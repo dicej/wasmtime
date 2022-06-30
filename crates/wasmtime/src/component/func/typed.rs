@@ -1492,6 +1492,40 @@ pub fn typecheck_record(
     }
 }
 
+/// Verify that the given wasm type is a variant with the expected cases in the right order and with the right
+/// names.
+pub fn typecheck_variant(
+    ty: &InterfaceType,
+    types: &ComponentTypes,
+    expected: &[(&str, fn(&InterfaceType, &ComponentTypes) -> Result<()>)],
+) -> Result<()> {
+    match ty {
+        InterfaceType::Variant(index) => {
+            let cases = &types[*index].cases;
+
+            if cases.len() != expected.len() {
+                bail!(
+                    "expected variant of {} cases, found {} cases",
+                    expected.len(),
+                    cases.len()
+                );
+            }
+
+            for (case, &(name, check)) in cases.iter().zip(expected) {
+                check(&case.ty, types)
+                    .with_context(|| format!("type mismatch for case {}", name))?;
+
+                if case.name != name {
+                    bail!("expected variant case named {}, found {}", name, case.name);
+                }
+            }
+
+            Ok(())
+        }
+        other => bail!("expected `variant` found `{}`", desc(other)),
+    }
+}
+
 unsafe impl<T> ComponentType for Option<T>
 where
     T: ComponentType,

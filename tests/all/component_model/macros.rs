@@ -81,7 +81,6 @@ fn record_derive() -> Result<()> {
 
     let engine = super::engine();
     let mut store = Store::new(&engine, ());
-    let input = Foo { a: -42, b: 73 };
 
     // Happy path: component type matches field count, names, and types
 
@@ -94,6 +93,7 @@ fn record_derive() -> Result<()> {
     )?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
 
+    let input = Foo { a: -42, b: 73 };
     let output = instance
         .get_typed_func::<(Foo,), Foo, _>(&mut store, "echo")?
         .call_and_post_return(&mut store, (input,))?;
@@ -153,6 +153,159 @@ fn record_derive() -> Result<()> {
     assert!(instance
         .get_typed_func::<(Foo,), Foo, _>(&mut store, "echo")
         .is_err());
+
+    // Happy path redux, with generics this time
+
+    #[derive(ComponentType, Lift, Lower, PartialEq, Eq, Debug, Copy, Clone)]
+    #[component(record)]
+    struct Generic<A, B> {
+        #[component(name = "foo-bar-baz")]
+        a: A,
+        b: B,
+    }
+
+    let input = Generic {
+        a: -43_i32,
+        b: 74_u32,
+    };
+
+    let component = Component::new(
+        &engine,
+        make_echo_component(
+            r#"(type $Foo (record (field "foo-bar-baz" s32) (field "b" u32)))"#,
+            8,
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+
+    let output = instance
+        .get_typed_func::<(Generic<i32, u32>,), Generic<i32, u32>, _>(&mut store, "echo")?
+        .call_and_post_return(&mut store, (input,))?;
+
+    assert_eq!(input, output);
+
+    Ok(())
+}
+
+#[test]
+fn variant_derive() -> Result<()> {
+    #[derive(ComponentType, Lift, Lower, PartialEq, Eq, Debug, Copy, Clone)]
+    #[component(variant)]
+    enum Foo {
+        #[component(name = "foo-bar-baz")]
+        A(i32),
+        B(u32),
+        C,
+    }
+
+    let engine = super::engine();
+    let mut store = Store::new(&engine, ());
+
+    // Happy path: component type matches case count, names, and types
+
+    let component = Component::new(
+        &engine,
+        make_echo_component(
+            r#"(type $Foo (variant (case "foo-bar-baz" s32) (case "B" u32) (case "C" unit)))"#,
+            8,
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_typed_func::<(Foo,), Foo, _>(&mut store, "echo")?;
+
+    for &input in &[Foo::A(-42), Foo::B(73), Foo::C] {
+        let output = func.call_and_post_return(&mut store, (input,))?;
+
+        assert_eq!(input, output);
+    }
+
+    // Sad path: case count mismatch (too few)
+
+    let component = Component::new(
+        &engine,
+        make_echo_component(
+            r#"(type $Foo (variant (case "foo-bar-baz" s32) (case "B" u32)))"#,
+            8,
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+
+    assert!(instance
+        .get_typed_func::<(Foo,), Foo, _>(&mut store, "echo")
+        .is_err());
+
+    // Sad path: field count mismatch (too many)
+
+    let component = Component::new(
+        &engine,
+        make_echo_component(
+            r#"(type $Foo (variant (case "foo-bar-baz" s32) (case "B" u32) (case "C" unit) (field "D" u32)))"#,
+            8,
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+
+    assert!(instance
+        .get_typed_func::<(Foo,), Foo, _>(&mut store, "echo")
+        .is_err());
+
+    // Sad path: field name mismatch
+
+    let component = Component::new(
+        &engine,
+        make_echo_component(
+            r#"(type $Foo (variant (case "A" s32) (case "B" u32) (case "C" unit)))"#,
+            8,
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+
+    assert!(instance
+        .get_typed_func::<(Foo,), Foo, _>(&mut store, "echo")
+        .is_err());
+
+    // Sad path: field type mismatch
+
+    let component = Component::new(
+        &engine,
+        make_echo_component(
+            r#"(type $Foo (variant (case "foo-bar-baz" s32) (case "B" s32) (case "C" unit)))"#,
+            8,
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+
+    assert!(instance
+        .get_typed_func::<(Foo,), Foo, _>(&mut store, "echo")
+        .is_err());
+
+    // Happy path redux, with generics this time
+
+    #[derive(ComponentType, Lift, Lower, PartialEq, Eq, Debug, Copy, Clone)]
+    #[component(variant)]
+    enum Generic<A, B> {
+        #[component(name = "foo-bar-baz")]
+        A(A),
+        B(B),
+        C,
+    }
+
+    let component = Component::new(
+        &engine,
+        make_echo_component(
+            r#"(type $Foo (record (field "foo-bar-baz" s32) (field "b" u32)))"#,
+            8,
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance
+        .get_typed_func::<(Generic<i32, u32>,), Generic<i32, u32>, _>(&mut store, "echo")?;
+
+    for &input in &[Generic::<i32, u32>::A(-42), Generic::B(73), Generic::C] {
+        let output = func.call_and_post_return(&mut store, (input,))?;
+
+        assert_eq!(input, output);
+    }
 
     Ok(())
 }
