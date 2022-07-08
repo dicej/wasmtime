@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::fmt::Write;
 use wasmtime::component::{Component, ComponentParams, Lift, Lower, TypedFunc};
 use wasmtime::{AsContextMut, Config, Engine};
 
@@ -147,4 +148,69 @@ fn components_importing_modules() -> Result<()> {
     )?;
 
     Ok(())
+}
+
+fn make_echo_component(type_definition: &str, type_size: u32) -> String {
+    if type_size <= 4 {
+        format!(
+            r#"
+            (component
+                (core module $m
+                    (func (export "echo") (param i32) (result i32)
+                        local.get 0
+                    )
+
+                    (memory (export "memory") 1)
+                )
+
+                (core instance $i (instantiate $m))
+
+                (type $Foo {})
+
+                (func (export "echo") (param $Foo) (result $Foo)
+                    (canon lift (core func $i "echo") (memory $i "memory"))
+                )
+            )"#,
+            type_definition
+        )
+    } else {
+        let mut params = String::new();
+        let mut store = String::new();
+
+        for index in 0..(type_size / 4) {
+            params.push_str(" i32");
+            write!(
+                &mut store,
+                "(i32.store offset={} (local.get $base) (local.get {}))",
+                index * 4,
+                index,
+            )
+            .unwrap();
+        }
+
+        format!(
+            r#"
+            (component
+                (core module $m
+                    (func (export "echo") (param{}) (result i32)
+                        (local $base i32)
+                        (local.set $base (i32.const 0))
+                        {}
+                        local.get $base
+                    )
+
+                    (memory (export "memory") 1)
+                )
+
+                (core instance $i (instantiate $m))
+
+                (type $Foo {})
+
+                (func (export "echo") (param $Foo) (result $Foo)
+                    (canon lift (core func $i "echo") (memory $i "memory"))
+                )
+            )"#,
+            params, store, type_definition
+        )
+    }
 }

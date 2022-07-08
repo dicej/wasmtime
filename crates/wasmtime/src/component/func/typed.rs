@@ -748,7 +748,7 @@ macro_rules! integers {
             fn typecheck(ty: &InterfaceType, _types: &ComponentTypes) -> Result<()> {
                 match ty {
                     InterfaceType::$ty => Ok(()),
-                    other => bail!("expected `{}` found `{}`", desc(&InterfaceType::$ty), desc(other))
+                    other => bail!("expected `{}` found `{}`", &InterfaceType::$ty.desc(), other.desc())
                 }
             }
         }
@@ -824,7 +824,7 @@ macro_rules! floats {
             fn typecheck(ty: &InterfaceType, _types: &ComponentTypes) -> Result<()> {
                 match ty {
                     InterfaceType::$ty => Ok(()),
-                    other => bail!("expected `{}` found `{}`", desc(&InterfaceType::$ty), desc(other))
+                    other => bail!("expected `{}` found `{}`", &InterfaceType::$ty.desc(), other.desc())
                 }
             }
         }
@@ -877,7 +877,7 @@ unsafe impl ComponentType for bool {
     fn typecheck(ty: &InterfaceType, _types: &ComponentTypes) -> Result<()> {
         match ty {
             InterfaceType::Bool => Ok(()),
-            other => bail!("expected `bool` found `{}`", desc(other)),
+            other => bail!("expected `bool` found `{}`", other.desc()),
         }
     }
 }
@@ -927,7 +927,7 @@ unsafe impl ComponentType for char {
     fn typecheck(ty: &InterfaceType, _types: &ComponentTypes) -> Result<()> {
         match ty {
             InterfaceType::Char => Ok(()),
-            other => bail!("expected `char` found `{}`", desc(other)),
+            other => bail!("expected `char` found `{}`", other.desc()),
         }
     }
 }
@@ -975,7 +975,7 @@ unsafe impl ComponentType for str {
     fn typecheck(ty: &InterfaceType, _types: &ComponentTypes) -> Result<()> {
         match ty {
             InterfaceType::String => Ok(()),
-            other => bail!("expected `string` found `{}`", desc(other)),
+            other => bail!("expected `string` found `{}`", other.desc()),
         }
     }
 }
@@ -1005,7 +1005,7 @@ unsafe impl Lower for str {
     }
 }
 
-fn lower_string<T>(mem: &mut MemoryMut<'_, T>, string: &str) -> Result<(usize, usize)> {
+pub(crate) fn lower_string<T>(mem: &mut MemoryMut<'_, T>, string: &str) -> Result<(usize, usize)> {
     match mem.string_encoding() {
         StringEncoding::Utf8 => {
             let ptr = mem.realloc(0, 0, 1, string.len())?;
@@ -1136,7 +1136,7 @@ unsafe impl ComponentType for WasmStr {
     fn typecheck(ty: &InterfaceType, _types: &ComponentTypes) -> Result<()> {
         match ty {
             InterfaceType::String => Ok(()),
-            other => bail!("expected `string` found `{}`", desc(other)),
+            other => bail!("expected `string` found `{}`", other.desc()),
         }
     }
 }
@@ -1172,7 +1172,7 @@ where
     fn typecheck(ty: &InterfaceType, types: &ComponentTypes) -> Result<()> {
         match ty {
             InterfaceType::List(t) => T::typecheck(&types[*t], types),
-            other => bail!("expected `list` found `{}`", desc(other)),
+            other => bail!("expected `list` found `{}`", other.desc()),
         }
     }
 }
@@ -1219,7 +1219,7 @@ where
 // pointer fo memory (I guess from `MemoryMut` itself?). Overall I'm not really
 // clear on what's happening there, but this is surely going to be a performance
 // bottleneck in the future.
-fn lower_list<T, U>(mem: &mut MemoryMut<'_, U>, list: &[T]) -> Result<(usize, usize)>
+pub(crate) fn lower_list<T, U>(mem: &mut MemoryMut<'_, U>, list: &[T]) -> Result<(usize, usize)>
 where
     T: Lower,
 {
@@ -1382,7 +1382,7 @@ unsafe impl<T: ComponentType> ComponentType for WasmList<T> {
     fn typecheck(ty: &InterfaceType, types: &ComponentTypes) -> Result<()> {
         match ty {
             InterfaceType::List(t) => T::typecheck(&types[*t], types),
-            other => bail!("expected `list` found `{}`", desc(other)),
+            other => bail!("expected `list` found `{}`", other.desc()),
         }
     }
 }
@@ -1453,9 +1453,9 @@ fn typecheck_tuple(
             Ok(())
         }
         other if expected.len() == 0 => {
-            bail!("expected `unit` or 0-tuple found `{}`", desc(other))
+            bail!("expected `unit` or 0-tuple found `{}`", other.desc())
         }
-        other => bail!("expected `tuple` found `{}`", desc(other)),
+        other => bail!("expected `tuple` found `{}`", other.desc()),
     }
 }
 
@@ -1489,7 +1489,7 @@ pub fn typecheck_record(
 
             Ok(())
         }
-        other => bail!("expected `record` found `{}`", desc(other)),
+        other => bail!("expected `record` found `{}`", other.desc()),
     }
 }
 
@@ -1523,7 +1523,7 @@ pub fn typecheck_variant(
 
             Ok(())
         }
-        other => bail!("expected `variant` found `{}`", desc(other)),
+        other => bail!("expected `variant` found `{}`", other.desc()),
     }
 }
 
@@ -1550,7 +1550,7 @@ pub fn typecheck_enum(ty: &InterfaceType, types: &ComponentTypes, expected: &[&s
 
             Ok(())
         }
-        other => bail!("expected `enum` found `{}`", desc(other)),
+        other => bail!("expected `enum` found `{}`", other.desc()),
     }
 }
 
@@ -1578,7 +1578,7 @@ pub fn typecheck_union(
 
             Ok(())
         }
-        other => bail!("expected `union` found `{}`", desc(other)),
+        other => bail!("expected `union` found `{}`", other.desc()),
     }
 }
 
@@ -1609,7 +1609,7 @@ pub fn typecheck_flags(
 
             Ok(())
         }
-        other => bail!("expected `flags` found `{}`", desc(other)),
+        other => bail!("expected `flags` found `{}`", other.desc()),
     }
 }
 
@@ -1643,7 +1643,7 @@ where
     fn typecheck(ty: &InterfaceType, types: &ComponentTypes) -> Result<()> {
         match ty {
             InterfaceType::Option(t) => T::typecheck(&types[*t], types),
-            other => bail!("expected `option` found `{}`", desc(other)),
+            other => bail!("expected `option` found `{}`", other.desc()),
         }
     }
 }
@@ -1759,7 +1759,7 @@ where
                 E::typecheck(&expected.err, types)?;
                 Ok(())
             }
-            other => bail!("expected `expected` found `{}`", desc(other)),
+            other => bail!("expected `expected` found `{}`", other.desc()),
         }
     }
 }
@@ -1970,32 +1970,3 @@ macro_rules! impl_component_ty_for_tuples {
 }
 
 for_each_function_signature!(impl_component_ty_for_tuples);
-
-fn desc(ty: &InterfaceType) -> &'static str {
-    match ty {
-        InterfaceType::U8 => "u8",
-        InterfaceType::S8 => "s8",
-        InterfaceType::U16 => "u16",
-        InterfaceType::S16 => "s16",
-        InterfaceType::U32 => "u32",
-        InterfaceType::S32 => "s32",
-        InterfaceType::U64 => "u64",
-        InterfaceType::S64 => "s64",
-        InterfaceType::Float32 => "f32",
-        InterfaceType::Float64 => "f64",
-        InterfaceType::Unit => "unit",
-        InterfaceType::Bool => "bool",
-        InterfaceType::Char => "char",
-        InterfaceType::String => "string",
-        InterfaceType::List(_) => "list",
-        InterfaceType::Tuple(_) => "tuple",
-        InterfaceType::Option(_) => "option",
-        InterfaceType::Expected(_) => "expected",
-
-        InterfaceType::Record(_) => "record",
-        InterfaceType::Variant(_) => "variant",
-        InterfaceType::Flags(_) => "flags",
-        InterfaceType::Enum(_) => "enum",
-        InterfaceType::Union(_) => "union",
-    }
-}

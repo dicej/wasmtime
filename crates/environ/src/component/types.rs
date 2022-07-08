@@ -833,6 +833,38 @@ pub enum InterfaceType {
     Expected(TypeExpectedIndex),
 }
 
+impl InterfaceType {
+    /// Return the component type keyword for the specified type, e.g. "u8", "list", "union", etc.
+    pub fn desc(&self) -> &'static str {
+        match self {
+            InterfaceType::U8 => "u8",
+            InterfaceType::S8 => "s8",
+            InterfaceType::U16 => "u16",
+            InterfaceType::S16 => "s16",
+            InterfaceType::U32 => "u32",
+            InterfaceType::S32 => "s32",
+            InterfaceType::U64 => "u64",
+            InterfaceType::S64 => "s64",
+            InterfaceType::Float32 => "f32",
+            InterfaceType::Float64 => "f64",
+            InterfaceType::Unit => "unit",
+            InterfaceType::Bool => "bool",
+            InterfaceType::Char => "char",
+            InterfaceType::String => "string",
+            InterfaceType::List(_) => "list",
+            InterfaceType::Tuple(_) => "tuple",
+            InterfaceType::Option(_) => "option",
+            InterfaceType::Expected(_) => "expected",
+
+            InterfaceType::Record(_) => "record",
+            InterfaceType::Variant(_) => "variant",
+            InterfaceType::Flags(_) => "flags",
+            InterfaceType::Enum(_) => "enum",
+            InterfaceType::Union(_) => "union",
+        }
+    }
+}
+
 impl From<&wasmparser::PrimitiveValType> for InterfaceType {
     fn from(ty: &wasmparser::PrimitiveValType) -> InterfaceType {
         match ty {

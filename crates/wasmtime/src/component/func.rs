@@ -1,7 +1,8 @@
 use crate::component::instance::{Instance, InstanceData};
+use crate::component::values::Val;
 use crate::store::{StoreOpaque, Stored};
-use crate::{AsContext, ValRaw};
-use anyhow::{Context, Result};
+use crate::{AsContext, AsContextMut, ValRaw};
+use anyhow::{bail, Context, Result};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -240,5 +241,79 @@ impl Func {
         Return::typecheck(&ty.result, &data.types).context("type mismatch with result")?;
 
         Ok(())
+    }
+
+    pub fn call(&self, mut store: impl AsContextMut, params: &[Val]) -> Result<Val> {
+        let store = &mut store.as_context_mut();
+
+        let data = &store[self.0];
+        let ty = &data.types[data.ty];
+
+        if ty.params.len() != params.len() {
+            bail!(
+                "expected {} arguments, got {}",
+                ty.params.len(),
+                params.len()
+            );
+        }
+
+        for ((_, ty), arg) in ty.params.iter().zip(params) {
+            arg.typecheck(ty, &data.types)
+                .context("type mismatch with parameters")?;
+        }
+
+        let FuncData {
+            trampoline,
+            export,
+            options,
+            instance,
+            component_instance,
+            ..
+        } = store.0[self.0];
+
+        let instance = store.0[instance.0].as_ref().unwrap().instance();
+        let flags = instance.flags(component_instance);
+        let mut space = Vec::new();
+
+        // TODO: handle parameters passed via the heap
+
+        unsafe {
+            if !(*flags).may_enter() {
+                bail!("cannot reenter component instance");
+            }
+            (*flags).set_may_enter(false);
+
+            debug_assert!((*flags).may_leave());
+            (*flags).set_may_leave(false);
+            let result = params
+                .iter()
+                .map(|param| param.lower(store, &options, &mut space))
+                .collect::<Result<()>>();
+            (*flags).set_may_leave(true);
+            result?;
+
+            if space.is_empty() {
+                // TODO: only do this if we're expecting a non-empty return value on the stack
+                space.push(ValRaw::u32(0));
+            }
+
+            crate::Func::call_unchecked_raw(store, export.anyfunc, trampoline, space.as_mut_ptr())?;
+
+            (*flags).set_needs_post_return(true);
+        }
+
+        // TODO: handle values returned via the heap
+
+        let val = Val::lift(
+            store.0,
+            &options,
+            &ty.result,
+            &data.types,
+            &mut space[..1].iter(),
+        )?;
+        let data = &mut store.0[self.0];
+        assert!(data.post_return_arg.is_none());
+        data.post_return_arg = Some(space[0]);
+        Ok(val)
     }
 }
