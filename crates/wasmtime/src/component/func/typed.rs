@@ -567,11 +567,9 @@ pub unsafe trait ComponentParams: ComponentType {
 // though, that correctness bugs in this trait implementation are highly likely
 // to lead to security bugs, which again leads to the `unsafe` in the trait.
 //
-// Also note that this trait specifically is not sealed because we'll
-// eventually have a proc macro that generates implementations of this trait
-// for external types in a `#[derive]`-like fashion.
-//
-// FIXME: need to write a #[derive(ComponentType)]
+// Also note that this trait specifically is not sealed because we have a proc
+// macro that generates implementations of this trait for external types in a
+// `#[derive]`-like fashion.
 pub unsafe trait ComponentType {
     /// Representation of the "lowered" form of this component value.
     ///
@@ -1005,7 +1003,7 @@ unsafe impl Lower for str {
     }
 }
 
-fn lower_string<T>(mem: &mut MemoryMut<'_, T>, string: &str) -> Result<(usize, usize)> {
+pub(crate) fn lower_string<T>(mem: &mut MemoryMut<'_, T>, string: &str) -> Result<(usize, usize)> {
     match mem.string_encoding() {
         StringEncoding::Utf8 => {
             let ptr = mem.realloc(0, 0, 1, string.len())?;
@@ -1095,7 +1093,7 @@ impl WasmStr {
         self._to_str(store.into().0)
     }
 
-    fn _to_str<'a>(&self, store: &'a StoreOpaque) -> Result<Cow<'a, str>> {
+    pub(crate) fn _to_str<'a>(&self, store: &'a StoreOpaque) -> Result<Cow<'a, str>> {
         match self.options.string_encoding() {
             StringEncoding::Utf8 => self.decode_utf8(store),
             StringEncoding::Utf16 => self.decode_utf16(store),
