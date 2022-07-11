@@ -243,13 +243,13 @@ impl Func {
         Ok(())
     }
 
-    pub fn call(&self, mut store: impl AsContextMut, params: &[Val]) -> Result<Val> {
+    pub fn call(&self, mut store: impl AsContextMut, args: &[Val]) -> Result<Val> {
         let store = &mut store.as_context_mut();
 
         let data = &store[self.0];
         let ty = &data.types[data.ty];
 
-        if ty.params.len() != params.len() {
+        if ty.params.len() != args.len() {
             bail!(
                 "expected {} arguments, got {}",
                 ty.params.len(),
@@ -257,9 +257,13 @@ impl Func {
             );
         }
 
-        for ((_, ty), arg) in ty.params.iter().zip(params) {
+        let mut param_count = 0;
+
+        for ((_, ty), arg) in ty.params.iter().zip(args) {
             arg.typecheck(ty, &data.types)
                 .context("type mismatch with parameters")?;
+
+            param_count += values::flatten_count(ty, &data.types);
         }
 
         let FuncData {
@@ -274,8 +278,7 @@ impl Func {
         let instance = store.0[instance.0].as_ref().unwrap().instance();
         let flags = instance.flags(component_instance);
         let mut space = Vec::new();
-
-        // TODO: handle parameters passed via the heap
+        let return_count = values::flatten_count(&ty.result, &data.types);
 
         unsafe {
             if !(*flags).may_enter() {
@@ -285,15 +288,20 @@ impl Func {
 
             debug_assert!((*flags).may_leave());
             (*flags).set_may_leave(false);
-            let result = params
-                .iter()
-                .map(|param| param.lower(store, &options, &mut space))
-                .collect::<Result<()>>();
+            let result = if param_count > MAX_STACK_PARAMS {
+                store_args(store, &options, &ty.params, &data.types, args, &mut space)
+            } else {
+                ty.params
+                    .iter()
+                    .zip(args)
+                    .map(|((_, ty), arg)| param.lower(store, &options, ty, &data.types, &mut space))
+                    .collect::<Result<()>>()
+            };
             (*flags).set_may_leave(true);
             result?;
 
-            if space.is_empty() {
-                // TODO: only do this if we're expecting a non-empty return value on the stack
+            if space.is_empty() && return_count > 0 {
+                // reserve space for return value
                 space.push(ValRaw::u32(0));
             }
 
@@ -302,18 +310,155 @@ impl Func {
             (*flags).set_needs_post_return(true);
         }
 
-        // TODO: handle values returned via the heap
+        let val = if return_count > MAX_STACK_RESULTS {
+            load_result(
+                store,
+                &options,
+                &ty.result,
+                &data.types,
+                &mut space[..MAX_STACK_RESULTS].iter(),
+            )
+        } else {
+            Val::lift(
+                store.0,
+                &options,
+                &ty.result,
+                &data.types,
+                &mut space[..MAX_STACK_RESULTS].iter(),
+            )
+        }?;
 
-        let val = Val::lift(
-            store.0,
-            &options,
-            &ty.result,
-            &data.types,
-            &mut space[..1].iter(),
-        )?;
         let data = &mut store.0[self.0];
         assert!(data.post_return_arg.is_none());
         data.post_return_arg = Some(space[0]);
         Ok(val)
     }
+}
+
+fn store_args<T>(
+    store: &mut StoreContextMut<'_, T>,
+    options: &Options,
+    params: &Params,
+    types: &ComponentTypes,
+    args: &[Val],
+    vec: &mut Vec<ValRaw>,
+) -> Result<()> {
+    let mut memory = MemoryMut::new(store.as_context_mut(), options);
+    let ptr = memory.realloc(0, 0, Params::ALIGN32, Params::SIZE32)?;
+    let mut offset = ptr;
+    for ((_, ty), arg) in params.iter().zip(args) {
+        arg.store(&mut memory, ty, types, next_field(ty, types, &mut offset))?;
+    }
+
+    dst.write(ValRaw::i64(ptr as i64));
+
+    Ok(())
+}
+
+fn load_result(
+    store: &StoreOpaque,
+    options: &Options,
+    mem: &Memory,
+    ty: &InterfaceType,
+    types: &ComponentTypes,
+    src: &mut impl Iterator<Item = &'a ValRaw>,
+) -> Result<Val> {
+    let SizeAndAlignment { size, alignment } = SizeAndAlignment::from(ty, types);
+    // FIXME: needs to read an i64 for memory64
+    let ptr = usize::try_from(src.next().unwrap().get_u32())?;
+    if ptr % usize::try_from(align)? != 0 {
+        bail!("return pointer not aligned");
+    }
+
+    let memory = Memory::new(store, options);
+    let bytes = memory
+        .as_slice()
+        .get(ptr..)
+        .and_then(|b| b.get(..size))
+        .ok_or_else(|| anyhow::anyhow!("pointer out of bounds of memory"))?;
+
+    Val::load(store, &memory, ty, types, bytes)
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum DiscriminantSize {
+    Size1,
+    Size2,
+    Size4,
+}
+
+impl DiscriminantSize {
+    pub fn quote(self, discriminant: usize) -> TokenStream {
+        match self {
+            Self::Size1 => {
+                let discriminant = u8::try_from(discriminant).unwrap();
+                quote!(#discriminant)
+            }
+            Self::Size2 => {
+                let discriminant = u16::try_from(discriminant).unwrap();
+                quote!(#discriminant)
+            }
+            Self::Size4 => {
+                let discriminant = u32::try_from(discriminant).unwrap();
+                quote!(#discriminant)
+            }
+        }
+    }
+
+    pub fn from_count(count: usize) -> Option<Self> {
+        if count <= 0xFF {
+            Some(Self::Size1)
+        } else if count <= 0xFFFF {
+            Some(Self::Size2)
+        } else if count <= 0xFFFF_FFFF {
+            Some(Self::Size4)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<DiscriminantSize> for u32 {
+    fn from(size: DiscriminantSize) -> u32 {
+        match size {
+            DiscriminantSize::Size1 => 1,
+            DiscriminantSize::Size2 => 2,
+            DiscriminantSize::Size4 => 4,
+        }
+    }
+}
+
+impl From<DiscriminantSize> for usize {
+    fn from(size: DiscriminantSize) -> usize {
+        match size {
+            DiscriminantSize::Size1 => 1,
+            DiscriminantSize::Size2 => 2,
+            DiscriminantSize::Size4 => 4,
+        }
+    }
+}
+
+pub enum FlagsSize {
+    /// Flags can fit in a u8
+    Size1,
+    /// Flags can fit in a u16
+    Size2,
+    /// Flags can fit in a specified number of u32 fields
+    Size4Plus(usize),
+}
+
+impl FlagsSize {
+    pub fn from_count(count: usize) -> FlagsSize {
+        if flags.flags.len() <= 8 {
+            FlagsSize::Size1
+        } else if flags.flags.len() <= 16 {
+            FlagsSize::Size2
+        } else {
+            FlagsSize::Size4Plus(ceiling_divide(flags.flags.len(), 32))
+        }
+    }
+}
+
+pub fn ceiling_divide(n: usize, d: usize) -> usize {
+    (n + d - 1) / d
 }

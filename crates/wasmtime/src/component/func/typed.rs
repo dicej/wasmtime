@@ -567,11 +567,9 @@ pub unsafe trait ComponentParams: ComponentType {
 // though, that correctness bugs in this trait implementation are highly likely
 // to lead to security bugs, which again leads to the `unsafe` in the trait.
 //
-// Also note that this trait specifically is not sealed because we'll
-// eventually have a proc macro that generates implementations of this trait
-// for external types in a `#[derive]`-like fashion.
-//
-// FIXME: need to write a #[derive(ComponentType)]
+// Also note that this trait specifically is not sealed because we have a proc
+// macro that generates implementations of this trait for external types in a
+// `#[derive]`-like fashion.
 pub unsafe trait ComponentType {
     /// Representation of the "lowered" form of this component value.
     ///
@@ -1219,7 +1217,7 @@ where
 // pointer fo memory (I guess from `MemoryMut` itself?). Overall I'm not really
 // clear on what's happening there, but this is surely going to be a performance
 // bottleneck in the future.
-pub(crate) fn lower_list<T, U>(mem: &mut MemoryMut<'_, U>, list: &[T]) -> Result<(usize, usize)>
+fn lower_list<T, U>(mem: &mut MemoryMut<'_, U>, list: &[T]) -> Result<(usize, usize)>
 where
     T: Lower,
 {
