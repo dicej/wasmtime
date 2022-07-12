@@ -537,7 +537,7 @@ fn flags() -> Result<()> {
         &engine,
         make_echo_component(
             &format!(
-                r#"(type $Foo (flags {}))"#,
+                r#"(flags {})"#,
                 (0..8)
                     .map(|index| format!(r#""F{}""#, index))
                     .collect::<Vec<_>>()
@@ -634,7 +634,7 @@ fn flags() -> Result<()> {
         &engine,
         make_echo_component(
             &format!(
-                r#"(type $Foo (flags {}))"#,
+                r#"(flags {})"#,
                 (0..16)
                     .map(|index| format!(r#""F{}""#, index))
                     .collect::<Vec<_>>()
@@ -721,7 +721,7 @@ fn flags() -> Result<()> {
         &engine,
         make_echo_component(
             &format!(
-                r#"(type $Foo (flags {}))"#,
+                r#"(flags {})"#,
                 (0..32)
                     .map(|index| format!(r#""F{}""#, index))
                     .collect::<Vec<_>>()

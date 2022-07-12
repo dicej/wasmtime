@@ -4,92 +4,231 @@ use crate::{AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{anyhow, bail, Result};
 use component_util::{DiscriminantSize, FlagsSize};
 use std::iter;
-use std::mem;
 use std::ops::Deref;
 use std::rc::Rc;
 use wasmtime_environ::component::{ComponentTypes, InterfaceType};
 
+#[derive(Debug)]
+pub(crate) enum Type {
+    Bool,
+    S8,
+    U8,
+    S16,
+    U16,
+    S32,
+    U32,
+    S64,
+    U64,
+    Float32,
+    Float64,
+    Char,
+    String,
+    List(Box<Type>),
+    Record(Box<[Type]>),
+    Variant(Box<[Type]>),
+    Flags(usize),
+}
+
+impl Type {
+    pub(crate) fn from(ty: &InterfaceType, types: &ComponentTypes) -> Self {
+        match ty {
+            InterfaceType::Unit => Type::Record(Box::new([])),
+            InterfaceType::Bool => Type::Bool,
+            InterfaceType::S8 => Type::S8,
+            InterfaceType::U8 => Type::U8,
+            InterfaceType::S16 => Type::S16,
+            InterfaceType::U16 => Type::U16,
+            InterfaceType::S32 => Type::S32,
+            InterfaceType::U32 => Type::U32,
+            InterfaceType::Char => Type::Char,
+            InterfaceType::Float32 => Type::Float32,
+            InterfaceType::S64 => Type::S64,
+            InterfaceType::U64 => Type::U64,
+            InterfaceType::Float64 => Type::Float64,
+            InterfaceType::Enum(index) => Type::Variant(
+                types[*index]
+                    .names
+                    .iter()
+                    .map(|_| Type::Record(Box::new([])))
+                    .collect(),
+            ),
+            InterfaceType::String => Type::String,
+            InterfaceType::List(index) => Type::List(Box::new(Type::from(&types[*index], types))),
+            InterfaceType::Record(index) => Type::Record(
+                types[*index]
+                    .fields
+                    .iter()
+                    .map(|field| Type::from(&field.ty, types))
+                    .collect(),
+            ),
+            InterfaceType::Variant(index) => Type::Variant(
+                types[*index]
+                    .cases
+                    .iter()
+                    .map(|case| Type::from(&case.ty, types))
+                    .collect(),
+            ),
+            InterfaceType::Tuple(index) => Type::Record(
+                types[*index]
+                    .types
+                    .iter()
+                    .map(|ty| Type::from(ty, types))
+                    .collect(),
+            ),
+            InterfaceType::Flags(index) => Type::Flags(types[*index].names.len()),
+            InterfaceType::Union(index) => Type::Variant(
+                types[*index]
+                    .types
+                    .iter()
+                    .map(|ty| Type::from(ty, types))
+                    .collect(),
+            ),
+            InterfaceType::Option(index) => Type::Variant(Box::new([
+                Type::Record(Box::new([])),
+                Type::from(&types[*index], types),
+            ])),
+            InterfaceType::Expected(index) => {
+                let expected = &types[*index];
+
+                Type::Variant(Box::new([
+                    Type::from(&expected.ok, types),
+                    Type::from(&expected.err, types),
+                ]))
+            }
+        }
+    }
+
+    pub(crate) fn flatten_count(&self) -> usize {
+        match self {
+            Type::Bool
+            | Type::S8
+            | Type::U8
+            | Type::S16
+            | Type::U16
+            | Type::S32
+            | Type::U32
+            | Type::S64
+            | Type::U64
+            | Type::Float32
+            | Type::Float64
+            | Type::Char => 1,
+
+            Type::String | Type::List(_) => 2,
+
+            Type::Record(types) => types.iter().map(Type::flatten_count).sum(),
+
+            Type::Variant(types) => 1 + types.iter().map(Type::flatten_count).max().unwrap_or(0),
+
+            Type::Flags(count) => 1 * component_util::ceiling_divide(*count, 32).max(1),
+        }
+    }
+
+    fn desc(&self) -> &'static str {
+        match self {
+            Type::Bool => "bool",
+            Type::S8 => "s8",
+            Type::U8 => "u8",
+            Type::S16 => "s16",
+            Type::U16 => "u16",
+            Type::S32 => "s32",
+            Type::U32 => "u32",
+            Type::S64 => "s64",
+            Type::U64 => "u64",
+            Type::Float32 => "float32",
+            Type::Float64 => "float64",
+            Type::Char => "char",
+            Type::String => "string",
+            Type::List(_) => "list",
+            Type::Record(_) => "record",
+            Type::Variant(_) => "variant",
+            Type::Flags(_) => "flags",
+        }
+    }
+}
+
+/// Possible runtime values which a component function can either consume or produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Val {
+    /// Boolean
     Bool(bool),
+    /// Signed 8-bit integer
     S8(i8),
+    /// Unsigned 8-bit integer
     U8(u8),
+    /// Signed 16-bit integer
     S16(i16),
+    /// Unsigned 16-bit integer
     U16(u16),
+    /// Signed 32-bit integer
     S32(i32),
+    /// Unsigned 32-bit integer
     U32(u32),
+    /// Signed 64-bit integer
     S64(i64),
+    /// Unsigned 64-bit integer
     U64(u64),
+    /// 32-bit floating point value
     Float32(u32),
+    /// 64-bit floating point value
     Float64(u64),
+    /// 32-bit character
     Char(char),
+    /// Character string
     String(Rc<str>),
+    /// List of values
     List(Rc<[Val]>),
+    /// Record, tuple, or unit
     Record(Rc<[Val]>),
-    Variant { discriminant: u32, value: Rc<Val> },
-    Flags { count: u32, value: Rc<[u32]> },
+    /// Variant, enum, or union
+    Variant {
+        /// Index of case
+        discriminant: u32,
+        /// Associated data for case
+        value: Rc<Val>,
+    },
+    /// Bit flags
+    Flags {
+        /// Total number of flags
+        count: u32,
+        /// Values of flags
+        value: Rc<[u32]>,
+    },
 }
 
 impl Val {
-    pub fn typecheck(&self, ty: &InterfaceType, types: &ComponentTypes) -> Result<()> {
+    pub(crate) fn typecheck(&self, ty: &Type) -> Result<()> {
         match (self, ty) {
-            (Val::Bool(_), InterfaceType::Bool)
-            | (Val::S8(_), InterfaceType::S8)
-            | (Val::U8(_), InterfaceType::U8)
-            | (Val::S16(_), InterfaceType::S16)
-            | (Val::U16(_), InterfaceType::U16)
-            | (Val::S32(_), InterfaceType::S32)
-            | (Val::U32(_), InterfaceType::U32)
-            | (Val::S64(_), InterfaceType::S64)
-            | (Val::U64(_), InterfaceType::U64)
-            | (Val::Float32(_), InterfaceType::Float32)
-            | (Val::Float64(_), InterfaceType::Float64)
-            | (Val::Char(_), InterfaceType::Char)
-            | (Val::String(_), InterfaceType::String) => (),
+            (Val::Bool(_), Type::Bool)
+            | (Val::S8(_), Type::S8)
+            | (Val::U8(_), Type::U8)
+            | (Val::S16(_), Type::S16)
+            | (Val::U16(_), Type::U16)
+            | (Val::S32(_), Type::S32)
+            | (Val::U32(_), Type::U32)
+            | (Val::S64(_), Type::S64)
+            | (Val::U64(_), Type::U64)
+            | (Val::Float32(_), Type::Float32)
+            | (Val::Float64(_), Type::Float64)
+            | (Val::Char(_), Type::Char)
+            | (Val::String(_), Type::String) => (),
 
-            (Val::List(items), InterfaceType::List(index)) => {
-                let ty = &types[*index];
-
+            (Val::List(items), Type::List(element_type)) => {
                 for item in items.deref() {
-                    item.typecheck(ty, types)?;
+                    item.typecheck(element_type)?;
                 }
             }
 
-            (Val::Record(values), InterfaceType::Record(index)) => {
-                let fields = &types[*index].fields;
-
-                if fields.len() != values.len() {
+            (Val::Record(values), Type::Record(types)) => {
+                if types.len() != values.len() {
                     bail!(
                         "expected {} field values, got {}",
-                        fields.len(),
+                        types.len(),
                         values.len()
                     );
                 }
 
-                for (field, value) in fields.iter().zip(values.deref()) {
-                    value.typecheck(&field.ty, types)?;
-                }
-            }
-
-            (Val::Record(values), InterfaceType::Tuple(index)) => {
-                let tuple_types = &types[*index].types;
-
-                if tuple_types.len() != values.len() {
-                    bail!(
-                        "expected {} values, got {}",
-                        tuple_types.len(),
-                        values.len()
-                    );
-                }
-
-                for (ty, value) in tuple_types.iter().zip(values.deref()) {
-                    value.typecheck(ty, types)?;
-                }
-            }
-
-            (Val::Record(values), InterfaceType::Unit) => {
-                if !values.is_empty() {
-                    bail!("expected 0 values, got {}", values.len());
+                for (ty, value) in types.iter().zip(values.deref()) {
+                    value.typecheck(ty)?;
                 }
             }
 
@@ -98,94 +237,22 @@ impl Val {
                     discriminant,
                     value,
                 },
-                InterfaceType::Variant(index),
+                Type::Variant(types),
             ) => {
-                let cases = &types[*index].cases;
-
-                if *discriminant as usize >= cases.len() {
+                if *discriminant as usize >= types.len() {
                     bail!(
                         "discriminant {} is out of expected range [0, {})",
                         discriminant,
-                        cases.len()
+                        types.len()
                     );
                 }
 
-                value.typecheck(&cases[*discriminant as usize].ty, types)?;
+                value.typecheck(&types[*discriminant as usize])?;
             }
 
-            (
-                Val::Variant {
-                    discriminant,
-                    value,
-                },
-                InterfaceType::Enum(index),
-            ) => {
-                let names = &types[*index].names;
-
-                if *discriminant as usize >= names.len() {
-                    bail!(
-                        "discriminant {} is out of expected range [0, {})",
-                        discriminant,
-                        names.len()
-                    );
-                }
-
-                value.typecheck(&InterfaceType::Unit, types)?;
-            }
-
-            (
-                Val::Variant {
-                    discriminant,
-                    value,
-                },
-                InterfaceType::Union(index),
-            ) => {
-                let union_types = &types[*index].types;
-
-                if *discriminant as usize >= union_types.len() {
-                    bail!(
-                        "discriminant {} is out of expected range [0, {})",
-                        discriminant,
-                        union_types.len()
-                    );
-                }
-
-                value.typecheck(&union_types[*discriminant as usize], types)?;
-            }
-
-            (
-                Val::Variant {
-                    discriminant,
-                    value,
-                },
-                InterfaceType::Option(index),
-            ) => match discriminant {
-                0 => value.typecheck(&InterfaceType::Unit, types)?,
-                1 => value.typecheck(&types[*index], types)?,
-                _ => bail!(
-                    "discriminant {} is out of expected range [0, 2)",
-                    discriminant
-                ),
-            },
-
-            (
-                Val::Variant {
-                    discriminant,
-                    value,
-                },
-                InterfaceType::Expected(index),
-            ) => match discriminant {
-                0 => value.typecheck(&types[*index].ok, types)?,
-                1 => value.typecheck(&types[*index].err, types)?,
-                _ => bail!(
-                    "discriminant {} is out of expected range [0, 2)",
-                    discriminant
-                ),
-            },
-
-            (Val::Flags { count, value }, InterfaceType::Flags(index)) => {
+            (Val::Flags { count, value }, Type::Flags(type_count)) => {
+                let type_count = *type_count;
                 let count = *count as usize;
-                let names = &types[*index].names;
 
                 if count > value.len() * 32 {
                     bail!(
@@ -203,8 +270,8 @@ impl Val {
                     );
                 }
 
-                if names.len() != count {
-                    bail!("expected {} flags, got {}", names.len(), count);
+                if type_count != count {
+                    bail!("expected {} flags, got {}", type_count, count);
                 }
             }
 
@@ -240,24 +307,23 @@ impl Val {
         &self,
         store: &mut StoreContextMut<T>,
         options: &Options,
-        ty: &InterfaceType,
-        types: &ComponentTypes,
+        ty: &Type,
         vec: &mut Vec<ValRaw>,
     ) -> Result<()> {
-        match self {
-            Val::Bool(value) => vec.push(ValRaw::u32(if *value { 1 } else { 0 })),
-            Val::S8(value) => vec.push(ValRaw::i32(*value as i32)),
-            Val::U8(value) => vec.push(ValRaw::u32(*value as u32)),
-            Val::S16(value) => vec.push(ValRaw::i32(*value as i32)),
-            Val::U16(value) => vec.push(ValRaw::u32(*value as u32)),
-            Val::S32(value) => vec.push(ValRaw::i32(*value)),
-            Val::U32(value) => vec.push(ValRaw::u32(*value)),
-            Val::S64(value) => vec.push(ValRaw::i64(*value)),
-            Val::U64(value) => vec.push(ValRaw::u64(*value)),
-            Val::Float32(value) => vec.push(ValRaw::f32(*value)),
-            Val::Float64(value) => vec.push(ValRaw::f64(*value)),
-            Val::Char(value) => vec.push(ValRaw::u32(u32::from(*value))),
-            Val::String(value) => {
+        match (self, ty) {
+            (Val::Bool(value), Type::Bool) => vec.push(ValRaw::u32(if *value { 1 } else { 0 })),
+            (Val::S8(value), Type::S8) => vec.push(ValRaw::i32(*value as i32)),
+            (Val::U8(value), Type::U8) => vec.push(ValRaw::u32(*value as u32)),
+            (Val::S16(value), Type::S16) => vec.push(ValRaw::i32(*value as i32)),
+            (Val::U16(value), Type::U16) => vec.push(ValRaw::u32(*value as u32)),
+            (Val::S32(value), Type::S32) => vec.push(ValRaw::i32(*value)),
+            (Val::U32(value), Type::U32) => vec.push(ValRaw::u32(*value)),
+            (Val::S64(value), Type::S64) => vec.push(ValRaw::i64(*value)),
+            (Val::U64(value), Type::U64) => vec.push(ValRaw::u64(*value)),
+            (Val::Float32(value), Type::Float32) => vec.push(ValRaw::f32(*value)),
+            (Val::Float64(value), Type::Float64) => vec.push(ValRaw::f64(*value)),
+            (Val::Char(value), Type::Char) => vec.push(ValRaw::u32(u32::from(*value))),
+            (Val::String(value), Type::String) => {
                 let (ptr, len) = super::lower_string(
                     &mut MemoryMut::new(store.as_context_mut(), options),
                     value,
@@ -265,37 +331,34 @@ impl Val {
                 vec.push(ValRaw::i64(ptr as i64));
                 vec.push(ValRaw::i64(len as i64));
             }
-            Val::List(items) => {
+            (Val::List(items), Type::List(element_type)) => {
                 let (ptr, len) = lower_list(
                     &mut MemoryMut::new(store.as_context_mut(), options),
-                    ty,
-                    types,
+                    element_type,
                     &items,
                 )?;
                 vec.push(ValRaw::i64(ptr as i64));
                 vec.push(ValRaw::i64(len as i64));
             }
-            Val::Record(values) => {
-                for (value, ty) in values.iter().zip(record_types(ty, types)) {
-                    value.lower(store, options, ty, types, vec)?;
+            (Val::Record(values), Type::Record(types)) => {
+                for (value, ty) in values.iter().zip(types.deref()) {
+                    value.lower(store, options, ty, vec)?;
                 }
             }
-            Val::Variant {
-                discriminant,
-                value,
-            } => {
+            (
+                Val::Variant {
+                    discriminant,
+                    value,
+                },
+                Type::Variant(types),
+            ) => {
                 vec.push(ValRaw::u32(*discriminant));
-                value.lower(
-                    store,
-                    options,
-                    variant_types(ty, types)[*discriminant as usize],
-                    types,
-                    vec,
-                )?;
+                value.lower(store, options, &types[*discriminant as usize], vec)?;
             }
-            Val::Flags { value, .. } => {
+            (Val::Flags { value, .. }, Type::Flags(_)) => {
                 vec.extend(value.iter().map(|&v| ValRaw::u32(v)));
             }
+            _ => unreachable!(),
         }
 
         Ok(())
@@ -304,48 +367,49 @@ impl Val {
     pub(crate) fn store<T>(
         &self,
         mem: &mut MemoryMut<'_, T>,
-        ty: &InterfaceType,
-        types: &ComponentTypes,
+        ty: &Type,
         offset: usize,
     ) -> Result<()> {
-        match self {
-            Val::Bool(value) => value.store(mem, offset)?,
-            Val::S8(value) => value.store(mem, offset)?,
-            Val::U8(value) => value.store(mem, offset)?,
-            Val::S16(value) => value.store(mem, offset)?,
-            Val::U16(value) => value.store(mem, offset)?,
-            Val::S32(value) => value.store(mem, offset)?,
-            Val::U32(value) => value.store(mem, offset)?,
-            Val::S64(value) => value.store(mem, offset)?,
-            Val::U64(value) => value.store(mem, offset)?,
-            Val::Float32(value) => value.store(mem, offset)?,
-            Val::Float64(value) => value.store(mem, offset)?,
-            Val::Char(value) => value.store(mem, offset)?,
-            Val::String(value) => {
+        match (self, ty) {
+            (Val::Bool(value), Type::Bool) => value.store(mem, offset)?,
+            (Val::S8(value), Type::S8) => value.store(mem, offset)?,
+            (Val::U8(value), Type::U8) => value.store(mem, offset)?,
+            (Val::S16(value), Type::S16) => value.store(mem, offset)?,
+            (Val::U16(value), Type::U16) => value.store(mem, offset)?,
+            (Val::S32(value), Type::S32) => value.store(mem, offset)?,
+            (Val::U32(value), Type::U32) => value.store(mem, offset)?,
+            (Val::S64(value), Type::S64) => value.store(mem, offset)?,
+            (Val::U64(value), Type::U64) => value.store(mem, offset)?,
+            (Val::Float32(value), Type::Float32) => value.store(mem, offset)?,
+            (Val::Float64(value), Type::Float64) => value.store(mem, offset)?,
+            (Val::Char(value), Type::Char) => value.store(mem, offset)?,
+            (Val::String(value), Type::String) => {
                 let (ptr, len) = super::lower_string(mem, value)?;
                 // FIXME: needs memory64 handling
                 *mem.get(offset + 0) = (ptr as i32).to_le_bytes();
                 *mem.get(offset + 4) = (len as i32).to_le_bytes();
             }
-            Val::List(items) => {
-                let (ptr, len) = lower_list(mem, ty, types, &items)?;
+            (Val::List(items), Type::List(element_type)) => {
+                let (ptr, len) = lower_list(mem, element_type, &items)?;
                 // FIXME: needs memory64 handling
                 *mem.get(offset + 0) = (ptr as i32).to_le_bytes();
                 *mem.get(offset + 4) = (len as i32).to_le_bytes();
             }
-            Val::Record(values) => {
+            (Val::Record(values), Type::Record(types)) => {
                 let mut offset = offset;
-                for (value, ty) in values.iter().zip(record_types(ty, types)) {
-                    value.store(mem, ty, types, next_field(ty, types, &mut offset))?;
+                for (value, ty) in values.iter().zip(types.deref()) {
+                    value.store(mem, ty, next_field(ty, &mut offset))?;
                 }
             }
-            Val::Variant {
-                discriminant,
-                value,
-            } => {
-                let variant_types = variant_types(ty, types);
-                let case_ty = variant_types[*discriminant as usize];
-                let discriminant_size = DiscriminantSize::from_count(variant_types.len()).unwrap();
+            (
+                Val::Variant {
+                    discriminant,
+                    value,
+                },
+                Type::Variant(types),
+            ) => {
+                let case_ty = &types[*discriminant as usize];
+                let discriminant_size = DiscriminantSize::from_count(types.len()).unwrap();
                 match discriminant_size {
                     DiscriminantSize::Size1 => {
                         u8::try_from(*discriminant).unwrap().store(mem, offset)?
@@ -359,25 +423,27 @@ impl Val {
                 value.store(
                     mem,
                     case_ty,
-                    types,
                     offset
                         + align_to(
                             discriminant_size.into(),
-                            SizeAndAlignment::from(ty, types).alignment,
+                            SizeAndAlignment::from(ty).alignment,
                         ),
                 )?;
             }
-            Val::Flags { count, value } => match FlagsSize::from_count(*count as usize) {
-                FlagsSize::Size1 => u8::try_from(value[0]).unwrap().store(mem, offset)?,
-                FlagsSize::Size2 => u16::try_from(value[0]).unwrap().store(mem, offset)?,
-                FlagsSize::Size4Plus(_) => {
-                    let mut offset = offset;
-                    for value in value.deref() {
-                        value.store(mem, offset)?;
-                        offset += 4;
+            (Val::Flags { count, value }, Type::Flags(_)) => {
+                match FlagsSize::from_count(*count as usize) {
+                    FlagsSize::Size1 => u8::try_from(value[0]).unwrap().store(mem, offset)?,
+                    FlagsSize::Size2 => u16::try_from(value[0]).unwrap().store(mem, offset)?,
+                    FlagsSize::Size4Plus(_) => {
+                        let mut offset = offset;
+                        for value in value.deref() {
+                            value.store(mem, offset)?;
+                            offset += 4;
+                        }
                     }
                 }
-            },
+            }
+            _ => unreachable!(),
         }
 
         Ok(())
@@ -386,8 +452,7 @@ impl Val {
     pub(crate) fn lift<'a>(
         store: &StoreOpaque,
         options: &Options,
-        ty: &InterfaceType,
-        types: &ComponentTypes,
+        ty: &Type,
         src: &mut impl Iterator<Item = &'a ValRaw>,
     ) -> Result<Self> {
         fn next<'a>(src: &mut impl Iterator<Item = &'a ValRaw>) -> &'a ValRaw {
@@ -395,95 +460,82 @@ impl Val {
         }
 
         Ok(match ty {
-            InterfaceType::Bool => Val::Bool(bool::lift(store, options, next(src))?),
-            InterfaceType::S8 => Val::S8(i8::lift(store, options, next(src))?),
-            InterfaceType::U8 => Val::U8(u8::lift(store, options, next(src))?),
-            InterfaceType::S16 => Val::S16(i16::lift(store, options, next(src))?),
-            InterfaceType::U16 => Val::U16(u16::lift(store, options, next(src))?),
-            InterfaceType::S32 => Val::S32(i32::lift(store, options, next(src))?),
-            InterfaceType::U32 => Val::U32(u32::lift(store, options, next(src))?),
-            InterfaceType::S64 => Val::S64(i64::lift(store, options, next(src))?),
-            InterfaceType::U64 => Val::U64(u64::lift(store, options, next(src))?),
-            InterfaceType::Float32 => Val::Float32(u32::lift(store, options, next(src))?),
-            InterfaceType::Float64 => Val::Float64(u64::lift(store, options, next(src))?),
-            InterfaceType::Char => Val::Char(char::lift(store, options, next(src))?),
-            InterfaceType::String | InterfaceType::List(_) => {
+            Type::Bool => Val::Bool(bool::lift(store, options, next(src))?),
+            Type::S8 => Val::S8(i8::lift(store, options, next(src))?),
+            Type::U8 => Val::U8(u8::lift(store, options, next(src))?),
+            Type::S16 => Val::S16(i16::lift(store, options, next(src))?),
+            Type::U16 => Val::U16(u16::lift(store, options, next(src))?),
+            Type::S32 => Val::S32(i32::lift(store, options, next(src))?),
+            Type::U32 => Val::U32(u32::lift(store, options, next(src))?),
+            Type::S64 => Val::S64(i64::lift(store, options, next(src))?),
+            Type::U64 => Val::U64(u64::lift(store, options, next(src))?),
+            Type::Float32 => Val::Float32(u32::lift(store, options, next(src))?),
+            Type::Float64 => Val::Float64(u64::lift(store, options, next(src))?),
+            Type::Char => Val::Char(char::lift(store, options, next(src))?),
+            Type::String | Type::List(_) => {
                 // These won't fit in func::MAX_STACK_RESULTS as of this writing, so presumably we should never
                 // reach here
                 unreachable!()
             }
-            InterfaceType::Record(_) | InterfaceType::Tuple(_) | InterfaceType::Unit => {
-                Val::Record(
-                    record_types(ty, types)
-                        .into_iter()
-                        .map(|ty| Self::lift(store, options, ty, types, src))
-                        .collect::<Result<_>>()?,
-                )
-            }
-            InterfaceType::Variant(_)
-            | InterfaceType::Enum(_)
-            | InterfaceType::Union(_)
-            | InterfaceType::Option(_)
-            | InterfaceType::Expected(_) => {
-                let variant_types = variant_types(ty, types);
+            Type::Record(types) => Val::Record(
+                types
+                    .into_iter()
+                    .map(|ty| Self::lift(store, options, ty, src))
+                    .collect::<Result<_>>()?,
+            ),
+            Type::Variant(types) => {
                 let discriminant = next(src).get_u32();
-                let case_ty = variant_types.get(discriminant as usize).ok_or_else(|| {
+                let case_ty = types.get(discriminant as usize).ok_or_else(|| {
                     anyhow!(
                         "discriminant {} out of range [0..{})",
                         discriminant,
-                        variant_types.len()
+                        types.len()
                     )
                 })?;
-                let value = Rc::new(Self::lift(store, options, case_ty, types, src)?);
+                let value = Rc::new(Self::lift(store, options, case_ty, src)?);
 
                 Val::Variant {
                     discriminant,
                     value,
                 }
             }
-            InterfaceType::Flags(index) => {
-                let names = &types[*index].names;
-                let count = u32::try_from(names.len()).unwrap();
-                assert!(count <= 32);
+            Type::Flags(count) => {
+                assert!(*count <= 32);
                 let value = iter::once(u32::lift(store, options, next(src))?).collect();
 
-                Val::Flags { count, value }
+                Val::Flags {
+                    count: u32::try_from(*count)?,
+                    value,
+                }
             }
         })
     }
 
-    pub(crate) fn load(
-        store: &StoreOpaque,
-        mem: &Memory,
-        ty: &InterfaceType,
-        types: &ComponentTypes,
-        bytes: &[u8],
-    ) -> Result<Self> {
+    pub(crate) fn load(store: &StoreOpaque, mem: &Memory, ty: &Type, bytes: &[u8]) -> Result<Self> {
         Ok(match ty {
-            InterfaceType::Bool => Val::Bool(bool::load(mem, bytes)?),
-            InterfaceType::S8 => Val::S8(i8::load(mem, bytes)?),
-            InterfaceType::U8 => Val::U8(u8::load(mem, bytes)?),
-            InterfaceType::S16 => Val::S16(i16::load(mem, bytes)?),
-            InterfaceType::U16 => Val::U16(u16::load(mem, bytes)?),
-            InterfaceType::S32 => Val::S32(i32::load(mem, bytes)?),
-            InterfaceType::U32 => Val::U32(u32::load(mem, bytes)?),
-            InterfaceType::S64 => Val::S64(i64::load(mem, bytes)?),
-            InterfaceType::U64 => Val::U64(u64::load(mem, bytes)?),
-            InterfaceType::Float32 => Val::Float32(u32::load(mem, bytes)?),
-            InterfaceType::Float64 => Val::Float64(u64::load(mem, bytes)?),
-            InterfaceType::Char => Val::Char(char::load(mem, bytes)?),
-            InterfaceType::String => {
+            Type::Bool => Val::Bool(bool::load(mem, bytes)?),
+            Type::S8 => Val::S8(i8::load(mem, bytes)?),
+            Type::U8 => Val::U8(u8::load(mem, bytes)?),
+            Type::S16 => Val::S16(i16::load(mem, bytes)?),
+            Type::U16 => Val::U16(u16::load(mem, bytes)?),
+            Type::S32 => Val::S32(i32::load(mem, bytes)?),
+            Type::U32 => Val::U32(u32::load(mem, bytes)?),
+            Type::S64 => Val::S64(i64::load(mem, bytes)?),
+            Type::U64 => Val::U64(u64::load(mem, bytes)?),
+            Type::Float32 => Val::Float32(u32::load(mem, bytes)?),
+            Type::Float64 => Val::Float64(u64::load(mem, bytes)?),
+            Type::Char => Val::Char(char::load(mem, bytes)?),
+            Type::String => {
                 Val::String(Rc::from(WasmStr::load(mem, bytes)?._to_str(store)?.deref()))
             }
-            InterfaceType::List(index) => {
-                let element_type = &types[*index];
+            Type::List(element_type) => {
                 // FIXME: needs memory64 treatment
                 let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
                 let len = u32::from_le_bytes(bytes[4..].try_into().unwrap()) as usize;
                 let SizeAndAlignment {
                     size: element_size,
                     alignment: element_alignment,
-                } = SizeAndAlignment::from(element_type, types);
+                } = SizeAndAlignment::from(element_type);
 
                 match len
                     .checked_mul(element_size)
@@ -503,59 +555,51 @@ impl Val {
                                 store,
                                 mem,
                                 element_type,
-                                types,
                                 &mem.as_slice()[ptr + (index * element_size)..][..element_size],
                             )
                         })
                         .collect::<Result<_>>()?,
                 )
             }
-            InterfaceType::Record(_) | InterfaceType::Tuple(_) | InterfaceType::Unit => {
+            Type::Record(types) => {
                 let mut offset = 0;
                 Val::Record(
-                    record_types(ty, types)
+                    types
                         .into_iter()
                         .map(|ty| {
                             Self::load(
                                 store,
                                 mem,
                                 ty,
-                                types,
-                                &bytes[next_field(ty, types, &mut offset)..]
-                                    [..SizeAndAlignment::from(ty, types).size],
+                                &bytes[next_field(ty, &mut offset)..]
+                                    [..SizeAndAlignment::from(ty).size],
                             )
                         })
                         .collect::<Result<_>>()?,
                 )
             }
-            InterfaceType::Variant(_)
-            | InterfaceType::Enum(_)
-            | InterfaceType::Union(_)
-            | InterfaceType::Option(_)
-            | InterfaceType::Expected(_) => {
-                let variant_types = variant_types(ty, types);
-                let discriminant_size = DiscriminantSize::from_count(variant_types.len()).unwrap();
+            Type::Variant(types) => {
+                let discriminant_size = DiscriminantSize::from_count(types.len()).unwrap();
                 let discriminant = match discriminant_size {
                     DiscriminantSize::Size1 => u8::load(mem, &bytes[..1])? as u32,
                     DiscriminantSize::Size2 => u16::load(mem, &bytes[..2])? as u32,
                     DiscriminantSize::Size4 => u32::load(mem, &bytes[..4])?,
                 };
-                let case_ty = variant_types.get(discriminant as usize).ok_or_else(|| {
+                let case_ty = types.get(discriminant as usize).ok_or_else(|| {
                     anyhow!(
                         "discriminant {} out of range [0..{})",
                         discriminant,
-                        variant_types.len()
+                        types.len()
                     )
                 })?;
                 let value = Rc::new(Self::load(
                     store,
                     mem,
                     case_ty,
-                    types,
                     &bytes[align_to(
                         usize::from(discriminant_size),
-                        SizeAndAlignment::from(ty, types).alignment,
-                    )..][..SizeAndAlignment::from(case_ty, types).size],
+                        SizeAndAlignment::from(ty).alignment,
+                    )..][..SizeAndAlignment::from(case_ty).size],
                 )?);
 
                 Val::Variant {
@@ -563,75 +607,29 @@ impl Val {
                     value,
                 }
             }
-            InterfaceType::Flags(index) => {
-                let count = types[*index].names.len();
-                Val::Flags {
-                    count: u32::try_from(count)?,
-                    value: match FlagsSize::from_count(count) {
-                        FlagsSize::Size1 => iter::once(u8::load(mem, bytes)? as u32).collect(),
-                        FlagsSize::Size2 => iter::once(u16::load(mem, bytes)? as u32).collect(),
-                        FlagsSize::Size4Plus(n) => (0..n)
-                            .map(|index| u32::load(mem, &bytes[index * 4..][..4]))
-                            .collect::<Result<_>>()?,
-                    },
-                }
-            }
+            Type::Flags(count) => Val::Flags {
+                count: u32::try_from(*count)?,
+                value: match FlagsSize::from_count(*count) {
+                    FlagsSize::Size1 => iter::once(u8::load(mem, bytes)? as u32).collect(),
+                    FlagsSize::Size2 => iter::once(u16::load(mem, bytes)? as u32).collect(),
+                    FlagsSize::Size4Plus(n) => (0..n)
+                        .map(|index| u32::load(mem, &bytes[index * 4..][..4]))
+                        .collect::<Result<_>>()?,
+                },
+            },
         })
-    }
-}
-
-fn record_types<'a>(ty: &InterfaceType, types: &'a ComponentTypes) -> Vec<&'a InterfaceType> {
-    match ty {
-        InterfaceType::Record(index) => types[*index]
-            .fields
-            .iter()
-            .map(|field| &field.ty)
-            .collect::<Vec<_>>(),
-        InterfaceType::Tuple(index) => types[*index].types.iter().collect::<Vec<_>>(),
-        InterfaceType::Unit => Vec::new(),
-        _ => unreachable!(),
-    }
-}
-
-fn variant_types<'a>(ty: &InterfaceType, types: &'a ComponentTypes) -> Vec<&'a InterfaceType> {
-    match ty {
-        InterfaceType::Variant(index) => types[*index]
-            .cases
-            .iter()
-            .map(|case| &case.ty)
-            .collect::<Vec<_>>(),
-        InterfaceType::Enum(index) => types[*index]
-            .names
-            .iter()
-            .map(|_| &InterfaceType::Unit)
-            .collect(),
-        InterfaceType::Union(index) => types[*index].types.iter().collect(),
-        InterfaceType::Option(index) => {
-            vec![&InterfaceType::Unit, &types[*index]]
-        }
-        InterfaceType::Expected(index) => {
-            let cases = &types[*index];
-            vec![&cases.ok, &cases.err]
-        }
-        _ => unreachable!(),
     }
 }
 
 fn lower_list<T>(
     mem: &mut MemoryMut<'_, T>,
-    ty: &InterfaceType,
-    types: &ComponentTypes,
+    element_type: &Type,
     items: &[Val],
 ) -> Result<(usize, usize)> {
-    let element_type = if let InterfaceType::List(index) = ty {
-        &types[*index]
-    } else {
-        unreachable!()
-    };
     let SizeAndAlignment {
         size: element_size,
         alignment: element_alignment,
-    } = SizeAndAlignment::from(element_type, types);
+    } = SizeAndAlignment::from(element_type);
     let size = items
         .len()
         .checked_mul(element_size)
@@ -639,80 +637,10 @@ fn lower_list<T>(
     let ptr = mem.realloc(0, 0, element_alignment, size)?;
     let mut element_ptr = ptr;
     for item in items {
-        item.store(mem, ty, types, element_ptr)?;
+        item.store(mem, element_type, element_ptr)?;
         element_ptr += element_size;
     }
     Ok((ptr, items.len()))
-}
-
-pub(crate) fn flatten_count(ty: &InterfaceType, types: &ComponentTypes) -> usize {
-    match ty {
-        InterfaceType::Unit => 0,
-        InterfaceType::Bool
-        | InterfaceType::S8
-        | InterfaceType::U8
-        | InterfaceType::S16
-        | InterfaceType::U16
-        | InterfaceType::S32
-        | InterfaceType::U32
-        | InterfaceType::S64
-        | InterfaceType::U64
-        | InterfaceType::Float32
-        | InterfaceType::Float64
-        | InterfaceType::Char
-        | InterfaceType::Enum(_) => mem::size_of::<ValRaw>(),
-
-        InterfaceType::String => mem::size_of::<ValRaw>() * 2,
-
-        InterfaceType::Record(index) => types[*index]
-            .fields
-            .iter()
-            .map(|field| flatten_count(&field.ty, types))
-            .sum(),
-
-        InterfaceType::Variant(index) => {
-            mem::size_of::<ValRaw>()
-                + types[*index]
-                    .cases
-                    .iter()
-                    .map(|case| flatten_count(&case.ty, types))
-                    .max()
-                    .unwrap_or(0)
-        }
-
-        InterfaceType::List(_) => mem::size_of::<ValRaw>() * 2,
-
-        InterfaceType::Tuple(index) => types[*index]
-            .types
-            .iter()
-            .map(|ty| flatten_count(ty, types))
-            .sum(),
-
-        InterfaceType::Flags(index) => {
-            mem::size_of::<ValRaw>()
-                * component_util::ceiling_divide(types[*index].names.len(), 32).max(1)
-        }
-
-        InterfaceType::Union(index) => {
-            mem::size_of::<ValRaw>()
-                + types[*index]
-                    .types
-                    .iter()
-                    .map(|ty| flatten_count(ty, types))
-                    .max()
-                    .unwrap_or(0)
-        }
-
-        InterfaceType::Option(index) => {
-            mem::size_of::<ValRaw>() + flatten_count(&types[*index], types)
-        }
-
-        InterfaceType::Expected(index) => {
-            mem::size_of::<ValRaw>()
-                + flatten_count(&types[*index].ok, types)
-                    .max(flatten_count(&types[*index].err, types))
-        }
-    }
 }
 
 pub(crate) struct SizeAndAlignment {
@@ -721,52 +649,38 @@ pub(crate) struct SizeAndAlignment {
 }
 
 impl SizeAndAlignment {
-    pub(crate) fn from(ty: &InterfaceType, types: &ComponentTypes) -> Self {
+    pub(crate) fn from(ty: &Type) -> Self {
         match ty {
-            InterfaceType::Unit => Self {
-                size: 0,
-                alignment: 1,
-            },
-            InterfaceType::Bool | InterfaceType::S8 | InterfaceType::U8 => Self {
+            Type::Bool | Type::S8 | Type::U8 => Self {
                 size: 1,
                 alignment: 1,
             },
-            InterfaceType::S16 | InterfaceType::U16 => Self {
+
+            Type::S16 | Type::U16 => Self {
                 size: 2,
                 alignment: 2,
             },
-            InterfaceType::S32
-            | InterfaceType::U32
-            | InterfaceType::Char
-            | InterfaceType::Float32 => Self {
+
+            Type::S32 | Type::U32 | Type::Char | Type::Float32 => Self {
                 size: 4,
                 alignment: 4,
             },
-            InterfaceType::S64 | InterfaceType::U64 | InterfaceType::Float64 => Self {
+
+            Type::S64 | Type::U64 | Type::Float64 => Self {
                 size: 8,
                 alignment: 8,
             },
 
-            InterfaceType::Enum(index) => {
-                let discriminant_size =
-                    DiscriminantSize::from_count(types[*index].names.len()).unwrap();
-
-                Self {
-                    size: discriminant_size.into(),
-                    alignment: discriminant_size.into(),
-                }
-            }
-
-            InterfaceType::String | InterfaceType::List(_) => Self {
+            Type::String | Type::List(_) => Self {
                 size: 8,
                 alignment: 4,
             },
 
-            InterfaceType::Record(index) => {
+            Type::Record(types) => {
                 let mut offset = 0;
                 let mut align = 1;
-                for field in types[*index].fields.iter() {
-                    let SizeAndAlignment { size, alignment } = Self::from(&field.ty, types);
+                for ty in types.iter() {
+                    let SizeAndAlignment { size, alignment } = Self::from(ty);
                     offset = align_to(offset, alignment) + size;
                     align = align.max(alignment);
                 }
@@ -777,44 +691,23 @@ impl SizeAndAlignment {
                 }
             }
 
-            InterfaceType::Variant(index) => {
-                let cases = &types[*index].cases;
-                let discriminant_size = DiscriminantSize::from_count(cases.len()).unwrap();
-                let alignment = u32::from(discriminant_size).max(
-                    cases
-                        .iter()
-                        .map(|case| Self::from(&case.ty, types).alignment)
-                        .max()
-                        .unwrap_or(0),
-                );
+            Type::Variant(types) => {
+                let discriminant_size = DiscriminantSize::from_count(types.len()).unwrap();
+                let mut alignment = 1;
+                let mut size = 0;
+                for ty in types.iter() {
+                    let s_and_a = Self::from(ty);
+                    alignment = alignment.max(s_and_a.alignment);
+                    size = size.max(s_and_a.size);
+                }
 
                 Self {
-                    size: align_to(usize::from(discriminant_size), alignment)
-                        + cases
-                            .iter()
-                            .map(|case| Self::from(&case.ty, types).size)
-                            .max()
-                            .unwrap_or(0),
+                    size: align_to(usize::from(discriminant_size), alignment) + size,
                     alignment,
                 }
             }
 
-            InterfaceType::Tuple(index) => {
-                let mut offset = 0;
-                let mut align = 1;
-                for ty in types[*index].types.iter() {
-                    let SizeAndAlignment { size, alignment } = Self::from(ty, types);
-                    offset = align_to(offset, alignment) + size;
-                    align = align.max(alignment);
-                }
-
-                Self {
-                    size: offset,
-                    alignment: align,
-                }
-            }
-
-            InterfaceType::Flags(index) => match FlagsSize::from_count(types[*index].names.len()) {
+            Type::Flags(count) => match FlagsSize::from_count(*count) {
                 FlagsSize::Size1 => Self {
                     size: 1,
                     alignment: 1,
@@ -828,62 +721,12 @@ impl SizeAndAlignment {
                     alignment: 4,
                 },
             },
-
-            InterfaceType::Union(index) => {
-                let union_types = &types[*index].types;
-                let discriminant_size = DiscriminantSize::from_count(union_types.len()).unwrap();
-                let alignment = u32::from(discriminant_size).max(
-                    union_types
-                        .iter()
-                        .map(|ty| Self::from(ty, types).alignment)
-                        .max()
-                        .unwrap_or(0),
-                );
-
-                Self {
-                    size: align_to(usize::from(discriminant_size), alignment)
-                        + union_types
-                            .iter()
-                            .map(|ty| Self::from(ty, types).size)
-                            .max()
-                            .unwrap_or(0),
-                    alignment,
-                }
-            }
-
-            InterfaceType::Option(index) => {
-                let SizeAndAlignment { size, alignment } = Self::from(&types[*index], types);
-
-                Self {
-                    size: align_to(1, alignment) + size,
-                    alignment,
-                }
-            }
-
-            InterfaceType::Expected(index) => {
-                let SizeAndAlignment {
-                    size: ok_size,
-                    alignment: ok_alignment,
-                } = Self::from(&types[*index].ok, types);
-
-                let SizeAndAlignment {
-                    size: err_size,
-                    alignment: err_alignment,
-                } = Self::from(&types[*index].err, types);
-
-                let alignment = ok_alignment.max(err_alignment);
-
-                Self {
-                    size: align_to(1, alignment) + ok_size.max(err_size),
-                    alignment,
-                }
-            }
         }
     }
 }
 
-pub fn next_field(ty: &InterfaceType, types: &ComponentTypes, offset: &mut usize) -> usize {
-    let SizeAndAlignment { size, alignment } = SizeAndAlignment::from(ty, types);
+pub(crate) fn next_field(ty: &Type, offset: &mut usize) -> usize {
+    let SizeAndAlignment { size, alignment } = SizeAndAlignment::from(ty);
     *offset = align_to(*offset, alignment);
     let result = *offset;
     *offset += size;

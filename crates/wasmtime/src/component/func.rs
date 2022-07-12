@@ -1,5 +1,5 @@
 use crate::component::instance::{Instance, InstanceData};
-use crate::component::values::{self, SizeAndAlignment, Val};
+use crate::component::values::{self, SizeAndAlignment, Type, Val};
 use crate::store::{StoreOpaque, Stored};
 use crate::{AsContext, AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{bail, Context, Result};
@@ -7,8 +7,7 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use wasmtime_environ::component::{
-    CanonicalOptions, ComponentTypes, CoreDef, InterfaceType, RuntimeComponentInstanceIndex,
-    TypeFuncIndex,
+    CanonicalOptions, ComponentTypes, CoreDef, RuntimeComponentInstanceIndex, TypeFuncIndex,
 };
 use wasmtime_runtime::{Export, ExportFunction, VMTrampoline};
 
@@ -244,23 +243,38 @@ impl Func {
         Ok(())
     }
 
+    /// Call this function dynamically.
+    ///
+    /// TODO: say more
     pub fn call(&self, mut store: impl AsContextMut, args: &[Val]) -> Result<Val> {
         let store = &mut store.as_context_mut();
 
-        let data = &store[self.0];
-        let ty = &data.types[data.ty];
+        let params;
+        let result;
 
-        if ty.params.len() != args.len() {
-            bail!("expected {} arguments, got {}", ty.params.len(), args.len());
-        }
+        {
+            let data = &store[self.0];
+            let ty = &data.types[data.ty];
 
-        let mut param_count = 0;
+            if ty.params.len() != args.len() {
+                bail!("expected {} arguments, got {}", ty.params.len(), args.len());
+            }
 
-        for ((_, ty), arg) in ty.params.iter().zip(args) {
-            arg.typecheck(ty, &data.types)
-                .context("type mismatch with parameters")?;
+            params = ty
+                .params
+                .iter()
+                .zip(args)
+                .map(|((_, ty), arg)| {
+                    let ty = Type::from(ty, &data.types);
 
-            param_count += values::flatten_count(ty, &data.types);
+                    arg.typecheck(&ty)
+                        .context("type mismatch with parameters")?;
+
+                    Ok(ty)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            result = Type::from(&ty.result, &data.types);
         }
 
         let FuncData {
@@ -274,8 +288,9 @@ impl Func {
 
         let instance = store.0[instance.0].as_ref().unwrap().instance();
         let flags = instance.flags(component_instance);
+        let param_count = dbg!(params.iter().map(|ty| ty.flatten_count()).sum::<usize>());
+        let result_count = dbg!(result.flatten_count());
         let mut space = Vec::new();
-        let return_count = values::flatten_count(&ty.result, &data.types);
 
         unsafe {
             if !(*flags).may_enter() {
@@ -286,18 +301,14 @@ impl Func {
             debug_assert!((*flags).may_leave());
             (*flags).set_may_leave(false);
             let result = if param_count > MAX_STACK_PARAMS {
-                store_args(store, &options, &ty.params, &data.types, args, &mut space)
+                self.store_args(store, &options, &params, args, &mut space)
             } else {
-                ty.params
-                    .iter()
-                    .zip(args)
-                    .map(|((_, ty), arg)| arg.lower(store, &options, ty, &data.types, &mut space))
-                    .collect::<Result<()>>()
+                self.lower_args(store, &options, &params, args, &mut space)
             };
             (*flags).set_may_leave(true);
             result?;
 
-            if space.is_empty() && return_count > 0 {
+            if space.is_empty() && result_count > 0 {
                 // reserve space for return value
                 space.push(ValRaw::u32(0));
             }
@@ -307,20 +318,18 @@ impl Func {
             (*flags).set_needs_post_return(true);
         }
 
-        let val = if return_count > MAX_STACK_RESULTS {
-            load_result(
+        let val = if result_count > MAX_STACK_RESULTS {
+            Self::load_result(
                 store.0,
                 &Memory::new(store.0, &options),
-                &ty.result,
-                &data.types,
+                &result,
                 &mut space[..MAX_STACK_RESULTS].iter(),
             )
         } else {
             Val::lift(
                 store.0,
                 &options,
-                &ty.result,
-                &data.types,
+                &result,
                 &mut space[..MAX_STACK_RESULTS].iter(),
             )
         }?;
@@ -330,59 +339,68 @@ impl Func {
         data.post_return_arg = Some(space[0]);
         Ok(val)
     }
-}
 
-fn store_args<T>(
-    store: &mut StoreContextMut<'_, T>,
-    options: &Options,
-    params: &[(Option<String>, InterfaceType)],
-    types: &ComponentTypes,
-    args: &[Val],
-    vec: &mut Vec<ValRaw>,
-) -> Result<()> {
-    let mut size = 0;
-    let mut alignment = 1;
-    for (_, ty) in params {
-        alignment = alignment.max(SizeAndAlignment::from(ty, types).alignment);
-        values::next_field(ty, types, &mut size);
+    fn store_args<T>(
+        &self,
+        store: &mut StoreContextMut<'_, T>,
+        options: &Options,
+        params: &[Type],
+        args: &[Val],
+        vec: &mut Vec<ValRaw>,
+    ) -> Result<()> {
+        let mut size = 0;
+        let mut alignment = 1;
+        for ty in params {
+            alignment = alignment.max(SizeAndAlignment::from(ty).alignment);
+            values::next_field(ty, &mut size);
+        }
+
+        let mut memory = MemoryMut::new(store.as_context_mut(), options);
+        let ptr = memory.realloc(0, 0, alignment, size)?;
+        let mut offset = ptr;
+        for (ty, arg) in params.iter().zip(args) {
+            arg.store(&mut memory, ty, values::next_field(ty, &mut offset))?;
+        }
+
+        vec.push(ValRaw::i64(ptr as i64));
+
+        Ok(())
     }
 
-    let mut memory = MemoryMut::new(store.as_context_mut(), options);
-    let ptr = memory.realloc(0, 0, alignment, size)?;
-    let mut offset = ptr;
-    for ((_, ty), arg) in params.iter().zip(args) {
-        arg.store(
-            &mut memory,
-            ty,
-            types,
-            values::next_field(ty, types, &mut offset),
-        )?;
+    fn lower_args<T>(
+        &self,
+        store: &mut StoreContextMut<'_, T>,
+        options: &Options,
+        params: &[Type],
+        args: &[Val],
+        vec: &mut Vec<ValRaw>,
+    ) -> Result<()> {
+        params
+            .iter()
+            .zip(args)
+            .map(|(ty, arg)| arg.lower(store, &options, ty, vec))
+            .collect::<Result<()>>()
     }
 
-    vec.push(ValRaw::i64(ptr as i64));
+    fn load_result<'a>(
+        store: &StoreOpaque,
+        mem: &Memory,
+        ty: &Type,
+        src: &mut impl Iterator<Item = &'a ValRaw>,
+    ) -> Result<Val> {
+        let SizeAndAlignment { size, alignment } = SizeAndAlignment::from(ty);
+        // FIXME: needs to read an i64 for memory64
+        let ptr = usize::try_from(src.next().unwrap().get_u32())?;
+        if ptr % usize::try_from(alignment)? != 0 {
+            bail!("return pointer not aligned");
+        }
 
-    Ok(())
-}
+        let bytes = mem
+            .as_slice()
+            .get(ptr..)
+            .and_then(|b| b.get(..size))
+            .ok_or_else(|| anyhow::anyhow!("pointer out of bounds of memory"))?;
 
-fn load_result<'a>(
-    store: &StoreOpaque,
-    mem: &Memory,
-    ty: &InterfaceType,
-    types: &ComponentTypes,
-    src: &mut impl Iterator<Item = &'a ValRaw>,
-) -> Result<Val> {
-    let SizeAndAlignment { size, alignment } = SizeAndAlignment::from(ty, types);
-    // FIXME: needs to read an i64 for memory64
-    let ptr = usize::try_from(src.next().unwrap().get_u32())?;
-    if ptr % usize::try_from(alignment)? != 0 {
-        bail!("return pointer not aligned");
+        Val::load(store, mem, ty, bytes)
     }
-
-    let bytes = mem
-        .as_slice()
-        .get(ptr..)
-        .and_then(|b| b.get(..size))
-        .ok_or_else(|| anyhow::anyhow!("pointer out of bounds of memory"))?;
-
-    Val::load(store, mem, ty, types, bytes)
 }

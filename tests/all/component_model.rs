@@ -3,6 +3,7 @@ use std::fmt::Write;
 use wasmtime::component::{Component, ComponentParams, Lift, Lower, TypedFunc};
 use wasmtime::{AsContextMut, Config, Engine};
 
+mod dynamic;
 mod func;
 mod import;
 mod instance;
