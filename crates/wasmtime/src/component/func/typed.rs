@@ -1093,7 +1093,7 @@ impl WasmStr {
         self._to_str(store.into().0)
     }
 
-    fn _to_str<'a>(&self, store: &'a StoreOpaque) -> Result<Cow<'a, str>> {
+    pub(crate) fn _to_str<'a>(&self, store: &'a StoreOpaque) -> Result<Cow<'a, str>> {
         match self.options.string_encoding() {
             StringEncoding::Utf8 => self.decode_utf8(store),
             StringEncoding::Utf16 => self.decode_utf16(store),

@@ -1,13 +1,14 @@
 use crate::component::instance::{Instance, InstanceData};
-use crate::component::values::Val;
+use crate::component::values::{self, SizeAndAlignment, Val};
 use crate::store::{StoreOpaque, Stored};
-use crate::{AsContext, AsContextMut, ValRaw};
+use crate::{AsContext, AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{bail, Context, Result};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use wasmtime_environ::component::{
-    CanonicalOptions, ComponentTypes, CoreDef, RuntimeComponentInstanceIndex, TypeFuncIndex,
+    CanonicalOptions, ComponentTypes, CoreDef, InterfaceType, RuntimeComponentInstanceIndex,
+    TypeFuncIndex,
 };
 use wasmtime_runtime::{Export, ExportFunction, VMTrampoline};
 
@@ -250,11 +251,7 @@ impl Func {
         let ty = &data.types[data.ty];
 
         if ty.params.len() != args.len() {
-            bail!(
-                "expected {} arguments, got {}",
-                ty.params.len(),
-                params.len()
-            );
+            bail!("expected {} arguments, got {}", ty.params.len(), args.len());
         }
 
         let mut param_count = 0;
@@ -294,7 +291,7 @@ impl Func {
                 ty.params
                     .iter()
                     .zip(args)
-                    .map(|((_, ty), arg)| param.lower(store, &options, ty, &data.types, &mut space))
+                    .map(|((_, ty), arg)| arg.lower(store, &options, ty, &data.types, &mut space))
                     .collect::<Result<()>>()
             };
             (*flags).set_may_leave(true);
@@ -312,8 +309,8 @@ impl Func {
 
         let val = if return_count > MAX_STACK_RESULTS {
             load_result(
-                store,
-                &options,
+                store.0,
+                &Memory::new(store.0, &options),
                 &ty.result,
                 &data.types,
                 &mut space[..MAX_STACK_RESULTS].iter(),
@@ -338,26 +335,37 @@ impl Func {
 fn store_args<T>(
     store: &mut StoreContextMut<'_, T>,
     options: &Options,
-    params: &Params,
+    params: &[(Option<String>, InterfaceType)],
     types: &ComponentTypes,
     args: &[Val],
     vec: &mut Vec<ValRaw>,
 ) -> Result<()> {
-    let mut memory = MemoryMut::new(store.as_context_mut(), options);
-    let ptr = memory.realloc(0, 0, Params::ALIGN32, Params::SIZE32)?;
-    let mut offset = ptr;
-    for ((_, ty), arg) in params.iter().zip(args) {
-        arg.store(&mut memory, ty, types, next_field(ty, types, &mut offset))?;
+    let mut size = 0;
+    let mut alignment = 1;
+    for (_, ty) in params {
+        alignment = alignment.max(SizeAndAlignment::from(ty, types).alignment);
+        values::next_field(ty, types, &mut size);
     }
 
-    dst.write(ValRaw::i64(ptr as i64));
+    let mut memory = MemoryMut::new(store.as_context_mut(), options);
+    let ptr = memory.realloc(0, 0, alignment, size)?;
+    let mut offset = ptr;
+    for ((_, ty), arg) in params.iter().zip(args) {
+        arg.store(
+            &mut memory,
+            ty,
+            types,
+            values::next_field(ty, types, &mut offset),
+        )?;
+    }
+
+    vec.push(ValRaw::i64(ptr as i64));
 
     Ok(())
 }
 
-fn load_result(
+fn load_result<'a>(
     store: &StoreOpaque,
-    options: &Options,
     mem: &Memory,
     ty: &InterfaceType,
     types: &ComponentTypes,
@@ -366,99 +374,15 @@ fn load_result(
     let SizeAndAlignment { size, alignment } = SizeAndAlignment::from(ty, types);
     // FIXME: needs to read an i64 for memory64
     let ptr = usize::try_from(src.next().unwrap().get_u32())?;
-    if ptr % usize::try_from(align)? != 0 {
+    if ptr % usize::try_from(alignment)? != 0 {
         bail!("return pointer not aligned");
     }
 
-    let memory = Memory::new(store, options);
-    let bytes = memory
+    let bytes = mem
         .as_slice()
         .get(ptr..)
         .and_then(|b| b.get(..size))
         .ok_or_else(|| anyhow::anyhow!("pointer out of bounds of memory"))?;
 
-    Val::load(store, &memory, ty, types, bytes)
-}
-
-#[derive(Debug, Copy, Clone)]
-pub enum DiscriminantSize {
-    Size1,
-    Size2,
-    Size4,
-}
-
-impl DiscriminantSize {
-    pub fn quote(self, discriminant: usize) -> TokenStream {
-        match self {
-            Self::Size1 => {
-                let discriminant = u8::try_from(discriminant).unwrap();
-                quote!(#discriminant)
-            }
-            Self::Size2 => {
-                let discriminant = u16::try_from(discriminant).unwrap();
-                quote!(#discriminant)
-            }
-            Self::Size4 => {
-                let discriminant = u32::try_from(discriminant).unwrap();
-                quote!(#discriminant)
-            }
-        }
-    }
-
-    pub fn from_count(count: usize) -> Option<Self> {
-        if count <= 0xFF {
-            Some(Self::Size1)
-        } else if count <= 0xFFFF {
-            Some(Self::Size2)
-        } else if count <= 0xFFFF_FFFF {
-            Some(Self::Size4)
-        } else {
-            None
-        }
-    }
-}
-
-impl From<DiscriminantSize> for u32 {
-    fn from(size: DiscriminantSize) -> u32 {
-        match size {
-            DiscriminantSize::Size1 => 1,
-            DiscriminantSize::Size2 => 2,
-            DiscriminantSize::Size4 => 4,
-        }
-    }
-}
-
-impl From<DiscriminantSize> for usize {
-    fn from(size: DiscriminantSize) -> usize {
-        match size {
-            DiscriminantSize::Size1 => 1,
-            DiscriminantSize::Size2 => 2,
-            DiscriminantSize::Size4 => 4,
-        }
-    }
-}
-
-pub enum FlagsSize {
-    /// Flags can fit in a u8
-    Size1,
-    /// Flags can fit in a u16
-    Size2,
-    /// Flags can fit in a specified number of u32 fields
-    Size4Plus(usize),
-}
-
-impl FlagsSize {
-    pub fn from_count(count: usize) -> FlagsSize {
-        if flags.flags.len() <= 8 {
-            FlagsSize::Size1
-        } else if flags.flags.len() <= 16 {
-            FlagsSize::Size2
-        } else {
-            FlagsSize::Size4Plus(ceiling_divide(flags.flags.len(), 32))
-        }
-    }
-}
-
-pub fn ceiling_divide(n: usize, d: usize) -> usize {
-    (n + d - 1) / d
+    Val::load(store, mem, ty, types, bytes)
 }

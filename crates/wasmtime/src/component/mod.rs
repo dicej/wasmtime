@@ -36,5 +36,5 @@ pub mod __internal {
     pub use wasmtime_environ::component::{ComponentTypes, InterfaceType};
 }
 
-pub(crate) use self::func::{lower_list, lower_string};
+pub(crate) use self::func::lower_string;
 pub(crate) use self::store::ComponentStoreData;

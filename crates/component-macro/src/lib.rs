@@ -1,3 +1,4 @@
+use component_util::{DiscriminantSize, FlagsSize};
 use proc_macro2::{Literal, TokenStream, TokenTree};
 use quote::{format_ident, quote};
 use std::collections::HashSet;
@@ -230,7 +231,7 @@ fn expand_variant(
         ));
     }
 
-    let discriminant_size = discriminant_size(body.variants.len()).ok_or_else(|| {
+    let discriminant_size = DiscriminantSize::from_count(body.variants.len()).ok_or_else(|| {
         Error::new(
             input.ident.span(),
             "`enum`s with more than 2^32 variants are not supported",
@@ -381,6 +382,23 @@ fn expand_record_for_component_type(
     Ok(quote!(const _: () = { #expanded };))
 }
 
+fn quote(size: DiscriminantSize, discriminant: usize) -> TokenStream {
+    match size {
+        DiscriminantSize::Size1 => {
+            let discriminant = u8::try_from(discriminant).unwrap();
+            quote!(#discriminant)
+        }
+        DiscriminantSize::Size2 => {
+            let discriminant = u16::try_from(discriminant).unwrap();
+            quote!(#discriminant)
+        }
+        DiscriminantSize::Size4 => {
+            let discriminant = u32::try_from(discriminant).unwrap();
+            quote!(#discriminant)
+        }
+    }
+}
+
 #[proc_macro_derive(Lift, attributes(component))]
 pub fn lift(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     expand(&LiftExpander, &parse_macro_input!(input as DeriveInput))
@@ -465,7 +483,7 @@ impl Expander for LiftExpander {
         for (index, VariantCase { ident, ty, .. }) in cases.iter().enumerate() {
             let index_u32 = u32::try_from(index).unwrap();
 
-            let index_quoted = discriminant_size.quote(index);
+            let index_quoted = quote(discriminant_size, index);
 
             if let Some(ty) = ty {
                 lifts.extend(
@@ -608,7 +626,7 @@ impl Expander for LowerExpander {
         for (index, VariantCase { ident, ty, .. }) in cases.iter().enumerate() {
             let index_u32 = u32::try_from(index).unwrap();
 
-            let index_quoted = discriminant_size.quote(index);
+            let index_quoted = quote(discriminant_size, index);
 
             let discriminant_size = usize::from(discriminant_size);
 

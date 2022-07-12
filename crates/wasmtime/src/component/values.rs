@@ -1,8 +1,10 @@
-use crate::component::func::{self, DiscriminantSize, FlagsSize, Lift, MemoryMut, Options};
+use crate::component::func::{align_to, Lift, Lower, Memory, MemoryMut, Options, WasmStr};
 use crate::store::StoreOpaque;
 use crate::{AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{anyhow, bail, Result};
+use component_util::{DiscriminantSize, FlagsSize};
 use std::iter;
+use std::mem;
 use std::ops::Deref;
 use std::rc::Rc;
 use wasmtime_environ::component::{ComponentTypes, InterfaceType};
@@ -193,7 +195,7 @@ impl Val {
                     );
                 }
 
-                if func::ceiling_divide(count, 32) > value.len() {
+                if component_util::ceiling_divide(count, 32) > value.len() {
                     bail!(
                         "value count {} must not be larger than required by flag count {}",
                         value.len() * 32,
@@ -228,6 +230,7 @@ impl Val {
             Val::Char(_) => "char",
             Val::String(_) => "string",
             Val::List(_) => "list",
+            Val::Record(_) => "record",
             Val::Variant { .. } => "variant",
             Val::Flags { .. } => "flags",
         }
@@ -290,7 +293,7 @@ impl Val {
                     vec,
                 )?;
             }
-            Val::Flags { count, value } => {
+            Val::Flags { value, .. } => {
                 vec.extend(value.iter().map(|&v| ValRaw::u32(v)));
             }
         }
@@ -319,21 +322,13 @@ impl Val {
             Val::Float64(value) => value.store(mem, offset)?,
             Val::Char(value) => value.store(mem, offset)?,
             Val::String(value) => {
-                let (ptr, len) = super::lower_string(
-                    &mut MemoryMut::new(store.as_context_mut(), options),
-                    value,
-                )?;
+                let (ptr, len) = super::lower_string(mem, value)?;
                 // FIXME: needs memory64 handling
                 *mem.get(offset + 0) = (ptr as i32).to_le_bytes();
                 *mem.get(offset + 4) = (len as i32).to_le_bytes();
             }
             Val::List(items) => {
-                let (ptr, len) = lower_list(
-                    &mut MemoryMut::new(store.as_context_mut(), options),
-                    ty,
-                    types,
-                    &items,
-                )?;
+                let (ptr, len) = lower_list(mem, ty, types, &items)?;
                 // FIXME: needs memory64 handling
                 *mem.get(offset + 0) = (ptr as i32).to_le_bytes();
                 *mem.get(offset + 4) = (len as i32).to_le_bytes();
@@ -348,10 +343,9 @@ impl Val {
                 discriminant,
                 value,
             } => {
-                let types = variant_types(ty, types);
-                let case_ty = types[*discriminant as usize];
-                let mut offset = offset;
-                let discriminant_size = DiscriminantSize::from_count(types.len()).unwrap();
+                let variant_types = variant_types(ty, types);
+                let case_ty = variant_types[*discriminant as usize];
+                let discriminant_size = DiscriminantSize::from_count(variant_types.len()).unwrap();
                 match discriminant_size {
                     DiscriminantSize::Size1 => {
                         u8::try_from(*discriminant).unwrap().store(mem, offset)?
@@ -373,7 +367,7 @@ impl Val {
                         ),
                 )?;
             }
-            Val::Flags { count, value } => match FlagsSize::from_count(count) {
+            Val::Flags { count, value } => match FlagsSize::from_count(*count as usize) {
                 FlagsSize::Size1 => u8::try_from(value[0]).unwrap().store(mem, offset)?,
                 FlagsSize::Size2 => u16::try_from(value[0]).unwrap().store(mem, offset)?,
                 FlagsSize::Size4Plus(_) => {
@@ -429,15 +423,15 @@ impl Val {
             InterfaceType::Variant(_)
             | InterfaceType::Enum(_)
             | InterfaceType::Union(_)
-            | InterfaceType::Optional(_)
+            | InterfaceType::Option(_)
             | InterfaceType::Expected(_) => {
-                let types = variant_types(ty, types);
+                let variant_types = variant_types(ty, types);
                 let discriminant = next(src).get_u32();
-                let case_ty = types.get(discriminant as usize).ok_or_else(|| {
+                let case_ty = variant_types.get(discriminant as usize).ok_or_else(|| {
                     anyhow!(
                         "discriminant {} out of range [0..{})",
                         discriminant,
-                        types.len()
+                        variant_types.len()
                     )
                 })?;
                 let value = Rc::new(Self::lift(store, options, case_ty, types, src)?);
@@ -458,7 +452,7 @@ impl Val {
         })
     }
 
-    fn load(
+    pub(crate) fn load(
         store: &StoreOpaque,
         mem: &Memory,
         ty: &InterfaceType,
@@ -479,13 +473,13 @@ impl Val {
             InterfaceType::Float64 => Val::Float64(u64::load(mem, bytes)?),
             InterfaceType::Char => Val::Char(char::load(mem, bytes)?),
             InterfaceType::String => {
-                Val::String(Rc::from(WasmStr::load(mem, bytes)?.to_str(store)?.deref()))
+                Val::String(Rc::from(WasmStr::load(mem, bytes)?._to_str(store)?.deref()))
             }
             InterfaceType::List(index) => {
                 let element_type = &types[*index];
                 // FIXME: needs memory64 treatment
-                let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-                let len = u32::from_le_bytes(bytes[4..].try_into().unwrap());
+                let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(bytes[4..].try_into().unwrap()) as usize;
                 let SizeAndAlignment {
                     size: element_size,
                     alignment: element_alignment,
@@ -495,7 +489,7 @@ impl Val {
                     .checked_mul(element_size)
                     .and_then(|len| ptr.checked_add(len))
                 {
-                    Some(n) if n <= memory.as_slice().len() => {}
+                    Some(n) if n <= mem.as_slice().len() => {}
                     _ => bail!("list pointer/length out of bounds of memory"),
                 }
                 if ptr % usize::try_from(element_alignment)? != 0 {
@@ -510,23 +504,24 @@ impl Val {
                                 mem,
                                 element_type,
                                 types,
-                                &memory.as_slice()[ptr + (index * element_size)..][..element_size],
+                                &mem.as_slice()[ptr + (index * element_size)..][..element_size],
                             )
                         })
-                        .collect::<Result<_>>(),
+                        .collect::<Result<_>>()?,
                 )
             }
             InterfaceType::Record(_) | InterfaceType::Tuple(_) | InterfaceType::Unit => {
+                let mut offset = 0;
                 Val::Record(
                     record_types(ty, types)
                         .into_iter()
                         .map(|ty| {
                             Self::load(
                                 store,
-                                options,
+                                mem,
                                 ty,
                                 types,
-                                &bytes[next_field(ty, &mut offset)..]
+                                &bytes[next_field(ty, types, &mut offset)..]
                                     [..SizeAndAlignment::from(ty, types).size],
                             )
                         })
@@ -536,20 +531,20 @@ impl Val {
             InterfaceType::Variant(_)
             | InterfaceType::Enum(_)
             | InterfaceType::Union(_)
-            | InterfaceType::Optional(_)
+            | InterfaceType::Option(_)
             | InterfaceType::Expected(_) => {
-                let types = variant_types(ty, types);
-                let discriminant_size = DiscriminantSize::from_count(types.len()).unwrap();
+                let variant_types = variant_types(ty, types);
+                let discriminant_size = DiscriminantSize::from_count(variant_types.len()).unwrap();
                 let discriminant = match discriminant_size {
                     DiscriminantSize::Size1 => u8::load(mem, &bytes[..1])? as u32,
                     DiscriminantSize::Size2 => u16::load(mem, &bytes[..2])? as u32,
-                    DiscriminantSize::Size1 => u32::load(mem, &bytes[..4])?,
+                    DiscriminantSize::Size4 => u32::load(mem, &bytes[..4])?,
                 };
-                let case_ty = types.get(discriminant as usize).ok_or_else(|| {
+                let case_ty = variant_types.get(discriminant as usize).ok_or_else(|| {
                     anyhow!(
                         "discriminant {} out of range [0..{})",
                         discriminant,
-                        types.len()
+                        variant_types.len()
                     )
                 })?;
                 let value = Rc::new(Self::load(
@@ -569,19 +564,23 @@ impl Val {
                 }
             }
             InterfaceType::Flags(index) => {
-                Val::Flags(match FlagsSize::from_count(types[*index].names) {
-                    FlagsSize::Size1 => iter::once(u8::load(mem, bytes)? as u32).collect(),
-                    FlagsSize::Size2 => iter::once(u16::load(mem, bytes)? as u32).collect(),
-                    FlagsSize::Size4Plus(n) => (0..n)
-                        .map(|index| u32::load(mem, bytes[index * 4..][..4]))
-                        .collect::<Result<_>>()?,
-                })
+                let count = types[*index].names.len();
+                Val::Flags {
+                    count: u32::try_from(count)?,
+                    value: match FlagsSize::from_count(count) {
+                        FlagsSize::Size1 => iter::once(u8::load(mem, bytes)? as u32).collect(),
+                        FlagsSize::Size2 => iter::once(u16::load(mem, bytes)? as u32).collect(),
+                        FlagsSize::Size4Plus(n) => (0..n)
+                            .map(|index| u32::load(mem, &bytes[index * 4..][..4]))
+                            .collect::<Result<_>>()?,
+                    },
+                }
             }
         })
     }
 }
 
-fn record_types(ty: &InterfaceType, types: &ComponentTypes) -> Vec<&InterfaceType> {
+fn record_types<'a>(ty: &InterfaceType, types: &'a ComponentTypes) -> Vec<&'a InterfaceType> {
     match ty {
         InterfaceType::Record(index) => types[*index]
             .fields
@@ -594,11 +593,7 @@ fn record_types(ty: &InterfaceType, types: &ComponentTypes) -> Vec<&InterfaceTyp
     }
 }
 
-fn variant_types(
-    ty: &InterfaceType,
-    types: &ComponentTypes,
-    discriminant: usize,
-) -> Vec<&InterfaceType> {
+fn variant_types<'a>(ty: &InterfaceType, types: &'a ComponentTypes) -> Vec<&'a InterfaceType> {
     match ty {
         InterfaceType::Variant(index) => types[*index]
             .cases
@@ -611,7 +606,7 @@ fn variant_types(
             .map(|_| &InterfaceType::Unit)
             .collect(),
         InterfaceType::Union(index) => types[*index].types.iter().collect(),
-        InterfaceType::Optional(index) => {
+        InterfaceType::Option(index) => {
             vec![&InterfaceType::Unit, &types[*index]]
         }
         InterfaceType::Expected(index) => {
@@ -626,14 +621,13 @@ fn lower_list<T>(
     mem: &mut MemoryMut<'_, T>,
     ty: &InterfaceType,
     types: &ComponentTypes,
-    vec: &[Val],
+    items: &[Val],
 ) -> Result<(usize, usize)> {
     let element_type = if let InterfaceType::List(index) = ty {
         &types[*index]
     } else {
         unreachable!()
     };
-    let memory = &mut MemoryMut::new(store.as_context_mut(), options);
     let SizeAndAlignment {
         size: element_size,
         alignment: element_alignment,
@@ -642,13 +636,13 @@ fn lower_list<T>(
         .len()
         .checked_mul(element_size)
         .ok_or_else(|| anyhow::anyhow!("size overflow copying a list"))?;
-    let ptr = memory.realloc(0, 0, element_alignment, size)?;
+    let ptr = mem.realloc(0, 0, element_alignment, size)?;
     let mut element_ptr = ptr;
     for item in items {
-        item.store(memory, ty, types, element_ptr)?;
+        item.store(mem, ty, types, element_ptr)?;
         element_ptr += element_size;
     }
-    (ptr, items.len())
+    Ok((ptr, items.len()))
 }
 
 pub(crate) fn flatten_count(ty: &InterfaceType, types: &ComponentTypes) -> usize {
@@ -683,6 +677,7 @@ pub(crate) fn flatten_count(ty: &InterfaceType, types: &ComponentTypes) -> usize
                     .iter()
                     .map(|case| flatten_count(&case.ty, types))
                     .max()
+                    .unwrap_or(0)
         }
 
         InterfaceType::List(_) => mem::size_of::<ValRaw>() * 2,
@@ -694,7 +689,8 @@ pub(crate) fn flatten_count(ty: &InterfaceType, types: &ComponentTypes) -> usize
             .sum(),
 
         InterfaceType::Flags(index) => {
-            mem::size_of::<ValRaw>() * func::ceiling_divide(types[*index].names, 32).max(1)
+            mem::size_of::<ValRaw>()
+                * component_util::ceiling_divide(types[*index].names.len(), 32).max(1)
         }
 
         InterfaceType::Union(index) => {
@@ -704,6 +700,7 @@ pub(crate) fn flatten_count(ty: &InterfaceType, types: &ComponentTypes) -> usize
                     .iter()
                     .map(|ty| flatten_count(ty, types))
                     .max()
+                    .unwrap_or(0)
         }
 
         InterfaceType::Option(index) => {
@@ -768,7 +765,7 @@ impl SizeAndAlignment {
             InterfaceType::Record(index) => {
                 let mut offset = 0;
                 let mut align = 1;
-                for field in &types[*index].fields {
+                for field in types[*index].fields.iter() {
                     let SizeAndAlignment { size, alignment } = Self::from(&field.ty, types);
                     offset = align_to(offset, alignment) + size;
                     align = align.max(alignment);
@@ -782,21 +779,22 @@ impl SizeAndAlignment {
 
             InterfaceType::Variant(index) => {
                 let cases = &types[*index].cases;
-                let discriminant_size =
-                    usize::from(DiscriminantSize::from_count(cases.len()).unwrap());
-                let alignment = discriminant_size.max(
+                let discriminant_size = DiscriminantSize::from_count(cases.len()).unwrap();
+                let alignment = u32::from(discriminant_size).max(
                     cases
                         .iter()
                         .map(|case| Self::from(&case.ty, types).alignment)
-                        .max(),
+                        .max()
+                        .unwrap_or(0),
                 );
 
                 Self {
-                    size: align_to(discriminant_size, alignment)
+                    size: align_to(usize::from(discriminant_size), alignment)
                         + cases
                             .iter()
                             .map(|case| Self::from(&case.ty, types).size)
-                            .max(),
+                            .max()
+                            .unwrap_or(0),
                     alignment,
                 }
             }
@@ -804,7 +802,7 @@ impl SizeAndAlignment {
             InterfaceType::Tuple(index) => {
                 let mut offset = 0;
                 let mut align = 1;
-                for ty in &types[*index].types {
+                for ty in types[*index].types.iter() {
                     let SizeAndAlignment { size, alignment } = Self::from(ty, types);
                     offset = align_to(offset, alignment) + size;
                     align = align.max(alignment);
@@ -825,22 +823,30 @@ impl SizeAndAlignment {
                     size: 2,
                     alignment: 2,
                 },
-                FlgasSize::Size4Plus(n) => Self {
+                FlagsSize::Size4Plus(n) => Self {
                     size: n * 4,
                     alignment: 4,
                 },
             },
 
             InterfaceType::Union(index) => {
-                let types = &types[*index].types;
-                let discriminant_size =
-                    usize::from(DiscriminantSize::from_count(types.len()).unwrap());
-                let alignment = discriminant_size
-                    .max(types.iter().map(|ty| Self::from(ty, types).alignment).max());
+                let union_types = &types[*index].types;
+                let discriminant_size = DiscriminantSize::from_count(union_types.len()).unwrap();
+                let alignment = u32::from(discriminant_size).max(
+                    union_types
+                        .iter()
+                        .map(|ty| Self::from(ty, types).alignment)
+                        .max()
+                        .unwrap_or(0),
+                );
 
                 Self {
-                    size: align_to(discriminant_size, alignment)
-                        + types.iter().map(|tu| Self::from(ty, types).size).max(),
+                    size: align_to(usize::from(discriminant_size), alignment)
+                        + union_types
+                            .iter()
+                            .map(|ty| Self::from(ty, types).size)
+                            .max()
+                            .unwrap_or(0),
                     alignment,
                 }
             }
@@ -856,18 +862,20 @@ impl SizeAndAlignment {
 
             InterfaceType::Expected(index) => {
                 let SizeAndAlignment {
-                    ok_size,
-                    ok_alignment,
+                    size: ok_size,
+                    alignment: ok_alignment,
                 } = Self::from(&types[*index].ok, types);
 
                 let SizeAndAlignment {
-                    err_size,
-                    err_alignment,
+                    size: err_size,
+                    alignment: err_alignment,
                 } = Self::from(&types[*index].err, types);
+
+                let alignment = ok_alignment.max(err_alignment);
 
                 Self {
                     size: align_to(1, alignment) + ok_size.max(err_size),
-                    alignment: ok_alignment.max(err_alignment),
+                    alignment,
                 }
             }
         }
