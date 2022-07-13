@@ -25,16 +25,38 @@ fn primitives() -> Result<()> {
     ] {
         let component = Component::new(&engine, make_echo_component_with_params(ty, &[param]))?;
         let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
-
-        let output = instance
-            .get_func(&mut store, "echo")
-            .unwrap()
-            .call(&mut store, &[input.clone()])?;
+        let func = instance.get_func(&mut store, "echo").unwrap();
+        let output = func.call(&mut store, &[input.clone()])?;
 
         assert_eq!(input, output);
     }
 
-    // TODO: sad paths
+    // Sad path: type mismatch
+
+    let component = Component::new(
+        &engine,
+        make_echo_component_with_params("float64", &[Type::F64]),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let func = instance.get_func(&mut store, "echo").unwrap();
+
+    assert!(func.call(&mut store, &[Val::U64(42)]).is_err());
+
+    // Sad path: arity mismatch (too many)
+
+    assert!(func
+        .call(
+            &mut store,
+            &[
+                Val::Float64(3.14159265_f64.to_bits()),
+                Val::Float64(3.14159265_f64.to_bits())
+            ]
+        )
+        .is_err());
+
+    // Sad path: arity mismatch (too few)
+
+    assert!(func.call(&mut store, &[]).is_err());
 
     Ok(())
 }
@@ -46,16 +68,11 @@ fn strings() -> Result<()> {
 
     let component = Component::new(&engine, make_echo_component("string", 8))?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
-
+    let func = instance.get_func(&mut store, "echo").unwrap();
     let input = Val::String(Rc::from("hello, component!"));
-    let output = instance
-        .get_func(&mut store, "echo")
-        .unwrap()
-        .call(&mut store, &[input.clone()])?;
+    let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
-
-    // TODO: sad paths
 
     Ok(())
 }
@@ -67,20 +84,28 @@ fn lists() -> Result<()> {
 
     let component = Component::new(&engine, make_echo_component("(list u32)", 8))?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
-
+    let func = instance.get_func(&mut store, "echo").unwrap();
     let input = Val::List(Rc::new([
         Val::U32(32343),
         Val::U32(79023439),
         Val::U32(2084037802),
     ]));
-    let output = instance
-        .get_func(&mut store, "echo")
-        .unwrap()
-        .call(&mut store, &[input.clone()])?;
+    let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
 
-    // TODO: sad paths
+    // Sad path: type mismatch
+
+    assert!(func
+        .call(
+            &mut store,
+            &[Val::List(Rc::new([
+                Val::U32(32343),
+                Val::U32(79023439),
+                Val::Float32(3.14159265_f32.to_bits()),
+            ]))]
+        )
+        .is_err());
 
     Ok(())
 }
@@ -98,20 +123,54 @@ fn records() -> Result<()> {
         ),
     )?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
-
+    let func = instance.get_func(&mut store, "echo").unwrap();
     let input = Val::Record(Rc::new([
         Val::U32(32343),
         Val::Float64(3.14159265_f64.to_bits()),
         Val::Record(Rc::new([Val::Bool(false), Val::U32(2084037802)])),
     ]));
-    let output = instance
-        .get_func(&mut store, "echo")
-        .unwrap()
-        .call(&mut store, &[input.clone()])?;
+    let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
 
-    // TODO: sad paths
+    // Sad path: type mismatch
+
+    assert!(func
+        .call(
+            &mut store,
+            &[Val::Record(Rc::new([
+                Val::S32(32343),
+                Val::Float64(3.14159265_f64.to_bits()),
+                Val::Record(Rc::new([Val::Bool(false), Val::U32(2084037802)])),
+            ]))]
+        )
+        .is_err());
+
+    // Sad path: too many fields
+
+    assert!(func
+        .call(
+            &mut store,
+            &[Val::Record(Rc::new([
+                Val::U32(32343),
+                Val::Float64(3.14159265_f64.to_bits()),
+                Val::Record(Rc::new([Val::Bool(false), Val::U32(2084037802)])),
+                Val::Record(Rc::new([]))
+            ]))]
+        )
+        .is_err());
+
+    // Sad path: too few fields
+
+    assert!(func
+        .call(
+            &mut store,
+            &[Val::Record(Rc::new([
+                Val::U32(32343),
+                Val::Float64(3.14159265_f64.to_bits()),
+            ]))]
+        )
+        .is_err());
 
     Ok(())
 }
@@ -129,19 +188,38 @@ fn variants() -> Result<()> {
         ),
     )?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
-
+    let func = instance.get_func(&mut store, "echo").unwrap();
     let input = Val::Variant {
         discriminant: 1,
         value: Rc::new(Val::Float64(3.14159265_f64.to_bits())),
     };
-    let output = instance
-        .get_func(&mut store, "echo")
-        .unwrap()
-        .call(&mut store, &[input.clone()])?;
+    let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
 
-    // TODO: sad paths
+    // Sad path: type mismatch
+
+    assert!(func
+        .call(
+            &mut store,
+            &[Val::Variant {
+                discriminant: 1,
+                value: Rc::new(Val::U64(314159265)),
+            }]
+        )
+        .is_err());
+
+    // Sad path: unknown discriminant
+
+    assert!(func
+        .call(
+            &mut store,
+            &[Val::Variant {
+                discriminant: 3,
+                value: Rc::new(Val::U64(314159265)),
+            }]
+        )
+        .is_err());
 
     Ok(())
 }
@@ -156,19 +234,38 @@ fn flags() -> Result<()> {
         make_echo_component_with_params(r#"(flags "A" "B" "C" "D" "E")"#, &[Type::U8]),
     )?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
-
+    let func = instance.get_func(&mut store, "echo").unwrap();
     let input = Val::Flags {
         count: 5,
         value: Rc::new([0b10101]),
     };
-    let output = instance
-        .get_func(&mut store, "echo")
-        .unwrap()
-        .call(&mut store, &[input.clone()])?;
+    let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
 
-    // TODO: sad paths
+    // Sad path: too many flags
+
+    assert!(func
+        .call(
+            &mut store,
+            &[Val::Flags {
+                count: 6,
+                value: Rc::new([0b110101]),
+            }]
+        )
+        .is_err());
+
+    // Sad path: too few flags
+
+    assert!(func
+        .call(
+            &mut store,
+            &[Val::Flags {
+                count: 4,
+                value: Rc::new([0b0101]),
+            }]
+        )
+        .is_err());
 
     Ok(())
 }
@@ -204,6 +301,8 @@ fn everything() -> Result<()> {
                 (field "X" unit)
                 (field "Y" (tuple u32 u32))
                 (field "Z" (union u32 float64))
+                (field "a" (option u32))
+                (field "b" (expected string string))
             )"#,
             &[
                 Type::I32,
@@ -227,11 +326,16 @@ fn everything() -> Result<()> {
                 Type::I32,
                 Type::I32,
                 Type::I64,
+                Type::U8,
+                Type::I32,
+                Type::U8,
+                Type::I32,
+                Type::I32,
             ],
         ),
     )?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
-
+    let func = instance.get_func(&mut store, "echo").unwrap();
     let input = Val::Record(Rc::new([
         Val::U32(32343),
         Val::Variant {
@@ -267,11 +371,16 @@ fn everything() -> Result<()> {
             discriminant: 1,
             value: Rc::new(Val::Float64(3.14159265_f64.to_bits())),
         },
+        Val::Variant {
+            discriminant: 1,
+            value: Rc::new(Val::U32(314159265)),
+        },
+        Val::Variant {
+            discriminant: 0,
+            value: Rc::new(Val::String(Rc::from("no problem"))),
+        },
     ]));
-    let output = instance
-        .get_func(&mut store, "echo")
-        .unwrap()
-        .call(&mut store, &[input.clone()])?;
+    let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
 
