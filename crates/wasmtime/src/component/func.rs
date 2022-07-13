@@ -288,8 +288,8 @@ impl Func {
 
         let instance = store.0[instance.0].as_ref().unwrap().instance();
         let flags = instance.flags(component_instance);
-        let param_count = dbg!(params.iter().map(|ty| ty.flatten_count()).sum::<usize>());
-        let result_count = dbg!(result.flatten_count());
+        let param_count = params.iter().map(|ty| ty.flatten_count()).sum::<usize>();
+        let result_count = result.flatten_count();
         let mut space = Vec::new();
 
         unsafe {

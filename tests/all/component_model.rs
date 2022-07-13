@@ -151,13 +151,36 @@ fn components_importing_modules() -> Result<()> {
     Ok(())
 }
 
+#[derive(PartialEq, Eq)]
+enum Primitive {
+    I32,
+    I64,
+    F32,
+    F64,
+}
+
 fn make_echo_component(type_definition: &str, type_size: u32) -> String {
-    if type_size <= 4 {
+    make_echo_component_with_primitive(type_definition, type_size, Primitive::I32)
+}
+
+fn make_echo_component_with_primitive(
+    type_definition: &str,
+    type_size: u32,
+    primitive: Primitive,
+) -> String {
+    let (width, name) = match primitive {
+        Primitive::I32 => (4, "i32"),
+        Primitive::I64 => (8, "i64"),
+        Primitive::F32 => (4, "f32"),
+        Primitive::F64 => (8, "f64"),
+    };
+
+    if type_size <= width {
         format!(
             r#"
             (component
                 (core module $m
-                    (func (export "echo") (param i32) (result i32)
+                    (func (export "echo") (param {}) (result {})
                         local.get 0
                     )
 
@@ -172,9 +195,11 @@ fn make_echo_component(type_definition: &str, type_size: u32) -> String {
                     (canon lift (core func $i "echo") (memory $i "memory"))
                 )
             )"#,
-            type_definition
+            name, name, type_definition
         )
     } else {
+        assert!(primitive == Primitive::I32);
+
         let mut params = String::new();
         let mut store = String::new();
 
