@@ -1,4 +1,4 @@
-use crate::component::func::{align_to, Lift, Lower, Memory, MemoryMut, Options, WasmStr};
+use crate::component::func::{self, Lift, Lower, Memory, MemoryMut, Options, WasmStr};
 use crate::store::StoreOpaque;
 use crate::{AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{anyhow, bail, Result};
@@ -424,7 +424,7 @@ impl Val {
                     mem,
                     case_ty,
                     offset
-                        + align_to(
+                        + func::align_to(
                             discriminant_size.into(),
                             SizeAndAlignment::from(ty).alignment,
                         ),
@@ -596,7 +596,7 @@ impl Val {
                     store,
                     mem,
                     case_ty,
-                    &bytes[align_to(
+                    &bytes[func::align_to(
                         usize::from(discriminant_size),
                         SizeAndAlignment::from(ty).alignment,
                     )..][..SizeAndAlignment::from(case_ty).size],
@@ -681,7 +681,7 @@ impl SizeAndAlignment {
                 let mut align = 1;
                 for ty in types.iter() {
                     let SizeAndAlignment { size, alignment } = Self::from(ty);
-                    offset = align_to(offset, alignment) + size;
+                    offset = func::align_to(offset, alignment) + size;
                     align = align.max(alignment);
                 }
 
@@ -702,7 +702,7 @@ impl SizeAndAlignment {
                 }
 
                 Self {
-                    size: align_to(usize::from(discriminant_size), alignment) + size,
+                    size: func::align_to(usize::from(discriminant_size), alignment) + size,
                     alignment,
                 }
             }
@@ -727,7 +727,7 @@ impl SizeAndAlignment {
 
 pub(crate) fn next_field(ty: &Type, offset: &mut usize) -> usize {
     let SizeAndAlignment { size, alignment } = SizeAndAlignment::from(ty);
-    *offset = align_to(*offset, alignment);
+    *offset = func::align_to(*offset, alignment);
     let result = *offset;
     *offset += size;
     result

@@ -1,5 +1,7 @@
 use anyhow::Result;
 use std::fmt::Write;
+use std::iter;
+use wasmtime::component::__internal::align_to;
 use wasmtime::component::{Component, ComponentParams, Lift, Lower, TypedFunc};
 use wasmtime::{AsContextMut, Config, Engine};
 
@@ -151,92 +153,141 @@ fn components_importing_modules() -> Result<()> {
     Ok(())
 }
 
-#[derive(PartialEq, Eq)]
-enum Primitive {
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Type {
+    S8,
+    U8,
+    S16,
+    U16,
     I32,
     I64,
     F32,
     F64,
 }
 
-fn make_echo_component(type_definition: &str, type_size: u32) -> String {
-    make_echo_component_with_primitive(type_definition, type_size, Primitive::I32)
+impl Type {
+    fn size(&self) -> u32 {
+        match self {
+            Self::S8 | Self::U8 => 1,
+            Self::S16 | Self::U16 => 2,
+            Self::I32 | Self::F32 => 4,
+            Self::I64 | Self::F64 => 8,
+        }
+    }
+
+    fn store(&self) -> &'static str {
+        match self {
+            Self::S8 | Self::U8 => "store8",
+            Self::S16 | Self::U16 => "store16",
+            Self::I32 | Self::F32 | Self::I64 | Self::F64 => "store",
+        }
+    }
+
+    fn primitive(&self) -> &'static str {
+        match self {
+            Self::S8 | Self::U8 | Self::S16 | Self::U16 | Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        }
+    }
 }
 
-fn make_echo_component_with_primitive(
-    type_definition: &str,
-    type_size: u32,
-    primitive: Primitive,
-) -> String {
-    let (width, name) = match primitive {
-        Primitive::I32 => (4, "i32"),
-        Primitive::I64 => (8, "i64"),
-        Primitive::F32 => (4, "f32"),
-        Primitive::F64 => (8, "f64"),
-    };
+fn make_echo_component(type_definition: &str, type_size: u32) -> String {
+    make_echo_component_with_params(
+        type_definition,
+        &iter::repeat(Type::I32)
+            .take(usize::try_from(type_size).unwrap() / 4)
+            .collect::<Vec<_>>(),
+    )
+}
 
-    if type_size <= width {
-        format!(
-            r#"
-            (component
-                (core module $m
-                    (func (export "echo") (param {}) (result {})
-                        local.get 0
+fn make_echo_component_with_params(type_definition: &str, params: &[Type]) -> String {
+    match params {
+        [param] => {
+            let primitive = param.primitive();
+
+            format!(
+                r#"
+                (component
+                    (core module $m
+                        (func (export "echo") (param {primitive}) (result {primitive})
+                            local.get 0
+                        )
+
+                        (memory (export "memory") 1)
+                        {REALLOC_AND_FREE}
                     )
 
-                    (memory (export "memory") 1)
-                )
+                    (core instance $i (instantiate $m))
 
-                (core instance $i (instantiate $m))
+                    (type $Foo {type_definition})
 
-                (type $Foo {})
-
-                (func (export "echo") (param $Foo) (result $Foo)
-                    (canon lift (core func $i "echo") (memory $i "memory"))
-                )
-            )"#,
-            name, name, type_definition
-        )
-    } else {
-        assert!(primitive == Primitive::I32);
-
-        let mut params = String::new();
-        let mut store = String::new();
-
-        for index in 0..(type_size / 4) {
-            params.push_str(" i32");
-            write!(
-                &mut store,
-                "(i32.store offset={} (local.get $base) (local.get {}))",
-                index * 4,
-                index,
+                    (func (export "echo") (param $Foo) (result $Foo)
+                        (canon lift
+                            (core func $i "echo")
+                            (memory $i "memory")
+                            (realloc (func $i "realloc"))
+                        )
+                    )
+                )"#,
             )
-            .unwrap();
         }
+        _ => {
+            let mut param_string = String::new();
+            let mut store = String::new();
+            let mut offset = 0;
 
-        format!(
-            r#"
-            (component
-                (core module $m
-                    (func (export "echo") (param{}) (result i32)
-                        (local $base i32)
-                        (local.set $base (i32.const 0))
-                        {}
-                        local.get $base
+            for (index, param) in params.iter().enumerate() {
+                let primitive = param.primitive();
+                let size = param.size();
+                offset = align_to(offset, size);
+
+                write!(&mut param_string, " {primitive}").unwrap();
+                write!(
+                    &mut store,
+                    "({primitive}.{} offset={} (local.get $base) (local.get {index}))",
+                    param.store(),
+                    offset,
+                )
+                .unwrap();
+
+                offset += usize::try_from(size).unwrap();
+            }
+
+            format!(
+                r#"
+                (component
+                    (core module $m
+                        (func (export "echo") (param{param_string}) (result i32)
+                            (local $base i32)
+                            (local.set $base
+                                (call $realloc
+                                    (i32.const 0)
+                                    (i32.const 0)
+                                    (i32.const 4)
+                                    (i32.const {offset})))
+                            {store}
+                            local.get $base
+                        )
+
+                        (memory (export "memory") 1)
+                        {REALLOC_AND_FREE}
                     )
 
-                    (memory (export "memory") 1)
-                )
+                    (core instance $i (instantiate $m))
 
-                (core instance $i (instantiate $m))
+                    (type $Foo {type_definition})
 
-                (type $Foo {})
-
-                (func (export "echo") (param $Foo) (result $Foo)
-                    (canon lift (core func $i "echo") (memory $i "memory"))
-                )
-            )"#,
-            params, store, type_definition
-        )
+                    (func (export "echo") (param $Foo) (result $Foo)
+                        (canon lift
+                            (core func $i "echo")
+                            (memory $i "memory")
+                            (realloc (func $i "realloc"))
+                        )
+                    )
+                )"#
+            )
+        }
     }
 }
