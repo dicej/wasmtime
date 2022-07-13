@@ -41,6 +41,7 @@ const CRATES_TO_PUBLISH: &[&str] = &[
     "wiggle-macro",
     // wasmtime
     "wasmtime-component-macro",
+    "wasmtime-component-util",
     "wasmtime-jit-debug",
     "wasmtime-fiber",
     "wasmtime-environ",

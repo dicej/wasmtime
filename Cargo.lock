@@ -451,10 +451,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "component-util"
-version = "0.1.0"
-
-[[package]]
 name = "console"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3319,7 +3315,6 @@ dependencies = [
  "backtrace",
  "bincode",
  "cfg-if",
- "component-util",
  "indexmap",
  "libc",
  "log",
@@ -3335,6 +3330,7 @@ dependencies = [
  "wasmparser",
  "wasmtime-cache",
  "wasmtime-component-macro",
+ "wasmtime-component-util",
  "wasmtime-cranelift",
  "wasmtime-environ",
  "wasmtime-fiber",
@@ -3464,11 +3460,15 @@ dependencies = [
 name = "wasmtime-component-macro"
 version = "0.40.0"
 dependencies = [
- "component-util",
  "proc-macro2",
  "quote",
  "syn",
+ "wasmtime-component-util",
 ]
+
+[[package]]
+name = "wasmtime-component-util"
+version = "0.40.0"
 
 [[package]]
 name = "wasmtime-cranelift"

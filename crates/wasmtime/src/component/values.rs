@@ -2,10 +2,10 @@ use crate::component::func::{self, Lift, Lower, Memory, MemoryMut, Options, Wasm
 use crate::store::StoreOpaque;
 use crate::{AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{anyhow, bail, Result};
-use component_util::{DiscriminantSize, FlagsSize};
 use std::iter;
 use std::ops::Deref;
 use std::rc::Rc;
+use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 use wasmtime_environ::component::{ComponentTypes, InterfaceType};
 
 /// Represents an owned, despecialized version of `InterfaceType`
@@ -130,7 +130,7 @@ impl Type {
 
             Type::Variant(types) => 1 + types.iter().map(Type::flatten_count).max().unwrap_or(0),
 
-            Type::Flags(count) => component_util::ceiling_divide(*count, 32).max(1),
+            Type::Flags(count) => wasmtime_component_util::ceiling_divide(*count, 32).max(1),
         }
     }
 
@@ -274,7 +274,7 @@ impl Val {
                     );
                 }
 
-                if component_util::ceiling_divide(count, 32) > value.len() {
+                if wasmtime_component_util::ceiling_divide(count, 32) > value.len() {
                     bail!(
                         "value count {} must not be larger than required by flag count {}",
                         value.len() * 32,

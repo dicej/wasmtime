@@ -1,4 +1,3 @@
-use component_util::{DiscriminantSize, FlagsSize};
 use proc_macro2::{Literal, TokenStream, TokenTree};
 use quote::{format_ident, quote};
 use std::collections::HashSet;
@@ -6,6 +5,7 @@ use std::fmt;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{braced, parse_macro_input, parse_quote, Data, DeriveInput, Error, Result, Token};
+use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 
 #[derive(Debug, Copy, Clone)]
 enum VariantStyle {
