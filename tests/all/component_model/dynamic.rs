@@ -107,3 +107,161 @@ fn records() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn variants() -> Result<()> {
+    let engine = super::engine();
+    let mut store = Store::new(&engine, ());
+
+    let component = Component::new(
+        &engine,
+        make_echo_component_with_params(
+            r#"(variant (case "A" u32) (case "B" float64) (case "C" (record (field "D" bool) (field "E" u32))))"#,
+            &[Type::U8, Type::I64, Type::I32],
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+
+    let input = Val::Variant {
+        discriminant: 1,
+        value: Rc::new(Val::Float64(3.14159265_f64.to_bits())),
+    };
+    let output = instance
+        .get_func(&mut store, "echo")
+        .unwrap()
+        .call(&mut store, &[input.clone()])?;
+
+    assert_eq!(input, output);
+
+    Ok(())
+}
+
+#[test]
+fn flags() -> Result<()> {
+    let engine = super::engine();
+    let mut store = Store::new(&engine, ());
+
+    let component = Component::new(
+        &engine,
+        make_echo_component_with_params(r#"(flags "A" "B" "C" "D" "E")"#, &[Type::U8]),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+
+    let input = Val::Flags {
+        count: 5,
+        value: Rc::new([0b10101]),
+    };
+    let output = instance
+        .get_func(&mut store, "echo")
+        .unwrap()
+        .call(&mut store, &[input.clone()])?;
+
+    assert_eq!(input, output);
+
+    Ok(())
+}
+
+#[test]
+fn everything() -> Result<()> {
+    // This serves to test both nested types and storing parameters on the heap (i.e. exceeding `MAX_STACK_PARAMS)
+
+    let engine = super::engine();
+    let mut store = Store::new(&engine, ());
+
+    let component = Component::new(
+        &engine,
+        make_echo_component_with_params(
+            r#"
+            (record
+                (field "A" u32)
+                (field "B" (enum "1" "2"))
+                (field "C" (record (field "D" bool) (field "E" u32)))
+                (field "F" (list (flags "G" "H" "I")))
+                (field "J" (variant
+                               (case "K" u32)
+                               (case "L" float64)
+                               (case "M" (record (field "N" bool) (field "O" u32)))))
+                (field "P" s8)
+                (field "Q" s16)
+                (field "R" s32)
+                (field "S" s64)
+                (field "T" float32)
+                (field "U" float64)
+                (field "V" string)
+                (field "W" char)
+                (field "X" unit)
+                (field "Y" (tuple u32 u32))
+                (field "Z" (union u32 float64))
+            )"#,
+            &[
+                Type::I32,
+                Type::U8,
+                Type::U8,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+                Type::U8,
+                Type::I64,
+                Type::I32,
+                Type::S8,
+                Type::S16,
+                Type::I32,
+                Type::I64,
+                Type::F32,
+                Type::F64,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+                Type::I32,
+                Type::I64,
+            ],
+        ),
+    )?;
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+
+    let input = Val::Record(Rc::new([
+        Val::U32(32343),
+        Val::Variant {
+            discriminant: 1,
+            value: Rc::new(Val::Record(Rc::new([]))),
+        },
+        Val::Record(Rc::new([Val::Bool(false), Val::U32(2084037802)])),
+        Val::List(Rc::new([
+            Val::Flags {
+                count: 3,
+                value: Rc::new([0b101]),
+            },
+            Val::Flags {
+                count: 3,
+                value: Rc::new([0b010]),
+            },
+        ])),
+        Val::Variant {
+            discriminant: 1,
+            value: Rc::new(Val::Float64(3.14159265_f64.to_bits())),
+        },
+        Val::S8(42),
+        Val::S16(4242),
+        Val::S32(42424242),
+        Val::S64(424242424242424242),
+        Val::Float32(3.14159265_f32.to_bits()),
+        Val::Float64(3.14159265_f64.to_bits()),
+        Val::String(Rc::from("wow, nice types")),
+        Val::Char('🦀'),
+        Val::Record(Rc::new([])),
+        Val::Record(Rc::new([Val::U32(42), Val::U32(24)])),
+        Val::Variant {
+            discriminant: 1,
+            value: Rc::new(Val::Float64(3.14159265_f64.to_bits())),
+        },
+    ]));
+    let output = instance
+        .get_func(&mut store, "echo")
+        .unwrap()
+        .call(&mut store, &[input.clone()])?;
+
+    assert_eq!(input, output);
+
+    Ok(())
+}

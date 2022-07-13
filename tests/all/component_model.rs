@@ -203,91 +203,92 @@ fn make_echo_component(type_definition: &str, type_size: u32) -> String {
 }
 
 fn make_echo_component_with_params(type_definition: &str, params: &[Type]) -> String {
-    match params {
-        [param] => {
-            let primitive = param.primitive();
+    if params.len() == 1 || params.len() > 16 {
+        let primitive = if params.len() == 1 {
+            params[0].primitive()
+        } else {
+            "i32"
+        };
 
-            format!(
-                r#"
-                (component
-                    (core module $m
-                        (func (export "echo") (param {primitive}) (result {primitive})
-                            local.get 0
-                        )
-
-                        (memory (export "memory") 1)
-                        {REALLOC_AND_FREE}
+        format!(
+            r#"
+            (component
+                (core module $m
+                    (func (export "echo") (param {primitive}) (result {primitive})
+                        local.get 0
                     )
 
-                    (core instance $i (instantiate $m))
-
-                    (type $Foo {type_definition})
-
-                    (func (export "echo") (param $Foo) (result $Foo)
-                        (canon lift
-                            (core func $i "echo")
-                            (memory $i "memory")
-                            (realloc (func $i "realloc"))
-                        )
-                    )
-                )"#,
-            )
-        }
-        _ => {
-            let mut param_string = String::new();
-            let mut store = String::new();
-            let mut offset = 0;
-
-            for (index, param) in params.iter().enumerate() {
-                let primitive = param.primitive();
-                let size = param.size();
-                offset = align_to(offset, size);
-
-                write!(&mut param_string, " {primitive}").unwrap();
-                write!(
-                    &mut store,
-                    "({primitive}.{} offset={} (local.get $base) (local.get {index}))",
-                    param.store(),
-                    offset,
+                    (memory (export "memory") 1)
+                    {REALLOC_AND_FREE}
                 )
-                .unwrap();
 
-                offset += usize::try_from(size).unwrap();
-            }
+                (core instance $i (instantiate $m))
 
-            format!(
-                r#"
-                (component
-                    (core module $m
-                        (func (export "echo") (param{param_string}) (result i32)
-                            (local $base i32)
-                            (local.set $base
-                                (call $realloc
-                                    (i32.const 0)
-                                    (i32.const 0)
-                                    (i32.const 4)
-                                    (i32.const {offset})))
-                            {store}
-                            local.get $base
-                        )
+                (type $Foo {type_definition})
 
-                        (memory (export "memory") 1)
-                        {REALLOC_AND_FREE}
+                (func (export "echo") (param $Foo) (result $Foo)
+                    (canon lift
+                        (core func $i "echo")
+                        (memory $i "memory")
+                        (realloc (func $i "realloc"))
                     )
+                )
+            )"#,
+        )
+    } else {
+        let mut param_string = String::new();
+        let mut store = String::new();
+        let mut offset = 0;
 
-                    (core instance $i (instantiate $m))
+        for (index, param) in params.iter().enumerate() {
+            let primitive = param.primitive();
+            let size = param.size();
+            offset = align_to(offset, size);
 
-                    (type $Foo {type_definition})
-
-                    (func (export "echo") (param $Foo) (result $Foo)
-                        (canon lift
-                            (core func $i "echo")
-                            (memory $i "memory")
-                            (realloc (func $i "realloc"))
-                        )
-                    )
-                )"#
+            write!(&mut param_string, " {primitive}").unwrap();
+            write!(
+                &mut store,
+                "({primitive}.{} offset={} (local.get $base) (local.get {index}))",
+                param.store(),
+                offset,
             )
+            .unwrap();
+
+            offset += usize::try_from(size).unwrap();
         }
+
+        format!(
+            r#"
+            (component
+                (core module $m
+                    (func (export "echo") (param{param_string}) (result i32)
+                        (local $base i32)
+                        (local.set $base
+                            (call $realloc
+                                (i32.const 0)
+                                (i32.const 0)
+                                (i32.const 4)
+                                (i32.const {offset})))
+                        {store}
+                        local.get $base
+                    )
+
+                    (memory (export "memory") 1)
+                    {REALLOC_AND_FREE}
+                )
+
+                (core instance $i (instantiate $m))
+
+                (type $Foo {type_definition})
+
+                (func (export "echo") (param $Foo) (result $Foo)
+                    (canon lift
+                        (core func $i "echo")
+                        (memory $i "memory")
+                        (realloc (func $i "realloc"))
+                    )
+                )
+            )"#
+        )
     }
 }

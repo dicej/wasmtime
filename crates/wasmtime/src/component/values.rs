@@ -354,6 +354,11 @@ impl Val {
             ) => {
                 vec.push(ValRaw::u32(*discriminant));
                 value.lower(store, options, &types[*discriminant as usize], vec)?;
+                // Pad `vec` out to max payload size:
+                vec.extend(
+                    iter::repeat(ValRaw::u32(0))
+                        .take(ty.flatten_count().checked_sub(vec.len()).unwrap()),
+                );
             }
             (Val::Flags { value, .. }, Type::Flags(_)) => {
                 vec.extend(value.iter().map(|&v| ValRaw::u32(v)));
