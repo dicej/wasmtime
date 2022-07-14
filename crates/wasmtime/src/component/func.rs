@@ -307,8 +307,7 @@ impl Func {
                 params
                     .iter()
                     .zip(args)
-                    .map(|(ty, arg)| arg.lower(store, &options, ty, &mut space))
-                    .collect::<Result<()>>()
+                    .try_for_each(|(ty, arg)| arg.lower(store, &options, ty, &mut space))
             };
             (*flags).set_may_leave(true);
             result?;

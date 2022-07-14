@@ -70,6 +70,6 @@ impl FlagsSize {
 }
 
 /// Divide `n` by `d`, rounding up in the case of a non-zero remainder.
-pub fn ceiling_divide(n: usize, d: usize) -> usize {
+fn ceiling_divide(n: usize, d: usize) -> usize {
     (n + d - 1) / d
 }

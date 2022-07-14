@@ -50,20 +50,12 @@ impl Type {
             InterfaceType::U16 => Type::U16,
             InterfaceType::S32 => Type::S32,
             InterfaceType::U32 => Type::U32,
-            InterfaceType::Char => Type::Char,
-            InterfaceType::Float32 => Type::Float32,
             InterfaceType::S64 => Type::S64,
             InterfaceType::U64 => Type::U64,
+            InterfaceType::Float32 => Type::Float32,
             InterfaceType::Float64 => Type::Float64,
-            InterfaceType::Enum(index) => Type::Variant(
-                types[*index]
-                    .names
-                    .iter()
-                    .map(|_| Type::Record(Box::new([])))
-                    .collect(),
-            ),
+            InterfaceType::Char => Type::Char,
             InterfaceType::String => Type::String,
-            InterfaceType::List(index) => Type::List(Box::new(Type::from(&types[*index], types))),
             InterfaceType::Record(index) => Type::Record(
                 types[*index]
                     .fields
@@ -78,6 +70,7 @@ impl Type {
                     .map(|case| Type::from(&case.ty, types))
                     .collect(),
             ),
+            InterfaceType::List(index) => Type::List(Box::new(Type::from(&types[*index], types))),
             InterfaceType::Tuple(index) => Type::Record(
                 types[*index]
                     .types
@@ -86,6 +79,13 @@ impl Type {
                     .collect(),
             ),
             InterfaceType::Flags(index) => Type::Flags(types[*index].names.len()),
+            InterfaceType::Enum(index) => Type::Variant(
+                types[*index]
+                    .names
+                    .iter()
+                    .map(|_| Type::Record(Box::new([])))
+                    .collect(),
+            ),
             InterfaceType::Union(index) => Type::Variant(
                 types[*index]
                     .types
@@ -130,7 +130,7 @@ impl Type {
 
             Type::Variant(types) => 1 + types.iter().map(Type::flatten_count).max().unwrap_or(0),
 
-            Type::Flags(count) => wasmtime_component_util::ceiling_divide(*count, 32).max(1),
+            Type::Flags(count) => u32_count_for_flag_count(*count),
         }
     }
 
@@ -274,7 +274,7 @@ impl Val {
                     );
                 }
 
-                if wasmtime_component_util::ceiling_divide(count, 32) > value.len() {
+                if u32_count_for_flag_count(count) > value.len() {
                     bail!(
                         "value count {} must not be larger than required by flag count {}",
                         value.len() * 32,
@@ -757,4 +757,14 @@ pub(crate) fn next_field(ty: &Type, offset: &mut usize) -> usize {
     let result = *offset;
     *offset += size;
     result
+}
+
+/// Calculate the size of a u32 array needed to represent the specified number of bit flags.
+///
+/// Note that this will always return at least 1, even if the `count` parameter is zero.
+fn u32_count_for_flag_count(count: usize) -> usize {
+    match FlagsSize::from_count(count) {
+        FlagsSize::Size1 | FlagsSize::Size2 => 1,
+        FlagsSize::Size4Plus(n) => n,
+    }
 }
