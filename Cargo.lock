@@ -451,6 +451,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "component-test-util"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "wasmtime",
+]
+
+[[package]]
 name = "console"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3415,6 +3424,7 @@ dependencies = [
  "async-trait",
  "clap 3.2.8",
  "component-macro-test",
+ "component-test-util",
  "criterion",
  "env_logger 0.9.0",
  "filecheck",
@@ -3539,6 +3549,9 @@ dependencies = [
 name = "wasmtime-fuzz"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "arbitrary",
+ "component-test-util",
  "cranelift-codegen",
  "cranelift-filetests",
  "cranelift-fuzzgen",
@@ -3546,6 +3559,9 @@ dependencies = [
  "cranelift-reader",
  "cranelift-wasm",
  "libfuzzer-sys",
+ "proc-macro2",
+ "quote",
+ "rand 0.8.5",
  "target-lexicon",
  "wasmtime",
  "wasmtime-fuzzing",
@@ -3557,8 +3573,11 @@ version = "0.19.0"
 dependencies = [
  "anyhow",
  "arbitrary",
+ "component-test-util",
  "env_logger 0.9.0",
  "log",
+ "proc-macro2",
+ "quote",
  "rand 0.8.5",
  "rayon",
  "target-lexicon",
@@ -3572,6 +3591,7 @@ dependencies = [
  "wasmparser",
  "wasmprinter",
  "wasmtime",
+ "wasmtime-component-util",
  "wasmtime-wast",
  "wat",
 ]

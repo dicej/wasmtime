@@ -20,6 +20,9 @@ mod spec_test;
 mod stacks;
 pub mod table_ops;
 
+#[cfg(feature = "component-model")]
+pub mod component_types;
+
 pub use codegen_settings::CodegenSettings;
 pub use config::{Config, WasmtimeConfig};
 pub use instance_allocation_strategy::InstanceAllocationStrategy;

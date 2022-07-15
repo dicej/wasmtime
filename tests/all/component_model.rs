@@ -1,8 +1,8 @@
 use anyhow::Result;
+use component_test_util::{engine, TypedFuncExt, REALLOC_AND_FREE};
 use std::fmt::Write;
 use std::iter;
-use wasmtime::component::{Component, ComponentParams, Lift, Lower, TypedFunc};
-use wasmtime::{AsContextMut, Config, Engine};
+use wasmtime::component::Component;
 
 mod dynamic;
 mod func;
@@ -11,87 +11,6 @@ mod instance;
 mod macros;
 mod nested;
 mod post_return;
-
-trait TypedFuncExt<P, R> {
-    fn call_and_post_return(&self, store: impl AsContextMut, params: P) -> Result<R>;
-}
-
-impl<P, R> TypedFuncExt<P, R> for TypedFunc<P, R>
-where
-    P: ComponentParams + Lower,
-    R: Lift,
-{
-    fn call_and_post_return(&self, mut store: impl AsContextMut, params: P) -> Result<R> {
-        let result = self.call(&mut store, params)?;
-        self.post_return(&mut store)?;
-        Ok(result)
-    }
-}
-
-// A simple bump allocator which can be used with modules
-const REALLOC_AND_FREE: &str = r#"
-    (global $last (mut i32) (i32.const 8))
-    (func $realloc (export "realloc")
-        (param $old_ptr i32)
-        (param $old_size i32)
-        (param $align i32)
-        (param $new_size i32)
-        (result i32)
-
-        ;; Test if the old pointer is non-null
-        local.get $old_ptr
-        if
-            ;; If the old size is bigger than the new size then
-            ;; this is a shrink and transparently allow it
-            local.get $old_size
-            local.get $new_size
-            i32.gt_u
-            if
-                local.get $old_ptr
-                return
-            end
-
-            ;; ... otherwise this is unimplemented
-            unreachable
-        end
-
-        ;; align up `$last`
-        (global.set $last
-            (i32.and
-                (i32.add
-                    (global.get $last)
-                    (i32.add
-                        (local.get $align)
-                        (i32.const -1)))
-                (i32.xor
-                    (i32.add
-                        (local.get $align)
-                        (i32.const -1))
-                    (i32.const -1))))
-
-        ;; save the current value of `$last` as the return value
-        global.get $last
-
-        ;; ensure anything necessary is set to valid data by spraying a bit
-        ;; pattern that is invalid
-        global.get $last
-        i32.const 0xde
-        local.get $new_size
-        memory.fill
-
-        ;; bump our pointer
-        (global.set $last
-            (i32.add
-                (global.get $last)
-                (local.get $new_size)))
-    )
-"#;
-
-fn engine() -> Engine {
-    let mut config = Config::new();
-    config.wasm_component_model(true);
-    Engine::new(&config).unwrap()
-}
 
 #[test]
 fn components_importing_modules() -> Result<()> {

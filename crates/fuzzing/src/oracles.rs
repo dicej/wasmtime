@@ -1055,3 +1055,82 @@ fn set_fuel<T>(store: &mut Store<T>, fuel: u64) {
     // double-check that the store has the expected amount of fuel remaining
     assert_eq!(store.consume_fuel(0).unwrap(), fuel);
 }
+
+/// Generate and execute a `crate::generators::component_types::TestCase` using the specified random bytes to drive
+/// creation of arbitrary types and values.
+#[cfg(feature = "component-model")]
+pub fn dynamic_component_api_case(bytes: &[u8]) -> arbitrary::Result<()> {
+    use crate::generators::component_types::{
+        self, TestCase, Value, EXPORT_FUNCTION, IMPORT_FUNCTION,
+    };
+    use anyhow::Result;
+    use arbitrary::Unstructured;
+    use component_test_util::FuncExt;
+    use wasmtime::component::{Component, Linker, Val};
+
+    let mut input = Unstructured::new(bytes);
+    let case = input.arbitrary::<TestCase>()?;
+
+    let engine = component_test_util::engine();
+    let mut store = Store::new(&engine, (Box::new([]) as Box<[Val]>, None));
+    let component = Component::new(
+        &engine,
+        component_types::make_component(
+            &case
+                .params
+                .iter()
+                .map(|ty| format!("(param {ty})"))
+                .collect::<Box<[_]>>()
+                .join(" "),
+            &format!("(result {})", case.result),
+            &case.import_and_export,
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut linker = Linker::new(&engine);
+
+    linker
+        .root()
+        .func_wrap(IMPORT_FUNCTION, {
+            move |cx: StoreContextMut<'_, (Box<[Val]>, Option<Val>)>, args: &[Val]| -> Result<Val> {
+                let (expected_args, result) = cx.data();
+                assert_eq!(args.len(), expected_args.len());
+                for (expected, actual) in expected_args.iter().zip(args) {
+                    assert_eq!(expected, actual);
+                }
+                Ok(result.as_ref().unwrap().clone())
+            }
+        })
+        .unwrap();
+
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let func = instance.get_func(&mut store, EXPORT_FUNCTION).unwrap();
+    let params = func.params(&store);
+
+    while input.arbitrary()? {
+        let args = case
+            .params
+            .iter()
+            .zip(params.iter())
+            .map(|(ty, component_type)| {
+                Ok(Value::arbitrary(ty, &mut input)?
+                    .to_val(component_type)
+                    .unwrap())
+            })
+            .collect::<arbitrary::Result<Box<[_]>>>()?;
+
+        let result = Value::arbitrary(&case.result, &mut input)?
+            .to_val(&func.result(&store))
+            .unwrap();
+
+        *store.data_mut() = (args.clone(), Some(result.clone()));
+
+        assert_eq!(
+            func.call_and_post_return(&mut store, &args).unwrap(),
+            result
+        );
+    }
+
+    Ok(())
+}

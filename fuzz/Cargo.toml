@@ -9,6 +9,8 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
+anyhow = { version = "1.0.19", optional = true }
+arbitrary = { version = "1.1.0", features = ["derive"], optional = true }
 cranelift-codegen = { path = "../cranelift/codegen" }
 cranelift-reader = { path = "../cranelift/reader" }
 cranelift-wasm = { path = "../cranelift/wasm" }
@@ -19,10 +21,25 @@ libfuzzer-sys = "0.4.0"
 target-lexicon = "0.12"
 wasmtime = { path = "../crates/wasmtime" }
 wasmtime-fuzzing = { path = "../crates/fuzzing" }
+component-test-util = { path = "../crates/misc/component-test-util", optional = true }
+
+[build-dependencies]
+anyhow = "1.0.19"
+proc-macro2 = "1.0"
+arbitrary = { version = "1.1.0", features = ["derive"] }
+rand = { version = "0.8.0" }
+quote = "1.0"
+wasmtime-fuzzing = { path = "../crates/fuzzing" }
 
 [features]
 default = ['fuzz-spec-interpreter']
 fuzz-spec-interpreter = ['wasmtime-fuzzing/fuzz-spec-interpreter']
+component-model = [
+  "wasmtime/component-model",
+  "wasmtime-fuzzing/component-model",
+  "component-test-util/component-model",
+  "dep:anyhow",
+  "dep:arbitrary"]
 
 [[bin]]
 name = "compile"
@@ -102,3 +119,17 @@ name = "instantiate-many"
 path = "fuzz_targets/instantiate-many.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "dynamic_component_api"
+path = "fuzz_targets/dynamic_component_api.rs"
+test = false
+doc = false
+required-features = ["component-model"]
+
+[[bin]]
+name = "static_component_api"
+path = "fuzz_targets/static_component_api.rs"
+test = false
+doc = false
+required-features = ["component-model"]
