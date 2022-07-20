@@ -1,12 +1,14 @@
-use crate::component::func::{self, Memory, Options};
+use crate::component::func::{self, Lift, Memory, Options, WasmStr};
 use crate::component::values::{
     self, Enum, Expected, Flags, List, Option, Record, Tuple, Union, Val, Variant,
 };
 use crate::store::StoreOpaque;
 use crate::ValRaw;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Error, Result};
 use std::collections::HashMap;
+use std::fmt;
 use std::iter;
+use std::ops::Deref;
 use std::sync::Arc;
 use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 use wasmtime_environ::component::{
@@ -20,15 +22,23 @@ pub struct Handle<T> {
     types: Arc<ComponentTypes>,
 }
 
+impl<T: fmt::Debug> fmt::Debug for Handle<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Handle")
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
 impl<T: PartialEq> PartialEq for Handle<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.index == other.index && Arc::ptr_eq(&self.types, other.types)
+        self.index == other.index && Arc::ptr_eq(&self.types, &other.types)
     }
 }
 
 impl<T: Eq> Eq for Handle<T> {}
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct TypeIndex(TypeInterfaceIndex);
 
 impl Handle<TypeIndex> {
@@ -42,7 +52,7 @@ pub struct Field<'a> {
     pub ty: Type,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct RecordIndex(TypeRecordIndex);
 
 impl Handle<RecordIndex> {
@@ -59,7 +69,7 @@ pub struct Case<'a> {
     pub ty: Type,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct VariantIndex(TypeVariantIndex);
 
 impl Handle<VariantIndex> {
@@ -71,20 +81,23 @@ impl Handle<VariantIndex> {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct FlagsIndex(TypeFlagsIndex);
 
 impl Handle<FlagsIndex> {
     pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.types[self.index.0].names.iter()
+        self.types[self.index.0]
+            .names
+            .iter()
+            .map(|name| name.deref())
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct TupleIndex(TypeTupleIndex);
 
 impl Handle<TupleIndex> {
-    pub fn types(&self) -> impl ExactSizeIterator<Item = Type> {
+    pub fn types(&self) -> impl ExactSizeIterator<Item = Type> + '_ {
         self.types[self.index.0]
             .types
             .iter()
@@ -92,20 +105,23 @@ impl Handle<TupleIndex> {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct EnumIndex(TypeEnumIndex);
 
 impl Handle<EnumIndex> {
     pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.types[self.index.0].names.iter()
+        self.types[self.index.0]
+            .names
+            .iter()
+            .map(|name| name.deref())
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct UnionIndex(TypeUnionIndex);
 
 impl Handle<UnionIndex> {
-    pub fn types(&self) -> impl ExactSizeIterator<Item = Type> {
+    pub fn types(&self) -> impl ExactSizeIterator<Item = Type> + '_ {
         self.types[self.index.0]
             .types
             .iter()
@@ -113,16 +129,16 @@ impl Handle<UnionIndex> {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct ExpectedIndex(TypeExpectedIndex);
 
 impl Handle<ExpectedIndex> {
     pub fn ok(&self) -> Type {
-        Type::from(&self.types[self.index.0].ok)
+        Type::from(&self.types[self.index.0].ok, &self.types)
     }
 
     pub fn err(&self) -> Type {
-        Type::from(&self.types[self.index.0].err)
+        Type::from(&self.types[self.index.0].err, &self.types)
     }
 }
 
@@ -132,34 +148,59 @@ pub(crate) struct SizeAndAlignment {
     pub(crate) alignment: u32,
 }
 
+/// Represents a component model interface type
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Type {
+    /// Unit
     Unit,
+    /// Boolean
     Bool,
+    /// Signed 8-bit integer
     S8,
+    /// Unsigned 8-bit integer
     U8,
+    /// Signed 16-bit integer
     S16,
+    /// Unsigned 16-bit integer
     U16,
+    /// Signed 32-bit integer
     S32,
+    /// Unsigned 32-bit integer
     U32,
+    /// Signed 64-bit integer
     S64,
+    /// Unsigned 64-bit integer
     U64,
+    /// 64-bit floating point value
     Float32,
+    /// 64-bit floating point value
     Float64,
+    /// 32-bit character
     Char,
+    /// Character string
     String,
+    /// List of values
     List(Handle<TypeIndex>),
+    /// Record
     Record(Handle<RecordIndex>),
+    /// Variant
     Variant(Handle<VariantIndex>),
+    /// Bit flags
     Flags(Handle<FlagsIndex>),
+    /// Tuple
     Tuple(Handle<TupleIndex>),
+    /// Enum
     Enum(Handle<EnumIndex>),
+    /// Union
     Union(Handle<UnionIndex>),
+    /// Option
     Option(Handle<TypeIndex>),
+    /// Expected
     Expected(Handle<ExpectedIndex>),
 }
 
 impl Type {
+    /// Instantiate this type (which must be a `Type::List`) with the specified `values`.
     pub fn new_list(&self, values: Box<[Val]>) -> Result<Val> {
         if let Type::List(handle) = self {
             let ty = handle.ty();
@@ -177,20 +218,31 @@ impl Type {
         }
     }
 
-    pub fn new_record(&self, values: &[(&str, Val)]) -> Result<Val> {
+    /// Instantiate this type (which must be a `Type::Record`) with the specified `values`.
+    pub fn new_record<'a>(
+        &self,
+        values: impl ExactSizeIterator<Item = (&'a str, Val)>,
+    ) -> Result<Val> {
         if let Type::Record(handle) = self {
+            if values.len() != handle.fields().len() {
+                bail!(
+                    "expected {} values; got {}",
+                    handle.fields().len(),
+                    values.len()
+                );
+            }
+
             Ok(Val::Record(Record {
                 ty: handle.clone(),
-                fields: values
-                    .iter()
+                values: values
                     .zip(handle.fields())
                     .map(|((name, value), field)| {
                         if name == field.name {
-                            field.ty.check(value).with_context(|| {
+                            field.ty.check(&value).with_context(|| {
                                 format!("type mismatch for field {name} of record")
                             })?;
 
-                            Ok(value.clone())
+                            Ok(value)
                         } else {
                             Err(anyhow!(
                                 "field name mismatch: expected {}; got {name}",
@@ -205,8 +257,17 @@ impl Type {
         }
     }
 
+    /// Instantiate this type (which must be a `Type::Tuple`) with the specified `values`.
     pub fn new_tuple(&self, values: Box<[Val]>) -> Result<Val> {
         if let Type::Tuple(handle) = self {
+            if values.len() != handle.types().len() {
+                bail!(
+                    "expected {} values; got {}",
+                    handle.types().len(),
+                    values.len()
+                );
+            }
+
             for (index, (value, ty)) in values.iter().zip(handle.types()).enumerate() {
                 ty.check(value)
                     .with_context(|| format!("type mismatch for field {index} of tuple"))?;
@@ -214,13 +275,14 @@ impl Type {
 
             Ok(Val::Tuple(Tuple {
                 ty: handle.clone(),
-                fields: values,
+                values,
             }))
         } else {
             Err(anyhow!("cannot make tuple from {} type", self.desc()))
         }
     }
 
+    /// Instantiate this type (which must be a `Type::Variant`) with the specified case `name` and `value`.
     pub fn new_variant(&self, name: &str, value: Val) -> Result<Val> {
         if let Type::Variant(handle) = self {
             let (discriminant, ty) = handle
@@ -235,7 +297,7 @@ impl Type {
                 })
                 .ok_or_else(|| anyhow!("unknown variant case: {name}"))?;
 
-            ty.check(value)
+            ty.check(&value)
                 .with_context(|| format!("type mismatch for case {name} of variant"))?;
 
             Ok(Val::Variant(Variant {
@@ -248,6 +310,7 @@ impl Type {
         }
     }
 
+    /// Instantiate this type (which must be a `Type::Enum`) with the specified case `name`.
     pub fn new_enum(&self, name: &str) -> Result<Val> {
         if let Type::Enum(handle) = self {
             let discriminant = u32::try_from(
@@ -257,19 +320,20 @@ impl Type {
                     .ok_or_else(|| anyhow!("unknown enum case: {name}"))?,
             )?;
 
-            Val::Enum(Enum {
+            Ok(Val::Enum(Enum {
                 ty: handle.clone(),
                 discriminant,
-            })
+            }))
         } else {
             Err(anyhow!("cannot make enum from {} type", self.desc()))
         }
     }
 
+    /// Instantiate this type (which must be a `Type::Union`) with the specified `discriminant` and `value`.
     pub fn new_union(&self, discriminant: u32, value: Val) -> Result<Val> {
         if let Type::Union(handle) = self {
             if let Some(ty) = handle.types().nth(usize::try_from(discriminant)?) {
-                ty.check(value)
+                ty.check(&value)
                     .with_context(|| format!("type mismatch for case {discriminant} of union"))?;
 
                 Ok(Val::Union(Union {
@@ -288,15 +352,17 @@ impl Type {
         }
     }
 
+    /// Instantiate this type (which must be a `Type::Option`) with the specified `value`.
     pub fn new_option(&self, value: std::option::Option<Val>) -> Result<Val> {
         if let Type::Option(handle) = self {
             let value = value
                 .map(|value| {
                     handle
                         .ty()
-                        .check(value)
+                        .check(&value)
                         .context("type mismatch for option")?;
-                    Ok(value)
+
+                    Ok::<_, Error>(value)
                 })
                 .transpose()?;
 
@@ -310,33 +376,35 @@ impl Type {
         }
     }
 
+    /// Instantiate this type (which must be a `Type::Expected`) with the specified `value`.
     pub fn new_expected(&self, value: Result<Val, Val>) -> Result<Val> {
-        if let Type::Option(handle) = self {
-            Ok(Val::Option(Option {
+        if let Type::Expected(handle) = self {
+            Ok(Val::Expected(Expected {
                 ty: handle.clone(),
                 discriminant: if value.is_ok() { 0 } else { 1 },
                 value: Box::new(match value {
                     Ok(value) => {
                         handle
                             .ok()
-                            .check(value)
+                            .check(&value)
                             .context("type mismatch for ok case of expected")?;
                         value
                     }
                     Err(value) => {
                         handle
                             .err()
-                            .check(value)
+                            .check(&value)
                             .context("type mismatch for err case of expected")?;
                         value
                     }
                 }),
             }))
         } else {
-            Err(anyhow!("cannot make option from {} type", self.desc()))
+            Err(anyhow!("cannot make expected from {} type", self.desc()))
         }
     }
 
+    /// Instantiate this type (which must be a `Type::Flags`) with the specified flag `names`.
     pub fn new_flags(&self, names: &[&str]) -> Result<Val> {
         if let Type::Flags(handle) = self {
             let map = handle
@@ -365,7 +433,7 @@ impl Type {
     }
 
     pub(crate) fn check(&self, value: &Val) -> Result<()> {
-        if self == value.ty() {
+        if self == &value.ty() {
             Ok(())
         } else {
             Err(anyhow!(
@@ -435,6 +503,8 @@ impl Type {
     /// Return the number of stack slots needed to store values of this type in lowered form.
     pub(crate) fn flatten_count(&self) -> usize {
         match self {
+            Type::Unit => 0,
+
             Type::Bool
             | Type::S8
             | Type::U8
@@ -451,19 +521,17 @@ impl Type {
 
             Type::String | Type::List(_) => 2,
 
-            Type::Record(handle) => handle.fields().map(|field| field.ty.flatten_count()),
+            Type::Record(handle) => handle.fields().map(|field| field.ty.flatten_count()).sum(),
+
+            Type::Tuple(handle) => handle.types().map(|ty| ty.flatten_count()).sum(),
 
             Type::Variant(handle) => {
                 1 + handle
-                    .types()
+                    .cases()
                     .map(|case| case.ty.flatten_count())
                     .max()
                     .unwrap_or(0)
             }
-
-            Type::Flags(handle) => values::u32_count_for_flag_count(handle.names().len()),
-
-            Type::Tuple(handle) => handle.types().map(|ty| ty.flatten_count()).sum(),
 
             Type::Union(handle) => {
                 1 + handle
@@ -481,6 +549,8 @@ impl Type {
                     .flatten_count()
                     .max(handle.err().flatten_count())
             }
+
+            Type::Flags(handle) => values::u32_count_for_flag_count(handle.names().len()),
         }
     }
 
@@ -520,6 +590,7 @@ impl Type {
         src: &mut impl Iterator<Item = &'a ValRaw>,
     ) -> Result<Val> {
         Ok(match self {
+            Type::Unit => Val::Unit,
             Type::Bool => Val::Bool(bool::lift(store, options, next(src))?),
             Type::S8 => Val::S8(i8::lift(store, options, next(src))?),
             Type::U8 => Val::U8(u8::lift(store, options, next(src))?),
@@ -558,7 +629,7 @@ impl Type {
                 Val::Variant(Variant {
                     ty: handle.clone(),
                     discriminant,
-                    value,
+                    value: Box::new(value),
                 })
             }
             Type::Enum(handle) => {
@@ -576,7 +647,7 @@ impl Type {
                 Val::Union(Union {
                     ty: handle.clone(),
                     discriminant,
-                    value,
+                    value: Box::new(value),
                 })
             }
             Type::Option(handle) => {
@@ -586,7 +657,7 @@ impl Type {
                 Val::Option(Option {
                     ty: handle.clone(),
                     discriminant,
-                    value,
+                    value: Box::new(value),
                 })
             }
             Type::Expected(handle) => {
@@ -596,7 +667,7 @@ impl Type {
                 Val::Expected(Expected {
                     ty: handle.clone(),
                     discriminant,
-                    value,
+                    value: Box::new(value),
                 })
             }
             Type::Flags(handle) => {
@@ -604,7 +675,11 @@ impl Type {
                 assert!(count <= 32);
                 let value = iter::once(u32::lift(store, options, next(src))?).collect();
 
-                Val::Flags { count, value }
+                Val::Flags(Flags {
+                    ty: handle.clone(),
+                    count,
+                    value,
+                })
             }
         })
     }
@@ -612,6 +687,7 @@ impl Type {
     /// Deserialize a value of this type from the heap.
     pub(crate) fn load(&self, store: &StoreOpaque, mem: &Memory, bytes: &[u8]) -> Result<Val> {
         Ok(match self {
+            Type::Unit => Val::Unit,
             Type::Bool => Val::Bool(bool::load(mem, bytes)?),
             Type::S8 => Val::S8(i8::load(mem, bytes)?),
             Type::U8 => Val::U8(u8::load(mem, bytes)?),
@@ -624,7 +700,9 @@ impl Type {
             Type::Float32 => Val::Float32(u32::load(mem, bytes)?),
             Type::Float64 => Val::Float64(u64::load(mem, bytes)?),
             Type::Char => Val::Char(char::load(mem, bytes)?),
-            Type::String => Val::String(Box::<str>::load(mem, bytes)?),
+            Type::String => Val::String(Box::from(
+                WasmStr::load(mem, bytes)?._to_str(store)?.deref(),
+            )),
             Type::List(handle) => {
                 // FIXME: needs memory64 treatment
                 let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
@@ -663,13 +741,10 @@ impl Type {
                 ty: handle.clone(),
                 values: load_record(handle.fields().map(|field| field.ty), store, mem, bytes)?,
             }),
-            Type::Tuple(handle) => {
-                let mut offset = 0;
-                Val::Tuple(Tuple {
-                    ty: handle.clone(),
-                    values: load_record(handle.types(), store, mem, bytes)?,
-                })
-            }
+            Type::Tuple(handle) => Val::Tuple(Tuple {
+                ty: handle.clone(),
+                values: load_record(handle.types(), store, mem, bytes)?,
+            }),
             Type::Variant(handle) => {
                 let (discriminant, value) =
                     self.load_variant(handle.cases().map(|case| case.ty), store, mem, bytes)?;
@@ -677,7 +752,7 @@ impl Type {
                 Val::Variant(Variant {
                     ty: handle.clone(),
                     discriminant,
-                    value,
+                    value: Box::new(value),
                 })
             }
             Type::Enum(handle) => {
@@ -695,7 +770,7 @@ impl Type {
                 Val::Union(Union {
                     ty: handle.clone(),
                     discriminant,
-                    value,
+                    value: Box::new(value),
                 })
             }
             Type::Option(handle) => {
@@ -705,7 +780,7 @@ impl Type {
                 Val::Option(Option {
                     ty: handle.clone(),
                     discriminant,
-                    value,
+                    value: Box::new(value),
                 })
             }
             Type::Expected(handle) => {
@@ -715,12 +790,13 @@ impl Type {
                 Val::Expected(Expected {
                     ty: handle.clone(),
                     discriminant,
-                    value,
+                    value: Box::new(value),
                 })
             }
             Type::Flags(handle) => Val::Flags(Flags {
+                ty: handle.clone(),
                 count: u32::try_from(handle.names().len())?,
-                value: match FlagsSize::from_count(handle.names.len()) {
+                value: match FlagsSize::from_count(handle.names().len()) {
                     FlagsSize::Size1 => iter::once(u8::load(mem, bytes)? as u32).collect(),
                     FlagsSize::Size2 => iter::once(u16::load(mem, bytes)? as u32).collect(),
                     FlagsSize::Size4Plus(n) => (0..n)
@@ -733,7 +809,7 @@ impl Type {
 
     fn load_variant(
         &self,
-        types: impl ExactSizeIterator<Item = Type>,
+        mut types: impl ExactSizeIterator<Item = Type>,
         store: &StoreOpaque,
         mem: &Memory,
         bytes: &[u8],
@@ -744,20 +820,20 @@ impl Type {
             DiscriminantSize::Size2 => u16::load(mem, &bytes[..2])? as u32,
             DiscriminantSize::Size4 => u32::load(mem, &bytes[..4])?,
         };
-        let case = types.nth(discriminant as usize).ok_or_else(|| {
+        let ty = types.nth(discriminant as usize).ok_or_else(|| {
             anyhow!(
                 "discriminant {} out of range [0..{})",
                 discriminant,
                 types.len()
             )
         })?;
-        let value = case.ty.load(
+        let value = ty.load(
             store,
             mem,
             &bytes[func::align_to(
                 usize::from(discriminant_size),
                 self.size_and_alignment().alignment,
-            )..][..case.ty.size_and_alignment().size],
+            )..][..ty.size_and_alignment().size],
         )?;
         Ok((discriminant, value))
     }
@@ -765,6 +841,11 @@ impl Type {
     /// Calculate the size and alignment requirements for the specified type.
     pub(crate) fn size_and_alignment(&self) -> SizeAndAlignment {
         match self {
+            Type::Unit => SizeAndAlignment {
+                size: 0,
+                alignment: 1,
+            },
+
             Type::Bool | Type::S8 | Type::U8 => SizeAndAlignment {
                 size: 1,
                 alignment: 1,
@@ -810,7 +891,7 @@ impl Type {
                 variant_size_and_alignment([handle.ok(), handle.err()].into_iter())
             }
 
-            Type::Flags(count) => match FlagsSize::from_count(*count) {
+            Type::Flags(handle) => match FlagsSize::from_count(handle.names().len()) {
                 FlagsSize::Size1 => SizeAndAlignment {
                     size: 1,
                     alignment: 1,
@@ -828,7 +909,7 @@ impl Type {
     }
 
     /// Calculate the aligned offset of a field of this type, updating `offset` to point to just after that field.
-    pub(crate) fn next_field(self, offset: &mut usize) -> usize {
+    pub(crate) fn next_field(&self, offset: &mut usize) -> usize {
         let SizeAndAlignment { size, alignment } = self.size_and_alignment();
         *offset = func::align_to(*offset, alignment);
         let result = *offset;
@@ -856,7 +937,7 @@ fn load_record(
 }
 
 fn lift_variant<'a>(
-    types: impl ExactSizeIterator<Item = Type>,
+    mut types: impl ExactSizeIterator<Item = Type>,
     store: &StoreOpaque,
     options: &Options,
     src: &mut impl Iterator<Item = &'a ValRaw>,
@@ -867,7 +948,7 @@ fn lift_variant<'a>(
         .nth(discriminant as usize)
         .ok_or_else(|| anyhow!("discriminant {} out of range [0..{})", discriminant, len))?;
     let value = ty.lift(store, options, src)?;
-    (discriminant, value)
+    Ok((discriminant, value))
 }
 
 fn record_size_and_alignment(types: impl Iterator<Item = Type>) -> SizeAndAlignment {

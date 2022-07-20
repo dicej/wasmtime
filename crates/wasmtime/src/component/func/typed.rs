@@ -158,14 +158,16 @@ where
         // count)
         if Params::flatten_count() <= MAX_STACK_PARAMS {
             if Return::flatten_count() <= MAX_STACK_RESULTS {
-                self.call_raw(
+                call_raw(
+                    &self.func,
                     store,
                     &params,
                     Self::lower_stack_args,
                     Self::lift_stack_result,
                 )
             } else {
-                self.call_raw(
+                call_raw(
+                    &self.func,
                     store,
                     &params,
                     Self::lower_stack_args,
@@ -174,14 +176,16 @@ where
             }
         } else {
             if Return::flatten_count() <= MAX_STACK_RESULTS {
-                self.call_raw(
+                call_raw(
+                    &self.func,
                     store,
                     &params,
                     Self::lower_heap_args,
                     Self::lift_stack_result,
                 )
             } else {
-                self.call_raw(
+                call_raw(
+                    &self.func,
                     store,
                     &params,
                     Self::lower_heap_args,
@@ -280,133 +284,6 @@ where
         Return::load(&memory, bytes)
     }
 
-    /// Invokes the underlying wasm function, lowering arguments and lifting the
-    /// result.
-    ///
-    /// The `lower` function and `lift` function provided here are what actually
-    /// do the lowering and lifting. The `LowerParams` and `LowerReturn` types
-    /// are what will be allocated on the stack for this function call. They
-    /// should be appropriately sized for the lowering/lifting operation
-    /// happening.
-    fn call_raw<T, LowerParams, LowerReturn>(
-        &self,
-        store: &mut StoreContextMut<'_, T>,
-        params: &Params,
-        lower: impl FnOnce(
-            &mut StoreContextMut<'_, T>,
-            &Options,
-            &Params,
-            &mut MaybeUninit<LowerParams>,
-        ) -> Result<()>,
-        lift: impl FnOnce(&StoreOpaque, &Options, &LowerReturn) -> Result<Return>,
-    ) -> Result<Return>
-    where
-        LowerParams: Copy,
-        LowerReturn: Copy,
-    {
-        let super::FuncData {
-            trampoline,
-            export,
-            options,
-            instance,
-            component_instance,
-            ..
-        } = store.0[self.func.0];
-
-        let space = &mut MaybeUninit::<ParamsAndResults<LowerParams, LowerReturn>>::uninit();
-
-        // Double-check the size/alignemnt of `space`, just in case.
-        //
-        // Note that this alone is not enough to guarantee the validity of the
-        // `unsafe` block below, but it's definitely required. In any case LLVM
-        // should be able to trivially see through these assertions and remove
-        // them in release mode.
-        let val_size = mem::size_of::<ValRaw>();
-        let val_align = mem::align_of::<ValRaw>();
-        assert!(mem::size_of_val(space) % val_size == 0);
-        assert!(mem::size_of_val(map_maybe_uninit!(space.params)) % val_size == 0);
-        assert!(mem::size_of_val(map_maybe_uninit!(space.ret)) % val_size == 0);
-        assert!(mem::align_of_val(space) == val_align);
-        assert!(mem::align_of_val(map_maybe_uninit!(space.params)) == val_align);
-        assert!(mem::align_of_val(map_maybe_uninit!(space.ret)) == val_align);
-
-        let instance = store.0[instance.0].as_ref().unwrap().instance();
-        let flags = instance.flags(component_instance);
-
-        unsafe {
-            // Test the "may enter" flag which is a "lock" on this instance.
-            // This is immediately set to `false` afterwards and note that
-            // there's no on-cleanup setting this flag back to true. That's an
-            // intentional design aspect where if anything goes wrong internally
-            // from this point on the instance is considered "poisoned" and can
-            // never be entered again. The only time this flag is set to `true`
-            // again is after post-return logic has completed successfully.
-            if !(*flags).may_enter() {
-                bail!("cannot reenter component instance");
-            }
-            (*flags).set_may_enter(false);
-
-            debug_assert!((*flags).may_leave());
-            (*flags).set_may_leave(false);
-            let result = lower(store, &options, params, map_maybe_uninit!(space.params));
-            (*flags).set_may_leave(true);
-            result?;
-
-            // This is unsafe as we are providing the guarantee that all the
-            // inputs are valid. The various pointers passed in for the function
-            // are all valid since they're coming from our store, and the
-            // `params_and_results` should have the correct layout for the core
-            // wasm function we're calling. Note that this latter point relies
-            // on the correctness of this module and `ComponentType`
-            // implementations, hence `ComponentType` being an `unsafe` trait.
-            crate::Func::call_unchecked_raw(
-                store,
-                export.anyfunc,
-                trampoline,
-                space.as_mut_ptr().cast(),
-            )?;
-
-            // Note that `.assume_init_ref()` here is unsafe but we're relying
-            // on the correctness of the structure of `LowerReturn` and the
-            // type-checking performed to acquire the `TypedFunc` to make this
-            // safe. It should be the case that `LowerReturn` is the exact
-            // representation of the return value when interpreted as
-            // `[ValRaw]`, and additionally they should have the correct types
-            // for the function we just called (which filled in the return
-            // values).
-            let ret = map_maybe_uninit!(space.ret).assume_init_ref();
-
-            // Lift the result into the host while managing post-return state
-            // here as well.
-            //
-            // After a successful lift the return value of the function, which
-            // is currently required to be 0 or 1 values according to the
-            // canonical ABI, is saved within the `Store`'s `FuncData`. This'll
-            // later get used in post-return.
-            (*flags).set_needs_post_return(true);
-            let val = lift(store.0, &options, ret)?;
-            let ret_slice = cast_storage(ret);
-            let data = &mut store.0[self.func.0];
-            assert!(data.post_return_arg.is_none());
-            match ret_slice.len() {
-                0 => data.post_return_arg = Some(ValRaw::i32(0)),
-                1 => data.post_return_arg = Some(ret_slice[0]),
-                _ => unreachable!(),
-            }
-            return Ok(val);
-        }
-
-        unsafe fn cast_storage<T>(storage: &T) -> &[ValRaw] {
-            assert!(std::mem::size_of_val(storage) % std::mem::size_of::<ValRaw>() == 0);
-            assert!(std::mem::align_of_val(storage) == std::mem::align_of::<ValRaw>());
-
-            std::slice::from_raw_parts(
-                (storage as *const T).cast(),
-                mem::size_of_val(storage) / mem::size_of::<ValRaw>(),
-            )
-        }
-    }
-
     /// Invokes the `post-return` canonical ABI option, if specified, after a
     /// [`TypedFunc::call`] has finished.
     ///
@@ -495,6 +372,133 @@ where
             (*flags).set_may_enter(true);
         }
         Ok(())
+    }
+}
+
+/// Invokes the underlying wasm function, lowering arguments and lifting the
+/// result.
+///
+/// The `lower` function and `lift` function provided here are what actually
+/// do the lowering and lifting. The `LowerParams` and `LowerReturn` types
+/// are what will be allocated on the stack for this function call. They
+/// should be appropriately sized for the lowering/lifting operation
+/// happening.
+pub(crate) fn call_raw<T, Params: ?Sized, Return, LowerParams, LowerReturn>(
+    func: &Func,
+    store: &mut StoreContextMut<'_, T>,
+    params: &Params,
+    lower: impl FnOnce(
+        &mut StoreContextMut<'_, T>,
+        &Options,
+        &Params,
+        &mut MaybeUninit<LowerParams>,
+    ) -> Result<()>,
+    lift: impl FnOnce(&StoreOpaque, &Options, &LowerReturn) -> Result<Return>,
+) -> Result<Return>
+where
+    LowerParams: Copy,
+    LowerReturn: Copy,
+{
+    let super::FuncData {
+        trampoline,
+        export,
+        options,
+        instance,
+        component_instance,
+        ..
+    } = store.0[func.0];
+
+    let space = &mut MaybeUninit::<ParamsAndResults<LowerParams, LowerReturn>>::uninit();
+
+    // Double-check the size/alignemnt of `space`, just in case.
+    //
+    // Note that this alone is not enough to guarantee the validity of the
+    // `unsafe` block below, but it's definitely required. In any case LLVM
+    // should be able to trivially see through these assertions and remove
+    // them in release mode.
+    let val_size = mem::size_of::<ValRaw>();
+    let val_align = mem::align_of::<ValRaw>();
+    assert!(mem::size_of_val(space) % val_size == 0);
+    assert!(mem::size_of_val(map_maybe_uninit!(space.params)) % val_size == 0);
+    assert!(mem::size_of_val(map_maybe_uninit!(space.ret)) % val_size == 0);
+    assert!(mem::align_of_val(space) == val_align);
+    assert!(mem::align_of_val(map_maybe_uninit!(space.params)) == val_align);
+    assert!(mem::align_of_val(map_maybe_uninit!(space.ret)) == val_align);
+
+    let instance = store.0[instance.0].as_ref().unwrap().instance();
+    let flags = instance.flags(component_instance);
+
+    unsafe {
+        // Test the "may enter" flag which is a "lock" on this instance.
+        // This is immediately set to `false` afterwards and note that
+        // there's no on-cleanup setting this flag back to true. That's an
+        // intentional design aspect where if anything goes wrong internally
+        // from this point on the instance is considered "poisoned" and can
+        // never be entered again. The only time this flag is set to `true`
+        // again is after post-return logic has completed successfully.
+        if !(*flags).may_enter() {
+            bail!("cannot reenter component instance");
+        }
+        (*flags).set_may_enter(false);
+
+        debug_assert!((*flags).may_leave());
+        (*flags).set_may_leave(false);
+        let result = lower(store, &options, params, map_maybe_uninit!(space.params));
+        (*flags).set_may_leave(true);
+        result?;
+
+        // This is unsafe as we are providing the guarantee that all the
+        // inputs are valid. The various pointers passed in for the function
+        // are all valid since they're coming from our store, and the
+        // `params_and_results` should have the correct layout for the core
+        // wasm function we're calling. Note that this latter point relies
+        // on the correctness of this module and `ComponentType`
+        // implementations, hence `ComponentType` being an `unsafe` trait.
+        crate::Func::call_unchecked_raw(
+            store,
+            export.anyfunc,
+            trampoline,
+            space.as_mut_ptr().cast(),
+        )?;
+
+        // Note that `.assume_init_ref()` here is unsafe but we're relying
+        // on the correctness of the structure of `LowerReturn` and the
+        // type-checking performed to acquire the `TypedFunc` to make this
+        // safe. It should be the case that `LowerReturn` is the exact
+        // representation of the return value when interpreted as
+        // `[ValRaw]`, and additionally they should have the correct types
+        // for the function we just called (which filled in the return
+        // values).
+        let ret = map_maybe_uninit!(space.ret).assume_init_ref();
+
+        // Lift the result into the host while managing post-return state
+        // here as well.
+        //
+        // After a successful lift the return value of the function, which
+        // is currently required to be 0 or 1 values according to the
+        // canonical ABI, is saved within the `Store`'s `FuncData`. This'll
+        // later get used in post-return.
+        (*flags).set_needs_post_return(true);
+        let val = lift(store.0, &options, ret)?;
+        let ret_slice = cast_storage(ret);
+        let data = &mut store.0[func.0];
+        assert!(data.post_return_arg.is_none());
+        match ret_slice.len() {
+            0 => data.post_return_arg = Some(ValRaw::i32(0)),
+            1 => data.post_return_arg = Some(ret_slice[0]),
+            _ => unreachable!(),
+        }
+        return Ok(val);
+    }
+
+    unsafe fn cast_storage<T>(storage: &T) -> &[ValRaw] {
+        assert!(std::mem::size_of_val(storage) % std::mem::size_of::<ValRaw>() == 0);
+        assert!(std::mem::align_of_val(storage) == std::mem::align_of::<ValRaw>());
+
+        std::slice::from_raw_parts(
+            (storage as *const T).cast(),
+            mem::size_of_val(storage) / mem::size_of::<ValRaw>(),
+        )
     }
 }
 

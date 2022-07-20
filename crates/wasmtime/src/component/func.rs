@@ -1,6 +1,6 @@
 use crate::component::instance::{Instance, InstanceData};
-use crate::component::types::{self, SizeAndAlignment, Type};
-use crate::component::values::{self, Val};
+use crate::component::types::{SizeAndAlignment, Type};
+use crate::component::values::Val;
 use crate::store::{StoreOpaque, Stored};
 use crate::{AsContext, AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{bail, Context, Result};
@@ -12,8 +12,8 @@ use wasmtime_environ::component::{
 };
 use wasmtime_runtime::{Export, ExportFunction, VMTrampoline};
 
-const MAX_STACK_PARAMS: usize = 16;
-const MAX_STACK_RESULTS: usize = 1;
+pub(crate) const MAX_STACK_PARAMS: usize = 16;
+pub(crate) const MAX_STACK_RESULTS: usize = 1;
 
 /// A helper macro to safely map `MaybeUninit<T>` to `MaybeUninit<U>` where `U`
 /// is a field projection within `T`.
@@ -244,6 +244,7 @@ impl Func {
         Ok(())
     }
 
+    /// Get the parameter types for this function.
     pub fn params(&self, store: impl AsContext) -> Box<[Type]> {
         let data = &store.as_context()[self.0];
         data.types[data.ty]
@@ -287,65 +288,34 @@ impl Func {
             result = Type::from(&ty.result, &data.types);
         }
 
-        let FuncData {
-            trampoline,
-            export,
-            options,
-            instance,
-            component_instance,
-            ..
-        } = store.0[self.0];
-
-        let instance = store.0[instance.0].as_ref().unwrap().instance();
-        let flags = instance.flags(component_instance);
         let param_count = params.iter().map(|ty| ty.flatten_count()).sum::<usize>();
         let result_count = result.flatten_count();
-        let mut space = Vec::new();
 
-        unsafe {
-            if !(*flags).may_enter() {
-                bail!("cannot reenter component instance");
-            }
-            (*flags).set_may_enter(false);
-
-            debug_assert!((*flags).may_leave());
-            (*flags).set_may_leave(false);
-            let result = if param_count > MAX_STACK_PARAMS {
-                self.store_args(store, &options, &params, args, &mut space)
-            } else {
-                params
-                    .iter()
-                    .zip(args)
-                    .try_for_each(|(ty, arg)| arg.lower(store, &options, ty, &mut space))
-            };
-            (*flags).set_may_leave(true);
-            result?;
-
-            if space.is_empty() && result_count > 0 {
-                // reserve space for return value
-                space.push(ValRaw::u32(0));
-            }
-
-            crate::Func::call_unchecked_raw(store, export.anyfunc, trampoline, space.as_mut_ptr())?;
-
-            (*flags).set_needs_post_return(true);
-        }
-
-        let val = if result_count > MAX_STACK_RESULTS {
-            Self::load_result(
-                store.0,
-                &Memory::new(store.0, &options),
-                &result,
-                &mut space[..MAX_STACK_RESULTS].iter(),
-            )
-        } else {
-            result.lift(store.0, &options, &mut space[..MAX_STACK_RESULTS].iter())
-        }?;
-
-        let data = &mut store.0[self.0];
-        assert!(data.post_return_arg.is_none());
-        data.post_return_arg = Some(space[0]);
-        Ok(val)
+        call_raw(
+            self,
+            store,
+            args,
+            |store, options, args, dst: &mut MaybeUninit<[ValRaw; MAX_STACK_PARAMS]>| {
+                if param_count > MAX_STACK_PARAMS {
+                    self.store_args(store, &options, &params, args, dst)
+                } else {
+                    args.iter()
+                        .try_for_each(|arg| arg.lower(store, &options, dst, 0))
+                }
+            },
+            |store, options, src: &[ValRaw; MAX_STACK_RESULTS]| {
+                if result_count > MAX_STACK_RESULTS {
+                    Self::load_result(
+                        store,
+                        &Memory::new(store, &options),
+                        &result,
+                        &mut src.iter(),
+                    )
+                } else {
+                    result.lift(store, &options, &mut src.iter())
+                }
+            },
+        )
     }
 
     fn store_args<T>(
@@ -354,12 +324,12 @@ impl Func {
         options: &Options,
         params: &[Type],
         args: &[Val],
-        vec: &mut Vec<ValRaw>,
+        dst: &mut MaybeUninit<[ValRaw; MAX_STACK_PARAMS]>,
     ) -> Result<()> {
         let mut size = 0;
         let mut alignment = 1;
         for ty in params {
-            alignment = alignment.max(SizeAndAlignment::from(ty).alignment);
+            alignment = alignment.max(ty.size_and_alignment().alignment);
             ty.next_field(&mut size);
         }
 
@@ -367,10 +337,10 @@ impl Func {
         let ptr = memory.realloc(0, 0, alignment, size)?;
         let mut offset = ptr;
         for (ty, arg) in params.iter().zip(args) {
-            arg.store(&mut memory, ty, ty.next_field(&mut offset))?;
+            arg.store(&mut memory, ty.next_field(&mut offset))?;
         }
 
-        vec.push(ValRaw::i64(ptr as i64));
+        map_maybe_uninit!(dst[0]).write(ValRaw::i64(ptr as i64));
 
         Ok(())
     }
@@ -381,7 +351,7 @@ impl Func {
         ty: &Type,
         src: &mut impl Iterator<Item = &'a ValRaw>,
     ) -> Result<Val> {
-        let SizeAndAlignment { size, alignment } = SizeAndAlignment::from(ty);
+        let SizeAndAlignment { size, alignment } = ty.size_and_alignment();
         // FIXME: needs to read an i64 for memory64
         let ptr = usize::try_from(src.next().unwrap().get_u32())?;
         if ptr % usize::try_from(alignment)? != 0 {

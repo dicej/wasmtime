@@ -1,70 +1,77 @@
-use crate::component::func::{self, Lift, Lower, Memory, MemoryMut, Options};
+use crate::component::func::{self, Lower, MemoryMut, Options, MAX_STACK_PARAMS};
 use crate::component::types::{
     EnumIndex, ExpectedIndex, FlagsIndex, Handle, RecordIndex, SizeAndAlignment, TupleIndex, Type,
     TypeIndex, UnionIndex, VariantIndex,
 };
-use crate::store::StoreOpaque;
-use crate::{AsContextMut, StoreContextMut, ValRaw};
-use anyhow::{anyhow, bail, Result};
-use std::iter;
+use crate::{map_maybe_uninit, AsContextMut, StoreContextMut, ValRaw};
+use anyhow::Result;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::rc::Rc;
 use wasmtime_component_util::{DiscriminantSize, FlagsSize};
-use wasmtime_environ::component::{ComponentTypes, InterfaceType};
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct List {
-    ty: Handle<TypeIndex>,
-    values: Box<[Val]>,
+    pub(crate) ty: Handle<TypeIndex>,
+    pub(crate) values: Box<[Val]>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Record {
-    ty: Handle<RecordIndex>,
-    values: Box<[Val]>,
+    pub(crate) ty: Handle<RecordIndex>,
+    pub(crate) values: Box<[Val]>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Variant {
-    ty: Handle<VariantIndex>,
-    discriminant: u32,
-    value: Box<Val>,
+    pub(crate) ty: Handle<VariantIndex>,
+    pub(crate) discriminant: u32,
+    pub(crate) value: Box<Val>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Flags {
-    ty: Handle<FlagsIndex>,
-    count: u32,
-    value: Box<[u32]>,
+    pub(crate) ty: Handle<FlagsIndex>,
+    pub(crate) count: u32,
+    pub(crate) value: Box<[u32]>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Tuple {
-    ty: Handle<TupleIndex>,
-    values: Box<[Val]>,
+    pub(crate) ty: Handle<TupleIndex>,
+    pub(crate) values: Box<[Val]>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Enum {
-    ty: Handle<EnumIndex>,
-    discriminant: u32,
+    pub(crate) ty: Handle<EnumIndex>,
+    pub(crate) discriminant: u32,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Union {
-    ty: Handle<UnionIndex>,
-    discriminant: u32,
-    value: Box<Val>,
+    pub(crate) ty: Handle<UnionIndex>,
+    pub(crate) discriminant: u32,
+    pub(crate) value: Box<Val>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Option {
-    ty: Handle<TypeIndex>,
-    discriminant: u32,
-    value: Box<Val>,
+    pub(crate) ty: Handle<TypeIndex>,
+    pub(crate) discriminant: u32,
+    pub(crate) value: Box<Val>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Expected {
-    ty: Handle<ExpectedIndex>,
-    discriminant: u32,
-    value: Box<Val>,
+    pub(crate) ty: Handle<ExpectedIndex>,
+    pub(crate) discriminant: u32,
+    pub(crate) value: Box<Val>,
 }
 
-/// Possible runtime values which a component function can either consume or produce
+/// Represents possible runtime values which a component function can either consume or produce
 #[derive(Debug, PartialEq, Eq)]
 pub enum Val {
+    /// Unit
     Unit,
     /// Boolean
     Bool(bool),
@@ -94,20 +101,26 @@ pub enum Val {
     String(Box<str>),
     /// List of values
     List(List),
-    /// Record, tuple, or unit
+    /// Record
     Record(Record),
-    /// Variant, enum, or union
+    /// Variant
     Variant(Variant),
     /// Bit flags
     Flags(Flags),
+    /// Tuple
     Tuple(Tuple),
+    /// Enum
     Enum(Enum),
+    /// Union
     Union(Union),
+    /// Option
     Option(Option),
+    /// Expected
     Expected(Expected),
 }
 
 impl Val {
+    /// Retrieve the [`Type`] of this value.
     pub fn ty(&self) -> Type {
         match self {
             Val::Unit => Type::Unit,
@@ -124,15 +137,15 @@ impl Val {
             Val::Float64(_) => Type::Float64,
             Val::Char(_) => Type::Char,
             Val::String(_) => Type::String,
-            Val::List(List { ty, .. }) => Type::List(ty),
-            Val::Record(Record { ty, .. }) => Type::Record(ty),
-            Val::Variant(Variant { ty, .. }) => Type::Variant(ty),
-            Val::Flags(Flags { ty, .. }) => Type::Flags(ty),
-            Val::Tuple(Tuple { ty, .. }) => Type::Tuple(ty),
-            Val::Enum(Enum { ty, .. }) => Type::Enum(ty),
-            Val::Union(Union { ty, .. }) => Type::Union(ty),
-            Val::Option(Option { ty, .. }) => Type::Option(ty),
-            Val::Expected(Expected { ty, .. }) => Type::Expected(ty),
+            Val::List(List { ty, .. }) => Type::List(ty.clone()),
+            Val::Record(Record { ty, .. }) => Type::Record(ty.clone()),
+            Val::Variant(Variant { ty, .. }) => Type::Variant(ty.clone()),
+            Val::Flags(Flags { ty, .. }) => Type::Flags(ty.clone()),
+            Val::Tuple(Tuple { ty, .. }) => Type::Tuple(ty.clone()),
+            Val::Enum(Enum { ty, .. }) => Type::Enum(ty.clone()),
+            Val::Union(Union { ty, .. }) => Type::Union(ty.clone()),
+            Val::Option(Option { ty, .. }) => Type::Option(ty.clone()),
+            Val::Expected(Expected { ty, .. }) => Type::Expected(ty.clone()),
         }
     }
 
@@ -141,38 +154,63 @@ impl Val {
         &self,
         store: &mut StoreContextMut<T>,
         options: &Options,
-        vec: &mut Vec<ValRaw>,
+        dst: &mut MaybeUninit<[ValRaw; MAX_STACK_PARAMS]>,
+        offset: usize,
     ) -> Result<()> {
         match self {
-            Val::Bool(value) => vec.push(ValRaw::u32(if *value { 1 } else { 0 })),
-            Val::S8(value) => vec.push(ValRaw::i32(*value as i32)),
-            Val::U8(value) => vec.push(ValRaw::u32(*value as u32)),
-            Val::S16(value) => vec.push(ValRaw::i32(*value as i32)),
-            Val::U16(value) => vec.push(ValRaw::u32(*value as u32)),
-            Val::S32(value) => vec.push(ValRaw::i32(*value)),
-            Val::U32(value) => vec.push(ValRaw::u32(*value)),
-            Val::S64(value) => vec.push(ValRaw::i64(*value)),
-            Val::U64(value) => vec.push(ValRaw::u64(*value)),
-            Val::Float32(value) => vec.push(ValRaw::f32(*value)),
-            Val::Float64(value) => vec.push(ValRaw::f64(*value)),
-            Val::Char(value) => vec.push(ValRaw::u32(u32::from(*value))),
+            Val::Bool(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::u32(if *value { 1 } else { 0 }));
+            }
+            Val::S8(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::i32(*value as i32));
+            }
+            Val::U8(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::u32(*value as u32));
+            }
+            Val::S16(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::i32(*value as i32));
+            }
+            Val::U16(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::u32(*value as u32));
+            }
+            Val::S32(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::i32(*value));
+            }
+            Val::U32(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::u32(*value));
+            }
+            Val::S64(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::i64(*value));
+            }
+            Val::U64(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::u64(*value));
+            }
+            Val::Float32(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::f32(*value));
+            }
+            Val::Float64(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::f64(*value));
+            }
+            Val::Char(value) => {
+                map_maybe_uninit!(dst[offset]).write(ValRaw::u32(u32::from(*value)));
+            }
             Val::String(value) => {
                 let (ptr, len) = super::lower_string(
                     &mut MemoryMut::new(store.as_context_mut(), options),
                     value,
                 )?;
-                vec.push(ValRaw::i64(ptr as i64));
-                vec.push(ValRaw::i64(len as i64));
+                map_maybe_uninit!(dst[offset]).write(ValRaw::i64(ptr as i64));
+                map_maybe_uninit!(dst[offset + 1]).write(ValRaw::i64(len as i64));
             }
             Val::List(List { values, .. }) => {
                 let (ptr, len) =
                     lower_list(&mut MemoryMut::new(store.as_context_mut(), options), values)?;
-                vec.push(ValRaw::i64(ptr as i64));
-                vec.push(ValRaw::i64(len as i64));
+                map_maybe_uninit!(dst[offset]).write(ValRaw::i64(ptr as i64));
+                map_maybe_uninit!(dst[offset + 1]).write(ValRaw::i64(len as i64));
             }
             Val::Record(Record { values, .. }) | Val::Tuple(Tuple { values, .. }) => {
-                for value in values.deref() {
-                    value.lower(store, options, vec)?;
+                for (index, value) in values.iter().enumerate() {
+                    value.lower(store, options, dst, offset + index)?;
                 }
             }
             Val::Variant(Variant {
@@ -195,19 +233,16 @@ impl Val {
                 value,
                 ..
             }) => {
-                vec.push(ValRaw::u32(*discriminant));
-                value.lower(store, options, vec)?;
-                // Pad `vec` out to max payload size:
-                vec.extend(
-                    iter::repeat(ValRaw::u32(0))
-                        .take(self.ty().flatten_count().checked_sub(vec.len()).unwrap()),
-                );
+                map_maybe_uninit!(dst[offset]).write(ValRaw::u32(*discriminant));
+                value.lower(store, options, dst, offset + 1)?;
             }
             Val::Enum(Enum { discriminant, .. }) => {
-                vec.push(ValRaw::u32(*discriminant));
+                map_maybe_uninit!(dst[offset]).write(ValRaw::u32(*discriminant));
             }
             Val::Flags(Flags { value, .. }) => {
-                vec.extend(value.iter().map(|&v| ValRaw::u32(v)));
+                for (index, value) in value.iter().enumerate() {
+                    map_maybe_uninit!(dst[offset + index]).write(ValRaw::u32(*value));
+                }
             }
             _ => unreachable!(),
         }
@@ -252,13 +287,17 @@ impl Val {
                 discriminant,
                 value,
                 ty,
-            }) => self.store_variant(discriminant, value, ty.cases().len(), mem, offset),
+            }) => self.store_variant(*discriminant, value, ty.cases().len(), mem, offset)?,
+
+            Val::Enum(Enum { discriminant, ty }) => {
+                self.store_variant(*discriminant, &Val::Unit, ty.names().len(), mem, offset)?
+            }
 
             Val::Union(Union {
                 discriminant,
                 value,
                 ty,
-            }) => self.store_variant(discriminant, value, ty.types().len(), mem, offset),
+            }) => self.store_variant(*discriminant, value, ty.types().len(), mem, offset)?,
 
             Val::Option(Option {
                 discriminant,
@@ -269,7 +308,7 @@ impl Val {
                 discriminant,
                 value,
                 ..
-            }) => self.store_variant(discriminant, value, 2, mem, offset),
+            }) => self.store_variant(*discriminant, value, 2, mem, offset)?,
 
             Val::Flags(Flags { count, value, .. }) => {
                 match FlagsSize::from_count(*count as usize) {
@@ -300,9 +339,9 @@ impl Val {
     ) -> Result<()> {
         let discriminant_size = DiscriminantSize::from_count(case_count).unwrap();
         match discriminant_size {
-            DiscriminantSize::Size1 => u8::try_from(*discriminant).unwrap().store(mem, offset)?,
-            DiscriminantSize::Size2 => u16::try_from(*discriminant).unwrap().store(mem, offset)?,
-            DiscriminantSize::Size4 => (*discriminant).store(mem, offset)?,
+            DiscriminantSize::Size1 => u8::try_from(discriminant).unwrap().store(mem, offset)?,
+            DiscriminantSize::Size2 => u16::try_from(discriminant).unwrap().store(mem, offset)?,
+            DiscriminantSize::Size4 => (discriminant).store(mem, offset)?,
         }
 
         value.store(
@@ -312,16 +351,16 @@ impl Val {
                     discriminant_size.into(),
                     self.ty().size_and_alignment().alignment,
                 ),
-        )?;
+        )
     }
 }
 
 /// Lower a list with the specified element type and values.
-fn lower_list<T>(
-    mem: &mut MemoryMut<'_, T>,
-    element_type: &Type,
-    items: &[Val],
-) -> Result<(usize, usize)> {
+fn lower_list<T>(mem: &mut MemoryMut<'_, T>, items: &[Val]) -> Result<(usize, usize)> {
+    let element_type = match items {
+        [item, ..] => item.ty(),
+        [] => Type::Unit,
+    };
     let SizeAndAlignment {
         size: element_size,
         alignment: element_alignment,
@@ -333,7 +372,7 @@ fn lower_list<T>(
     let ptr = mem.realloc(0, 0, element_alignment, size)?;
     let mut element_ptr = ptr;
     for item in items {
-        item.store(mem, element_type, element_ptr)?;
+        item.store(mem, element_ptr)?;
         element_ptr += element_size;
     }
     Ok((ptr, items.len()))
