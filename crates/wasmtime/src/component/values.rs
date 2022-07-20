@@ -9,59 +9,59 @@ use std::mem::MaybeUninit;
 use std::ops::Deref;
 use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct List {
     pub(crate) ty: Handle<TypeIndex>,
     pub(crate) values: Box<[Val]>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Record {
     pub(crate) ty: Handle<RecordIndex>,
     pub(crate) values: Box<[Val]>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Variant {
     pub(crate) ty: Handle<VariantIndex>,
     pub(crate) discriminant: u32,
     pub(crate) value: Box<Val>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Flags {
     pub(crate) ty: Handle<FlagsIndex>,
     pub(crate) count: u32,
     pub(crate) value: Box<[u32]>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Tuple {
     pub(crate) ty: Handle<TupleIndex>,
     pub(crate) values: Box<[Val]>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Enum {
     pub(crate) ty: Handle<EnumIndex>,
     pub(crate) discriminant: u32,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Union {
     pub(crate) ty: Handle<UnionIndex>,
     pub(crate) discriminant: u32,
     pub(crate) value: Box<Val>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Option {
     pub(crate) ty: Handle<TypeIndex>,
     pub(crate) discriminant: u32,
     pub(crate) value: Box<Val>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Expected {
     pub(crate) ty: Handle<ExpectedIndex>,
     pub(crate) discriminant: u32,
@@ -69,7 +69,7 @@ pub struct Expected {
 }
 
 /// Represents possible runtime values which a component function can either consume or produce
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Val {
     /// Unit
     Unit,
@@ -158,6 +158,7 @@ impl Val {
         offset: usize,
     ) -> Result<()> {
         match self {
+            Val::Unit => (),
             Val::Bool(value) => {
                 map_maybe_uninit!(dst[offset]).write(ValRaw::u32(if *value { 1 } else { 0 }));
             }
@@ -244,7 +245,6 @@ impl Val {
                     map_maybe_uninit!(dst[offset + index]).write(ValRaw::u32(*value));
                 }
             }
-            _ => unreachable!(),
         }
 
         Ok(())
@@ -253,6 +253,7 @@ impl Val {
     /// Serialize this value to the heap at the specified memory location.
     pub(crate) fn store<T>(&self, mem: &mut MemoryMut<'_, T>, offset: usize) -> Result<()> {
         match self {
+            Val::Unit => (),
             Val::Bool(value) => value.store(mem, offset)?,
             Val::S8(value) => value.store(mem, offset)?,
             Val::U8(value) => value.store(mem, offset)?,
@@ -323,7 +324,6 @@ impl Val {
                     }
                 }
             }
-            _ => unreachable!(),
         }
 
         Ok(())

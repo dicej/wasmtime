@@ -1,7 +1,6 @@
 use super::{make_echo_component, make_echo_component_with_params, Type};
 use anyhow::Result;
-use std::rc::Rc;
-use wasmtime::component::{Component, Linker, Val};
+use wasmtime::component::{self, Component, Linker, Val};
 use wasmtime::Store;
 
 #[test]
@@ -69,7 +68,7 @@ fn strings() -> Result<()> {
     let component = Component::new(&engine, make_echo_component("string", 8))?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let func = instance.get_func(&mut store, "echo").unwrap();
-    let input = Val::String(Rc::from("hello, component!"));
+    let input = Val::String(Box::from("hello, component!"));
     let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
@@ -85,26 +84,24 @@ fn lists() -> Result<()> {
     let component = Component::new(&engine, make_echo_component("(list u32)", 8))?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let func = instance.get_func(&mut store, "echo").unwrap();
-    let input = Val::List(Rc::new([
+    let ty = &func.params(&store)[0];
+    let input = ty.new_list(Box::new([
         Val::U32(32343),
         Val::U32(79023439),
         Val::U32(2084037802),
-    ]));
+    ]))?;
     let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
 
     // Sad path: type mismatch
 
-    assert!(func
-        .call(
-            &mut store,
-            &[Val::List(Rc::new([
-                Val::U32(32343),
-                Val::U32(79023439),
-                Val::Float32(3.14159265_f32.to_bits()),
-            ]))]
-        )
+    assert!(ty
+        .new_list(Box::new([
+            Val::U32(32343),
+            Val::U32(79023439),
+            Val::Float32(3.14159265_f32.to_bits()),
+        ]))
         .is_err());
 
     Ok(())
@@ -124,51 +121,75 @@ fn records() -> Result<()> {
     )?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let func = instance.get_func(&mut store, "echo").unwrap();
-    let input = Val::Record(Rc::new([
-        Val::U32(32343),
-        Val::Float64(3.14159265_f64.to_bits()),
-        Val::Record(Rc::new([Val::Bool(false), Val::U32(2084037802)])),
-    ]));
+    let ty = &func.params(&store)[0];
+    let inner_type = if let component::Type::Record(handle) = ty {
+        handle.fields().nth(2).unwrap().ty
+    } else {
+        unreachable!()
+    };
+    let input = ty.new_record(
+        [
+            ("A", Val::U32(32343)),
+            ("B", Val::Float64(3.14159265_f64.to_bits())),
+            (
+                "C",
+                inner_type.new_record(
+                    [("D", Val::Bool(false)), ("E", Val::U32(2084037802))].into_iter(),
+                )?,
+            ),
+        ]
+        .into_iter(),
+    )?;
     let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
 
     // Sad path: type mismatch
 
-    assert!(func
-        .call(
-            &mut store,
-            &[Val::Record(Rc::new([
-                Val::S32(32343),
-                Val::Float64(3.14159265_f64.to_bits()),
-                Val::Record(Rc::new([Val::Bool(false), Val::U32(2084037802)])),
-            ]))]
+    assert!(ty
+        .new_record(
+            [
+                ("A", Val::S32(32343)),
+                ("B", Val::Float64(3.14159265_f64.to_bits())),
+                (
+                    "C",
+                    inner_type.new_record(
+                        [("D", Val::Bool(false)), ("E", Val::U32(2084037802))].into_iter(),
+                    )?,
+                ),
+            ]
+            .into_iter(),
         )
         .is_err());
 
     // Sad path: too many fields
 
-    assert!(func
-        .call(
-            &mut store,
-            &[Val::Record(Rc::new([
-                Val::U32(32343),
-                Val::Float64(3.14159265_f64.to_bits()),
-                Val::Record(Rc::new([Val::Bool(false), Val::U32(2084037802)])),
-                Val::Record(Rc::new([]))
-            ]))]
+    assert!(ty
+        .new_record(
+            [
+                ("A", Val::U32(32343)),
+                ("B", Val::Float64(3.14159265_f64.to_bits())),
+                (
+                    "C",
+                    inner_type.new_record(
+                        [("D", Val::Bool(false)), ("E", Val::U32(2084037802))].into_iter(),
+                    )?,
+                ),
+                ("F", Val::Unit)
+            ]
+            .into_iter(),
         )
         .is_err());
 
     // Sad path: too few fields
 
-    assert!(func
-        .call(
-            &mut store,
-            &[Val::Record(Rc::new([
-                Val::U32(32343),
-                Val::Float64(3.14159265_f64.to_bits()),
-            ]))]
+    assert!(ty
+        .new_record(
+            [
+                ("A", Val::U32(32343)),
+                ("B", Val::Float64(3.14159265_f64.to_bits()))
+            ]
+            .into_iter(),
         )
         .is_err());
 
@@ -189,37 +210,19 @@ fn variants() -> Result<()> {
     )?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let func = instance.get_func(&mut store, "echo").unwrap();
-    let input = Val::Variant {
-        discriminant: 1,
-        value: Rc::new(Val::Float64(3.14159265_f64.to_bits())),
-    };
+    let ty = &func.params(&store)[0];
+    let input = ty.new_variant("B", Val::Float64(3.14159265_f64.to_bits()))?;
     let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
 
     // Sad path: type mismatch
 
-    assert!(func
-        .call(
-            &mut store,
-            &[Val::Variant {
-                discriminant: 1,
-                value: Rc::new(Val::U64(314159265)),
-            }]
-        )
-        .is_err());
+    assert!(ty.new_variant("B", Val::U64(314159265)).is_err());
 
     // Sad path: unknown discriminant
 
-    assert!(func
-        .call(
-            &mut store,
-            &[Val::Variant {
-                discriminant: 3,
-                value: Rc::new(Val::U64(314159265)),
-            }]
-        )
-        .is_err());
+    assert!(ty.new_variant("D", Val::U64(314159265)).is_err());
 
     Ok(())
 }
@@ -235,37 +238,15 @@ fn flags() -> Result<()> {
     )?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let func = instance.get_func(&mut store, "echo").unwrap();
-    let input = Val::Flags {
-        count: 5,
-        value: Rc::new([0b10101]),
-    };
+    let ty = &func.params(&store)[0];
+    let input = ty.new_flags(&["B", "D"])?;
     let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
 
-    // Sad path: too many flags
+    // Sad path: unknown flags
 
-    assert!(func
-        .call(
-            &mut store,
-            &[Val::Flags {
-                count: 6,
-                value: Rc::new([0b110101]),
-            }]
-        )
-        .is_err());
-
-    // Sad path: too few flags
-
-    assert!(func
-        .call(
-            &mut store,
-            &[Val::Flags {
-                count: 4,
-                value: Rc::new([0b0101]),
-            }]
-        )
-        .is_err());
+    assert!(ty.new_flags(&["B", "D", "F"]).is_err());
 
     Ok(())
 }
@@ -301,8 +282,8 @@ fn everything() -> Result<()> {
                 (field "X" unit)
                 (field "Y" (tuple u32 u32))
                 (field "Z" (union u32 float64))
-                (field "a" (option u32))
-                (field "b" (expected string string))
+                (field "AA" (option u32))
+                (field "BB" (expected string string))
             )"#,
             &[
                 Type::I32,
@@ -336,50 +317,63 @@ fn everything() -> Result<()> {
     )?;
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let func = instance.get_func(&mut store, "echo").unwrap();
-    let input = Val::Record(Rc::new([
-        Val::U32(32343),
-        Val::Variant {
-            discriminant: 1,
-            value: Rc::new(Val::Record(Rc::new([]))),
-        },
-        Val::Record(Rc::new([Val::Bool(false), Val::U32(2084037802)])),
-        Val::List(Rc::new([
-            Val::Flags {
-                count: 3,
-                value: Rc::new([0b101]),
-            },
-            Val::Flags {
-                count: 3,
-                value: Rc::new([0b010]),
-            },
-        ])),
-        Val::Variant {
-            discriminant: 1,
-            value: Rc::new(Val::Float64(3.14159265_f64.to_bits())),
-        },
-        Val::S8(42),
-        Val::S16(4242),
-        Val::S32(42424242),
-        Val::S64(424242424242424242),
-        Val::Float32(3.14159265_f32.to_bits()),
-        Val::Float64(3.14159265_f64.to_bits()),
-        Val::String(Rc::from("wow, nice types")),
-        Val::Char('🦀'),
-        Val::Record(Rc::new([])),
-        Val::Record(Rc::new([Val::U32(42), Val::U32(24)])),
-        Val::Variant {
-            discriminant: 1,
-            value: Rc::new(Val::Float64(3.14159265_f64.to_bits())),
-        },
-        Val::Variant {
-            discriminant: 1,
-            value: Rc::new(Val::U32(314159265)),
-        },
-        Val::Variant {
-            discriminant: 0,
-            value: Rc::new(Val::String(Rc::from("no problem"))),
-        },
-    ]));
+    let ty = &func.params(&store)[0];
+    let types = if let component::Type::Record(handle) = ty {
+        handle.fields().map(|field| field.ty).collect::<Box<[_]>>()
+    } else {
+        unreachable!()
+    };
+    let (b_type, c_type, f_type, j_type, y_type, z_type, aa_type, bb_type) = (
+        &types[1], &types[2], &types[3], &types[4], &types[14], &types[15], &types[16], &types[17],
+    );
+    let f_element_type = &if let component::Type::List(handle) = &f_type {
+        handle.ty()
+    } else {
+        unreachable!()
+    };
+    let input = ty.new_record(
+        [
+            ("A", Val::U32(32343)),
+            ("B", b_type.new_enum("2")?),
+            (
+                "C",
+                c_type.new_record(
+                    [("D", Val::Bool(false)), ("E", Val::U32(2084037802))].into_iter(),
+                )?,
+            ),
+            (
+                "F",
+                f_type.new_list(Box::new([f_element_type.new_flags(&["G", "I"])?]))?,
+            ),
+            (
+                "J",
+                j_type.new_variant("L", Val::Float64(3.14159265_f64.to_bits()))?,
+            ),
+            ("P", Val::S8(42)),
+            ("Q", Val::S16(4242)),
+            ("R", Val::S32(42424242)),
+            ("S", Val::S64(424242424242424242)),
+            ("T", Val::Float32(3.14159265_f32.to_bits())),
+            ("U", Val::Float64(3.14159265_f64.to_bits())),
+            ("V", Val::String(Box::from("wow, nice types"))),
+            ("W", Val::Char('🦀')),
+            ("X", Val::Unit),
+            (
+                "Y",
+                y_type.new_tuple(Box::new([Val::U32(42), Val::U32(24)]))?,
+            ),
+            (
+                "Z",
+                z_type.new_union(1, Val::Float64(3.14159265_f64.to_bits()))?,
+            ),
+            ("AA", aa_type.new_option(Some(Val::U32(314159265)))?),
+            (
+                "BB",
+                bb_type.new_expected(Ok(Val::String(Box::from("no problem"))))?,
+            ),
+        ]
+        .into_iter(),
+    )?;
     let output = func.call(&mut store, &[input.clone()])?;
 
     assert_eq!(input, output);
