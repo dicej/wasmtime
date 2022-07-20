@@ -1,3 +1,14 @@
+use crate::component::func::{self, Memory, Options};
+use crate::component::values::{
+    self, Enum, Expected, Flags, List, Option, Record, Tuple, Union, Val, Variant,
+};
+use crate::store::StoreOpaque;
+use crate::ValRaw;
+use anyhow::{anyhow, bail, Result};
+use std::collections::HashMap;
+use std::iter;
+use std::sync::Arc;
+use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 use wasmtime_environ::component::{
     ComponentTypes, InterfaceType, TypeEnumIndex, TypeExpectedIndex, TypeFlagsIndex,
     TypeInterfaceIndex, TypeRecordIndex, TypeTupleIndex, TypeUnionIndex, TypeVariantIndex,
@@ -10,7 +21,7 @@ pub struct Handle<T> {
 }
 
 impl<T: PartialEq> PartialEq for Handle<T> {
-    pub fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, other: &Self) -> bool {
         self.index == other.index && Arc::ptr_eq(&self.types, other.types)
     }
 }
@@ -22,7 +33,7 @@ pub struct TypeIndex(TypeInterfaceIndex);
 
 impl Handle<TypeIndex> {
     pub fn ty(&self) -> Type {
-        Type::from(&self.types[self.0], &self.types)
+        Type::from(&self.types[self.index.0], &self.types)
     }
 }
 
@@ -35,8 +46,8 @@ pub struct Field<'a> {
 pub struct RecordIndex(TypeRecordIndex);
 
 impl Handle<RecordIndex> {
-    pub fn fields(&self) -> impl ExactSizeIterator<Field> {
-        self.types[self.0].fields.iter().map(|field| Field {
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = Field> {
+        self.types[self.index.0].fields.iter().map(|field| Field {
             name: &field.name,
             ty: Type::from(&field.ty, &self.types),
         })
@@ -52,8 +63,8 @@ pub struct Case<'a> {
 pub struct VariantIndex(TypeVariantIndex);
 
 impl Handle<VariantIndex> {
-    pub fn cases(&self) -> impl ExactSizeIterator<Case> {
-        self.types[self.0].cases.iter().map(|case| Case {
+    pub fn cases(&self) -> impl ExactSizeIterator<Item = Case> {
+        self.types[self.index.0].cases.iter().map(|case| Case {
             name: &case.name,
             ty: Type::from(&case.ty, &self.types),
         })
@@ -64,8 +75,8 @@ impl Handle<VariantIndex> {
 pub struct FlagsIndex(TypeFlagsIndex);
 
 impl Handle<FlagsIndex> {
-    pub fn names(&self) -> impl ExactSizeIterator<Name> {
-        self.types[self.0].names.iter()
+    pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.types[self.index.0].names.iter()
     }
 }
 
@@ -73,8 +84,8 @@ impl Handle<FlagsIndex> {
 pub struct TupleIndex(TypeTupleIndex);
 
 impl Handle<TupleIndex> {
-    pub fn types(&self) -> impl ExactSizeIterator<Type> {
-        self.types[self.0]
+    pub fn types(&self) -> impl ExactSizeIterator<Item = Type> {
+        self.types[self.index.0]
             .types
             .iter()
             .map(|ty| Type::from(ty, &self.types))
@@ -85,8 +96,8 @@ impl Handle<TupleIndex> {
 pub struct EnumIndex(TypeEnumIndex);
 
 impl Handle<EnumIndex> {
-    pub fn names(&self) -> impl ExactSizeIterator<Name> {
-        self.types[self.0].names.iter()
+    pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.types[self.index.0].names.iter()
     }
 }
 
@@ -94,8 +105,8 @@ impl Handle<EnumIndex> {
 pub struct UnionIndex(TypeUnionIndex);
 
 impl Handle<UnionIndex> {
-    pub fn types(&self) -> impl ExactSizeIterator<Type> {
-        self.types[self.0]
+    pub fn types(&self) -> impl ExactSizeIterator<Item = Type> {
+        self.types[self.index.0]
             .types
             .iter()
             .map(|ty| Type::from(ty, &self.types))
@@ -107,11 +118,11 @@ pub struct ExpectedIndex(TypeExpectedIndex);
 
 impl Handle<ExpectedIndex> {
     pub fn ok(&self) -> Type {
-        Type::from(&self.types[self.0].ok)
+        Type::from(&self.types[self.index.0].ok)
     }
 
     pub fn err(&self) -> Type {
-        Type::from(&self.types[self.0].err)
+        Type::from(&self.types[self.index.0].err)
     }
 }
 
@@ -121,7 +132,7 @@ pub(crate) struct SizeAndAlignment {
     pub(crate) alignment: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Type {
     Unit,
     Bool,
@@ -149,17 +160,17 @@ pub enum Type {
 }
 
 impl Type {
-    pub fn new_list(&self, elements: Box<[Val]>) -> Result<Val> {
+    pub fn new_list(&self, values: Box<[Val]>) -> Result<Val> {
         if let Type::List(handle) = self {
             let ty = handle.ty();
-            for (index, elements) in elements.iter().enumerate() {
-                ty.check(item)
+            for (index, value) in values.iter().enumerate() {
+                ty.check(value)
                     .with_context(|| format!("type mismatch for element {index} of list"))?;
             }
 
             Ok(Val::List(List {
                 ty: handle.clone(),
-                elements,
+                values,
             }))
         } else {
             Err(anyhow!("cannot make list from {} type", self.desc()))
@@ -268,7 +279,8 @@ impl Type {
                 }))
             } else {
                 Err(anyhow!(
-                    "discriminant {discriminant} out of range: [0,{count})"
+                    "discriminant {discriminant} out of range: [0,{})",
+                    handle.types().len()
                 ))
             }
         } else {
@@ -276,7 +288,7 @@ impl Type {
         }
     }
 
-    pub fn new_option(&self, value: Option<Val>) -> Result<Val> {
+    pub fn new_option(&self, value: std::option::Option<Val>) -> Result<Val> {
         if let Type::Option(handle) = self {
             let value = value
                 .map(|value| {
@@ -333,7 +345,7 @@ impl Type {
                 .map(|(index, name)| (name, index))
                 .collect::<HashMap<_, _>>();
 
-            let mut values = vec![0_u32; u32_count_from_flag_count(handle.names().len())];
+            let mut values = vec![0_u32; values::u32_count_for_flag_count(handle.names().len())];
 
             for name in names {
                 let index = map
@@ -358,8 +370,8 @@ impl Type {
         } else {
             Err(anyhow!(
                 "type mismatch: expected {}, got {}",
-                ty.desc(),
-                self.desc()
+                self.desc(),
+                value.ty().desc()
             ))
         }
     }
@@ -449,7 +461,7 @@ impl Type {
                     .unwrap_or(0)
             }
 
-            Type::Flags(handle) => u32_count_for_flag_count(handle.names().len()),
+            Type::Flags(handle) => values::u32_count_for_flag_count(handle.names().len()),
 
             Type::Tuple(handle) => handle.types().map(|ty| ty.flatten_count()).sum(),
 
@@ -464,7 +476,6 @@ impl Type {
             Type::Option(handle) => 1 + handle.ty().flatten_count(),
 
             Type::Expected(handle) => {
-                let expected = &types[index.0];
                 1 + handle
                     .ok()
                     .flatten_count()
@@ -508,10 +519,6 @@ impl Type {
         options: &Options,
         src: &mut impl Iterator<Item = &'a ValRaw>,
     ) -> Result<Val> {
-        fn next<'a>(src: &mut impl Iterator<Item = &'a ValRaw>) -> &'a ValRaw {
-            src.next().unwrap()
-        }
-
         Ok(match self {
             Type::Bool => Val::Bool(bool::lift(store, options, next(src))?),
             Type::S8 => Val::S8(i8::lift(store, options, next(src))?),
@@ -665,7 +672,7 @@ impl Type {
             }
             Type::Variant(handle) => {
                 let (discriminant, value) =
-                    load_variant(handle.cases().map(|case| case.ty), store, mem, bytes)?;
+                    self.load_variant(handle.cases().map(|case| case.ty), store, mem, bytes)?;
 
                 Val::Variant(Variant {
                     ty: handle.clone(),
@@ -675,7 +682,7 @@ impl Type {
             }
             Type::Enum(handle) => {
                 let (discriminant, _) =
-                    load_variant(handle.names().map(|_| Type::Unit), store, mem, bytes)?;
+                    self.load_variant(handle.names().map(|_| Type::Unit), store, mem, bytes)?;
 
                 Val::Enum(Enum {
                     ty: handle.clone(),
@@ -683,7 +690,7 @@ impl Type {
                 })
             }
             Type::Union(handle) => {
-                let (discriminant, value) = load_variant(handle.types(), store, mem, bytes)?;
+                let (discriminant, value) = self.load_variant(handle.types(), store, mem, bytes)?;
 
                 Val::Union(Union {
                     ty: handle.clone(),
@@ -693,7 +700,7 @@ impl Type {
             }
             Type::Option(handle) => {
                 let (discriminant, value) =
-                    load_variant([Type::Unit, handle.ty()].into_iter(), store, mem, bytes)?;
+                    self.load_variant([Type::Unit, handle.ty()].into_iter(), store, mem, bytes)?;
 
                 Val::Option(Option {
                     ty: handle.clone(),
@@ -703,7 +710,7 @@ impl Type {
             }
             Type::Expected(handle) => {
                 let (discriminant, value) =
-                    load_variant([handle.ok(), handle.err()].into_iter(), store, mem, bytes)?;
+                    self.load_variant([handle.ok(), handle.err()].into_iter(), store, mem, bytes)?;
 
                 Val::Expected(Expected {
                     ty: handle.clone(),
@@ -724,9 +731,40 @@ impl Type {
         })
     }
 
+    fn load_variant(
+        &self,
+        types: impl ExactSizeIterator<Item = Type>,
+        store: &StoreOpaque,
+        mem: &Memory,
+        bytes: &[u8],
+    ) -> Result<(u32, Val)> {
+        let discriminant_size = DiscriminantSize::from_count(types.len()).unwrap();
+        let discriminant = match discriminant_size {
+            DiscriminantSize::Size1 => u8::load(mem, &bytes[..1])? as u32,
+            DiscriminantSize::Size2 => u16::load(mem, &bytes[..2])? as u32,
+            DiscriminantSize::Size4 => u32::load(mem, &bytes[..4])?,
+        };
+        let case = types.nth(discriminant as usize).ok_or_else(|| {
+            anyhow!(
+                "discriminant {} out of range [0..{})",
+                discriminant,
+                types.len()
+            )
+        })?;
+        let value = case.ty.load(
+            store,
+            mem,
+            &bytes[func::align_to(
+                usize::from(discriminant_size),
+                self.size_and_alignment().alignment,
+            )..][..case.ty.size_and_alignment().size],
+        )?;
+        Ok((discriminant, value))
+    }
+
     /// Calculate the size and alignment requirements for the specified type.
     pub(crate) fn size_and_alignment(&self) -> SizeAndAlignment {
-        match ty {
+        match self {
             Type::Bool | Type::S8 | Type::U8 => SizeAndAlignment {
                 size: 1,
                 alignment: 1,
@@ -788,6 +826,15 @@ impl Type {
             },
         }
     }
+
+    /// Calculate the aligned offset of a field of this type, updating `offset` to point to just after that field.
+    pub(crate) fn next_field(self, offset: &mut usize) -> usize {
+        let SizeAndAlignment { size, alignment } = self.size_and_alignment();
+        *offset = func::align_to(*offset, alignment);
+        let result = *offset;
+        *offset += size;
+        result
+    }
 }
 
 fn load_record(
@@ -802,54 +849,24 @@ fn load_record(
             ty.load(
                 store,
                 mem,
-                &bytes[next_field(ty, &mut offset)..][..ty.size_and_alignment().size],
+                &bytes[ty.next_field(&mut offset)..][..ty.size_and_alignment().size],
             )
         })
         .collect()
 }
 
-fn load_variant(
-    types: impl ExactSizedIterator<Item = Type>,
-    store: &StoreOpaque,
-    mem: &Memory,
-    bytes: &[u8],
-) -> Result<(u32, Val)> {
-    let discriminant_size = DiscriminantSize::from_count(types.len()).unwrap();
-    let discriminant = match discriminant_size {
-        DiscriminantSize::Size1 => u8::load(mem, &bytes[..1])? as u32,
-        DiscriminantSize::Size2 => u16::load(mem, &bytes[..2])? as u32,
-        DiscriminantSize::Size4 => u32::load(mem, &bytes[..4])?,
-    };
-    let case = types.nth(discriminant as usize).ok_or_else(|| {
-        anyhow!(
-            "discriminant {} out of range [0..{})",
-            discriminant,
-            types.len()
-        )
-    })?;
-    let value = Rc::new(case.ty.load(
-        store,
-        mem,
-        &bytes[func::align_to(
-            usize::from(discriminant_size),
-            self.size_and_alignment().alignment,
-        )..][..case.ty.size_and_alignment().size],
-    )?);
-    Ok((discriminant, value))
-}
-
-fn lift_variant(
-    types: impl ExactSizedIterator<Item = Type>,
+fn lift_variant<'a>(
+    types: impl ExactSizeIterator<Item = Type>,
     store: &StoreOpaque,
     options: &Options,
     src: &mut impl Iterator<Item = &'a ValRaw>,
 ) -> Result<(u32, Val)> {
     let len = types.len();
     let discriminant = next(src).get_u32();
-    let case = types
+    let ty = types
         .nth(discriminant as usize)
         .ok_or_else(|| anyhow!("discriminant {} out of range [0..{})", discriminant, len))?;
-    let value = Rc::new(ty.lift(store, options, src)?);
+    let value = ty.lift(store, options, src)?;
     (discriminant, value)
 }
 
@@ -868,7 +885,7 @@ fn record_size_and_alignment(types: impl Iterator<Item = Type>) -> SizeAndAlignm
     }
 }
 
-fn variant_size_and_alignment(types: impl ExactSizedIterator<Item = Type>) -> SizeAndAlignment {
+fn variant_size_and_alignment(types: impl ExactSizeIterator<Item = Type>) -> SizeAndAlignment {
     let discriminant_size = DiscriminantSize::from_count(types.len()).unwrap();
     let mut alignment = 1;
     let mut size = 0;
@@ -882,4 +899,8 @@ fn variant_size_and_alignment(types: impl ExactSizedIterator<Item = Type>) -> Si
         size: func::align_to(usize::from(discriminant_size), alignment) + size,
         alignment,
     }
+}
+
+fn next<'a>(src: &mut impl Iterator<Item = &'a ValRaw>) -> &'a ValRaw {
+    src.next().unwrap()
 }

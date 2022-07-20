@@ -1,4 +1,8 @@
-use crate::component::func::{self, Lift, Lower, Memory, MemoryMut, Options, WasmStr};
+use crate::component::func::{self, Lift, Lower, Memory, MemoryMut, Options};
+use crate::component::types::{
+    EnumIndex, ExpectedIndex, FlagsIndex, Handle, RecordIndex, SizeAndAlignment, TupleIndex, Type,
+    TypeIndex, UnionIndex, VariantIndex,
+};
 use crate::store::StoreOpaque;
 use crate::{AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{anyhow, bail, Result};
@@ -213,7 +217,7 @@ impl Val {
 
     /// Serialize this value to the heap at the specified memory location.
     pub(crate) fn store<T>(&self, mem: &mut MemoryMut<'_, T>, offset: usize) -> Result<()> {
-        match (self, ty) {
+        match self {
             Val::Bool(value) => value.store(mem, offset)?,
             Val::S8(value) => value.store(mem, offset)?,
             Val::U8(value) => value.store(mem, offset)?,
@@ -241,20 +245,20 @@ impl Val {
             Val::Record(Record { values, .. }) | Val::Tuple(Tuple { values, .. }) => {
                 let mut offset = offset;
                 for value in values.deref() {
-                    value.store(mem, next_field(&value.ty(), &mut offset))?;
+                    value.store(mem, value.ty().next_field(&mut offset))?;
                 }
             }
             Val::Variant(Variant {
                 discriminant,
                 value,
                 ty,
-            }) => store_variant(discriminant, value, ty.cases().len()),
+            }) => self.store_variant(discriminant, value, ty.cases().len(), mem, offset),
 
             Val::Union(Union {
                 discriminant,
                 value,
                 ty,
-            }) => store_variant(discriminant, value, ty.types().len()),
+            }) => self.store_variant(discriminant, value, ty.types().len(), mem, offset),
 
             Val::Option(Option {
                 discriminant,
@@ -265,7 +269,7 @@ impl Val {
                 discriminant,
                 value,
                 ..
-            }) => store_variant(discriminant, value, 2),
+            }) => self.store_variant(discriminant, value, 2, mem, offset),
 
             Val::Flags(Flags { count, value, .. }) => {
                 match FlagsSize::from_count(*count as usize) {
@@ -285,20 +289,31 @@ impl Val {
 
         Ok(())
     }
-}
 
-fn store_variant(discriminant: u32, value: &Value, case_count: usize) -> Result<()> {
-    let discriminant_size = DiscriminantSize::from_count(case_count).unwrap();
-    match discriminant_size {
-        DiscriminantSize::Size1 => u8::try_from(*discriminant).unwrap().store(mem, offset)?,
-        DiscriminantSize::Size2 => u16::try_from(*discriminant).unwrap().store(mem, offset)?,
-        DiscriminantSize::Size4 => (*discriminant).store(mem, offset)?,
+    fn store_variant<T>(
+        &self,
+        discriminant: u32,
+        value: &Val,
+        case_count: usize,
+        mem: &mut MemoryMut<'_, T>,
+        offset: usize,
+    ) -> Result<()> {
+        let discriminant_size = DiscriminantSize::from_count(case_count).unwrap();
+        match discriminant_size {
+            DiscriminantSize::Size1 => u8::try_from(*discriminant).unwrap().store(mem, offset)?,
+            DiscriminantSize::Size2 => u16::try_from(*discriminant).unwrap().store(mem, offset)?,
+            DiscriminantSize::Size4 => (*discriminant).store(mem, offset)?,
+        }
+
+        value.store(
+            mem,
+            offset
+                + func::align_to(
+                    discriminant_size.into(),
+                    self.ty().size_and_alignment().alignment,
+                ),
+        )?;
     }
-
-    value.store(
-        mem,
-        offset + func::align_to(discriminant_size.into(), ty.size_and_alignment().alignment),
-    )?;
 }
 
 /// Lower a list with the specified element type and values.
@@ -324,20 +339,10 @@ fn lower_list<T>(
     Ok((ptr, items.len()))
 }
 
-/// Calculate the aligned offset of a field of the specified type, updating `offset` to point to just after that
-/// field.
-pub(crate) fn next_field(ty: &Type, offset: &mut usize) -> usize {
-    let SizeAndAlignment { size, alignment } = ty.size_and_alignment();
-    *offset = func::align_to(*offset, alignment);
-    let result = *offset;
-    *offset += size;
-    result
-}
-
 /// Calculate the size of a u32 array needed to represent the specified number of bit flags.
 ///
 /// Note that this will always return at least 1, even if the `count` parameter is zero.
-fn u32_count_for_flag_count(count: usize) -> usize {
+pub(crate) fn u32_count_for_flag_count(count: usize) -> usize {
     match FlagsSize::from_count(count) {
         FlagsSize::Size1 | FlagsSize::Size2 => 1,
         FlagsSize::Size4Plus(n) => n,

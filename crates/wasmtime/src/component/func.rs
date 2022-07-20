@@ -1,5 +1,6 @@
 use crate::component::instance::{Instance, InstanceData};
-use crate::component::values::{self, SizeAndAlignment, Type, Val};
+use crate::component::types::{self, SizeAndAlignment, Type};
+use crate::component::values::{self, Val};
 use crate::store::{StoreOpaque, Stored};
 use crate::{AsContext, AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{bail, Context, Result};
@@ -243,6 +244,15 @@ impl Func {
         Ok(())
     }
 
+    pub fn params(&self, store: impl AsContext) -> Box<[Type]> {
+        let data = &store.as_context()[self.0];
+        data.types[data.ty]
+            .params
+            .iter()
+            .map(|(_, ty)| Type::from(ty, &data.types))
+            .collect()
+    }
+
     /// Invokes this function with the `params` given and returns the result.
     ///
     /// The `params` here must match the type signature of this `Func`, or this will return an error. If a trap
@@ -268,8 +278,7 @@ impl Func {
                 .map(|((_, ty), arg)| {
                     let ty = Type::from(ty, &data.types);
 
-                    arg.typecheck(&ty)
-                        .context("type mismatch with parameters")?;
+                    ty.check(arg).context("type mismatch with parameters")?;
 
                     Ok(ty)
                 })
@@ -330,12 +339,7 @@ impl Func {
                 &mut space[..MAX_STACK_RESULTS].iter(),
             )
         } else {
-            Val::lift(
-                store.0,
-                &options,
-                &result,
-                &mut space[..MAX_STACK_RESULTS].iter(),
-            )
+            result.lift(store.0, &options, &mut space[..MAX_STACK_RESULTS].iter())
         }?;
 
         let data = &mut store.0[self.0];
@@ -356,14 +360,14 @@ impl Func {
         let mut alignment = 1;
         for ty in params {
             alignment = alignment.max(SizeAndAlignment::from(ty).alignment);
-            values::next_field(ty, &mut size);
+            ty.next_field(&mut size);
         }
 
         let mut memory = MemoryMut::new(store.as_context_mut(), options);
         let ptr = memory.realloc(0, 0, alignment, size)?;
         let mut offset = ptr;
         for (ty, arg) in params.iter().zip(args) {
-            arg.store(&mut memory, ty, values::next_field(ty, &mut offset))?;
+            arg.store(&mut memory, ty, ty.next_field(&mut offset))?;
         }
 
         vec.push(ValRaw::i64(ptr as i64));
@@ -390,6 +394,6 @@ impl Func {
             .and_then(|b| b.get(..size))
             .ok_or_else(|| anyhow::anyhow!("pointer out of bounds of memory"))?;
 
-        Val::load(store, mem, ty, bytes)
+        ty.load(store, mem, bytes)
     }
 }
