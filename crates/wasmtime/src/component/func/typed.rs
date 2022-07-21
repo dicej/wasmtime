@@ -284,94 +284,9 @@ where
         Return::load(&memory, bytes)
     }
 
-    /// Invokes the `post-return` canonical ABI option, if specified, after a
-    /// [`TypedFunc::call`] has finished.
-    ///
-    /// For some more information on when to use this function see the
-    /// documentation for post-return in the [`TypedFunc::call`] method.
-    /// Otherwise though this function is a required method call after a
-    /// [`TypedFunc::call`] completes successfully. After the embedder has
-    /// finished processing the return value then this function must be invoked.
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error in the case of a WebAssembly trap
-    /// happening during the execution of the `post-return` function, if
-    /// specified.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if it's not called under the correct
-    /// conditions. This can only be called after a previous invocation of
-    /// [`TypedFunc::call`] completes successfully, and this function can only
-    /// be called for the same [`TypedFunc`] that was `call`'d.
-    ///
-    /// If this function is called when [`TypedFunc::call`] was not previously
-    /// called, then it will panic. If a different [`TypedFunc`] for the same
-    /// component instance was invoked then this function will also panic
-    /// because the `post-return` needs to happen for the other function.
-    pub fn post_return(&self, mut store: impl AsContextMut) -> Result<()> {
-        let mut store = store.as_context_mut();
-        let data = &mut store.0[self.func.0];
-        let instance = data.instance;
-        let post_return = data.post_return;
-        let component_instance = data.component_instance;
-        let post_return_arg = data.post_return_arg.take();
-        let instance = store.0[instance.0].as_ref().unwrap().instance();
-        let flags = instance.flags(component_instance);
-
-        unsafe {
-            // First assert that the instance is in a "needs post return" state.
-            // This will ensure that the previous action on the instance was a
-            // function call above. This flag is only set after a component
-            // function returns so this also can't be called (as expected)
-            // during a host import for example.
-            //
-            // Note, though, that this assert is not sufficient because it just
-            // means some function on this instance needs its post-return
-            // called. We need a precise post-return for a particular function
-            // which is the second assert here (the `.expect`). That will assert
-            // that this function itself needs to have its post-return called.
-            //
-            // The theory at least is that these two asserts ensure component
-            // model semantics are upheld where the host properly calls
-            // `post_return` on the right function despite the call being a
-            // separate step in the API.
-            assert!(
-                (*flags).needs_post_return(),
-                "post_return can only be called after a function has previously been called",
-            );
-            let post_return_arg = post_return_arg.expect("calling post_return on wrong function");
-
-            // This is a sanity-check assert which shouldn't ever trip.
-            assert!(!(*flags).may_enter());
-
-            // Unset the "needs post return" flag now that post-return is being
-            // processed. This will cause future invocations of this method to
-            // panic, even if the function call below traps.
-            (*flags).set_needs_post_return(false);
-
-            // If the function actually had a `post-return` configured in its
-            // canonical options that's executed here.
-            //
-            // Note that if this traps (returns an error) this function
-            // intentionally leaves the instance in a "poisoned" state where it
-            // can no longer be entered because `may_enter` is `false`.
-            if let Some((func, trampoline)) = post_return {
-                crate::Func::call_unchecked_raw(
-                    &mut store,
-                    func.anyfunc,
-                    trampoline,
-                    &post_return_arg as *const ValRaw as *mut ValRaw,
-                )?;
-            }
-
-            // And finally if everything completed successfully then the "may
-            // enter" flag is set to `true` again here which enables further use
-            // of the component.
-            (*flags).set_may_enter(true);
-        }
-        Ok(())
+    /// See [`Func::post_return`]
+    pub fn post_return(&self, store: impl AsContextMut) -> Result<()> {
+        self.func.post_return(store)
     }
 }
 

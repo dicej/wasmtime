@@ -219,14 +219,20 @@ impl Type {
     }
 
     /// Instantiate this type (which must be a `Type::Record`) with the specified `values`.
-    pub fn new_record<'a>(
+    pub fn new_record<
+        'a,
+        I: ExactSizeIterator<Item = (&'a str, Val)>,
+        II: IntoIterator<Item = (&'a str, Val), IntoIter = I>,
+    >(
         &self,
-        values: impl ExactSizeIterator<Item = (&'a str, Val)>,
+        values: II,
     ) -> Result<Val> {
         if let Type::Record(handle) = self {
+            let values = values.into_iter();
+
             if values.len() != handle.fields().len() {
                 bail!(
-                    "expected {} values; got {}",
+                    "expected {} value(s); got {}",
                     handle.fields().len(),
                     values.len()
                 );
@@ -262,7 +268,7 @@ impl Type {
         if let Type::Tuple(handle) = self {
             if values.len() != handle.types().len() {
                 bail!(
-                    "expected {} values; got {}",
+                    "expected {} value(s); got {}",
                     handle.types().len(),
                     values.len()
                 );
@@ -429,6 +435,45 @@ impl Type {
             }))
         } else {
             Err(anyhow!("cannot make flags from {} type", self.desc()))
+        }
+    }
+
+    /// Retrieve any types nested within this type.
+    ///
+    /// For example, this will return the field types in order of declaration for a record type.  It will return
+    /// the element type for a list type and nothing for non-composite types like bool, u8, and string.
+    pub fn nested(&self) -> Box<[Type]> {
+        match self {
+            Type::Unit
+            | Type::Bool
+            | Type::S8
+            | Type::U8
+            | Type::S16
+            | Type::U16
+            | Type::S32
+            | Type::U32
+            | Type::S64
+            | Type::U64
+            | Type::Float32
+            | Type::Float64
+            | Type::Char
+            | Type::String
+            | Type::Enum(_)
+            | Type::Flags(_) => Box::new([]),
+
+            Type::List(handle) => Box::new([handle.ty()]),
+
+            Type::Record(handle) => handle.fields().map(|field| field.ty).collect(),
+
+            Type::Tuple(handle) => handle.types().collect(),
+
+            Type::Variant(handle) => handle.cases().map(|case| case.ty).collect(),
+
+            Type::Union(handle) => handle.types().collect(),
+
+            Type::Option(handle) => Box::new([handle.ty()]),
+
+            Type::Expected(handle) => Box::new([handle.ok(), handle.err()]),
         }
     }
 
