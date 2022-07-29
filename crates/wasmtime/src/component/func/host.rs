@@ -463,7 +463,7 @@ where
             ret.lower(&mut cx, &options, &mut dst.iter_mut())?;
         } else {
             let arg_ptr = &storage[0];
-            let ret_ptr = &storage[0];
+            let ret_ptr = &storage[1];
             let ptr = validate_inbounds_dynamic(param_layout, memory.as_slice(), arg_ptr)?;
             let mut offset = ptr;
             let args = params
