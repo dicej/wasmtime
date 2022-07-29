@@ -39,7 +39,8 @@ component-model = [
   "wasmtime-fuzzing/component-model",
   "component-test-util/component-model",
   "dep:anyhow",
-  "dep:arbitrary"]
+  "dep:arbitrary"
+]
 
 [[bin]]
 name = "compile"

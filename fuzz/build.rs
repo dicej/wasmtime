@@ -19,7 +19,7 @@ mod component {
     use std::ops::DerefMut;
     use std::path::PathBuf;
     use std::process::Command;
-    use wasmtime_fuzzing::generators::component_types::{self, TestCase};
+    use wasmtime_fuzzing::generators::component_types::{self, Declarations, TestCase};
 
     pub fn generate_static_api_tests() -> Result<()> {
         println!("cargo:rerun-if-changed=build.rs");
@@ -60,23 +60,19 @@ mod component {
             let mut bytes = vec![0u8; rng.gen_range(1000..2000)];
             rng.fill(bytes.deref_mut());
 
-            let TestCase {
+            let case = TestCase::arbitrary(&mut Unstructured::new(&bytes))?;
+
+            let Declarations {
+                types,
                 params,
                 result,
                 import_and_export,
-            } = TestCase::arbitrary(&mut Unstructured::new(&bytes))?;
+            } = case.declarations();
 
-            let test = format_ident!("static_api_test{}", params.len());
+            let test = format_ident!("static_api_test{}", case.params.len());
 
-            let component_params = params
-                .iter()
-                .map(|ty| format!("(param {ty})"))
-                .collect::<Box<[_]>>()
-                .join(" ");
-
-            let component_result = format!("(result {result})");
-
-            let params = params
+            let rust_params = case
+                .params
                 .iter()
                 .map(|ty| {
                     let ty = component_types::rust_type(&ty, name_counter, &mut declarations);
@@ -84,10 +80,17 @@ mod component {
                 })
                 .collect::<TokenStream>();
 
-            let result = component_types::rust_type(&result, name_counter, &mut declarations);
+            let rust_result =
+                component_types::rust_type(&case.result, name_counter, &mut declarations);
 
-            let test = quote!(#index => component_types::#test::<#params #result>(
-                &mut input, #component_params, #component_result, #import_and_export
+            let test = quote!(#index => component_types::#test::<#rust_params #rust_result>(
+                &mut input,
+                &Declarations {
+                    types: #types,
+                    params: #params,
+                    result: #result,
+                    import_and_export: #import_and_export
+                }
             ),);
 
             tests.extend(test);
@@ -101,7 +104,7 @@ mod component {
                 use component_test_util::{self, Float32, Float64};
                 use std::sync::{Arc, Once};
                 use wasmtime::component::{ComponentType, Lift, Lower};
-                use wasmtime_fuzzing::generators::component_types;
+                use wasmtime_fuzzing::generators::component_types::{self, Declarations};
 
                 const SEED: u64 = #seed;
 

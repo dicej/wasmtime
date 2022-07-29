@@ -1071,21 +1071,8 @@ pub fn dynamic_component_api_case(bytes: &[u8]) -> arbitrary::Result<()> {
 
     let engine = component_test_util::engine();
     let mut store = Store::new(&engine, (Box::new([]) as Box<[Val]>, None));
-    let component = Component::new(
-        &engine,
-        component_types::make_component(
-            &case
-                .params
-                .iter()
-                .map(|ty| format!("(param {ty})"))
-                .collect::<Box<[_]>>()
-                .join(" "),
-            &format!("(result {})", case.result),
-            &case.import_and_export,
-        )
-        .as_bytes(),
-    )
-    .unwrap();
+    let component =
+        Component::new(&engine, case.declarations().make_component().as_bytes()).unwrap();
     let mut linker = Linker::new(&engine);
 
     linker

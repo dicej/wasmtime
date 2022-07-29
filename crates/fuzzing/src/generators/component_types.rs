@@ -129,78 +129,6 @@ pub enum Type {
     Flags(NonEmptyArray<()>),
 }
 
-impl fmt::Display for Type {
-    /// Format this type according to [the component model
-    /// grammar](https://github.com/WebAssembly/component-model/blob/main/design/mvp/Explainer.md#type-definitions).
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unit => f.write_str("unit"),
-            Self::Bool => f.write_str("bool"),
-            Self::S8 => f.write_str("s8"),
-            Self::U8 => f.write_str("u8"),
-            Self::S16 => f.write_str("s16"),
-            Self::U16 => f.write_str("u16"),
-            Self::S32 => f.write_str("s32"),
-            Self::U32 => f.write_str("u32"),
-            Self::S64 => f.write_str("s64"),
-            Self::U64 => f.write_str("u64"),
-            Self::Float32 => f.write_str("float32"),
-            Self::Float64 => f.write_str("float64"),
-            Self::Char => f.write_str("char"),
-            Self::String => f.write_str("string"),
-            Self::List(ty) => write!(f, "(list {ty})"),
-            Self::Record(types) => {
-                f.write_str("(record")?;
-                for (index, ty) in types.0.iter().enumerate() {
-                    write!(f, r#" (field "f{index}" {ty})"#)?;
-                }
-                f.write_str(")")
-            }
-            Self::Tuple(types) => {
-                f.write_str("(tuple")?;
-                for ty in types.0.iter() {
-                    write!(f, r#" {ty}"#)?;
-                }
-                f.write_str(")")
-            }
-            Self::Variant(types) => {
-                f.write_str("(variant")?;
-                for (index, ty) in types.0.iter().enumerate() {
-                    write!(f, r#" (case "C{index}" {ty})"#)?;
-                }
-                f.write_str(")")
-            }
-            Self::Enum(units) => {
-                f.write_str("(enum")?;
-                for index in 0..units.0.len() {
-                    write!(f, r#" "C{index}""#)?;
-                }
-                f.write_str(")")
-            }
-            Self::Union(types) => {
-                f.write_str("(union")?;
-                for ty in types.0.iter() {
-                    write!(f, r#" {ty}"#)?;
-                }
-                f.write_str(")")
-            }
-            Self::Option(ty) => {
-                write!(f, r#"(option {ty})"#)
-            }
-            Self::Expected { ok, err } => {
-                write!(f, r#"(expected {ok} {err})"#)
-            }
-            Self::Flags(units) => {
-                f.write_str("(flags")?;
-                for index in 0..units.0.len() {
-                    write!(f, r#" "F{index}""#)?;
-                }
-                f.write_str(")")
-            }
-        }
-    }
-}
-
 fn lower_record<'a>(types: impl Iterator<Item = &'a Type>, vec: &mut Vec<CoreType>) {
     for ty in types {
         ty.lower(vec);
@@ -549,7 +477,7 @@ fn make_import_and_export(params: &[Type], result: &Type) -> Box<str> {
     .into()
 }
 
-fn make_name<'a>(name_counter: &mut u32) -> Ident {
+fn make_rust_name(name_counter: &mut u32) -> Ident {
     let name = format_ident!("Foo{name_counter}");
     *name_counter += 1;
     name
@@ -559,11 +487,7 @@ fn make_name<'a>(name_counter: &mut u32) -> Ident {
 ///
 /// The `name_counter` parameter is used to generate names for each recursively visited type.  The `declarations`
 /// parameter is used to accumulate declarations for each recursively visited type.
-pub fn rust_type<'a>(
-    ty: &'a Type,
-    name_counter: &mut u32,
-    declarations: &mut TokenStream,
-) -> TokenStream {
+pub fn rust_type(ty: &Type, name_counter: &mut u32, declarations: &mut TokenStream) -> TokenStream {
     match ty {
         Type::Unit => quote!(()),
         Type::Bool => quote!(bool),
@@ -595,7 +519,7 @@ pub fn rust_type<'a>(
                 })
                 .collect::<TokenStream>();
 
-            let name = make_name(name_counter);
+            let name = make_rust_name(name_counter);
 
             declarations.extend(quote! {
                 #[derive(ComponentType, Lift, Lower, PartialEq, Debug, Clone, Arbitrary)]
@@ -631,7 +555,7 @@ pub fn rust_type<'a>(
                 })
                 .collect::<TokenStream>();
 
-            let name = make_name(name_counter);
+            let name = make_rust_name(name_counter);
 
             let which = if let Type::Variant(_) = ty {
                 quote!(variant)
@@ -657,7 +581,7 @@ pub fn rust_type<'a>(
                 })
                 .collect::<TokenStream>();
 
-            let name = make_name(name_counter);
+            let name = make_rust_name(name_counter);
 
             declarations.extend(quote! {
                 #[derive(ComponentType, Lift, Lower, PartialEq, Debug, Clone, Arbitrary)]
@@ -679,7 +603,7 @@ pub fn rust_type<'a>(
             quote!(Result<#ok, #err>)
         }
         Type::Flags(units) => {
-            let type_name = make_name(name_counter);
+            let type_name = make_rust_name(name_counter);
 
             let mut flags = TokenStream::new();
             let mut names = TokenStream::new();
@@ -715,6 +639,183 @@ pub fn rust_type<'a>(
     }
 }
 
+fn make_component_name(name_counter: &mut u32) -> String {
+    let name = format!("$Foo{name_counter}");
+    *name_counter += 1;
+    name
+}
+
+fn write_component_type(
+    ty: &Type,
+    f: &mut String,
+    name_counter: &mut u32,
+    declarations: &mut String,
+) {
+    match ty {
+        Type::Unit => f.push_str("unit"),
+        Type::Bool => f.push_str("bool"),
+        Type::S8 => f.push_str("s8"),
+        Type::U8 => f.push_str("u8"),
+        Type::S16 => f.push_str("s16"),
+        Type::U16 => f.push_str("u16"),
+        Type::S32 => f.push_str("s32"),
+        Type::U32 => f.push_str("u32"),
+        Type::S64 => f.push_str("s64"),
+        Type::U64 => f.push_str("u64"),
+        Type::Float32 => f.push_str("float32"),
+        Type::Float64 => f.push_str("float64"),
+        Type::Char => f.push_str("char"),
+        Type::String => f.push_str("string"),
+        Type::List(ty) => {
+            let mut case = String::new();
+            write_component_type(ty, &mut case, name_counter, declarations);
+            let name = make_component_name(name_counter);
+            write!(declarations, "(type {name} (list {case}))").unwrap();
+            f.push_str(&name);
+        }
+        Type::Record(types) => {
+            let mut fields = String::new();
+            for (index, ty) in types.0.iter().enumerate() {
+                write!(fields, r#" (field "f{index}" "#).unwrap();
+                write_component_type(ty, &mut fields, name_counter, declarations);
+                fields.push_str(")");
+            }
+            let name = make_component_name(name_counter);
+            write!(declarations, "(type {name} (record{fields}))").unwrap();
+            f.push_str(&name);
+        }
+        Type::Tuple(types) => {
+            let mut fields = String::new();
+            for ty in types.0.iter() {
+                fields.push_str(" ");
+                write_component_type(ty, &mut fields, name_counter, declarations);
+            }
+            let name = make_component_name(name_counter);
+            write!(declarations, "(type {name} (tuple{fields}))").unwrap();
+            f.push_str(&name);
+        }
+        Type::Variant(types) => {
+            let mut cases = String::new();
+            for (index, ty) in types.0.iter().enumerate() {
+                write!(cases, r#" (case "C{index}" "#).unwrap();
+                write_component_type(ty, &mut cases, name_counter, declarations);
+                cases.push_str(")");
+            }
+            let name = make_component_name(name_counter);
+            write!(declarations, "(type {name} (variant{cases}))").unwrap();
+            f.push_str(&name);
+        }
+        Type::Enum(units) => {
+            f.push_str("(enum");
+            for index in 0..units.0.len() {
+                write!(f, r#" "C{index}""#).unwrap();
+            }
+            f.push_str(")");
+        }
+        Type::Union(types) => {
+            let mut cases = String::new();
+            for ty in types.0.iter() {
+                cases.push_str(" ");
+                write_component_type(ty, &mut cases, name_counter, declarations);
+            }
+            let name = make_component_name(name_counter);
+            write!(declarations, "(type {name} (union{cases}))").unwrap();
+            f.push_str(&name);
+        }
+        Type::Option(ty) => {
+            let mut case = String::new();
+            write_component_type(ty, &mut case, name_counter, declarations);
+            let name = make_component_name(name_counter);
+            write!(declarations, "(type {name} (option {case}))").unwrap();
+            f.push_str(&name);
+        }
+        Type::Expected { ok, err } => {
+            let mut cases = String::new();
+            write_component_type(ok, &mut cases, name_counter, declarations);
+            cases.push_str(" ");
+            write_component_type(err, &mut cases, name_counter, declarations);
+            let name = make_component_name(name_counter);
+            write!(declarations, "(type {name} (expected {cases}))").unwrap();
+            f.push_str(&name);
+        }
+        Type::Flags(units) => {
+            f.push_str("(flags");
+            for index in 0..units.0.len() {
+                write!(f, r#" "F{index}""#).unwrap();
+            }
+            f.push_str(")");
+        }
+    }
+}
+
+/// Represents custom fragments of a WAT file which may be used to create a component for exercising [`TestCase`]s
+#[derive(Debug)]
+pub struct Declarations {
+    /// Type declarations (if any) referenced by `params` and/or `result`
+    pub types: Box<str>,
+    /// Parameter declarations used for the imported and exported functions
+    pub params: Box<str>,
+    /// Result declaration used for the imported and exported functions
+    pub result: Box<str>,
+    /// A WAT fragment representing the core function import and export to use for testing
+    pub import_and_export: Box<str>,
+}
+
+impl Declarations {
+    /// Generate a complete WAT file based on the specified fragments.
+    pub fn make_component(&self) -> Box<str> {
+        let Self {
+            types,
+            params,
+            result,
+            import_and_export,
+        } = self;
+
+        format!(
+            r#"
+            (component
+                (core module $libc
+                    (memory (export "memory") 1)
+                    {REALLOC_AND_FREE}
+                )
+
+                (core instance $libc (instantiate $libc))
+
+                {types}
+
+                (import "{IMPORT_FUNCTION}" (func $f {params} {result}))
+
+                (core func $f_lower (canon lower
+                    (func $f)
+                    (memory $libc "memory")
+                    (realloc (func $libc "realloc"))
+                ))
+
+                (core module $m
+                    (memory (import "libc" "memory") 1)
+                    (func $realloc (import "libc" "realloc") (param i32 i32 i32 i32) (result i32))
+
+                    {import_and_export}
+                )
+
+                (core instance $i (instantiate $m
+                    (with "libc" (instance $libc))
+                    (with "host" (instance (export "{IMPORT_FUNCTION}" (func $f_lower))))
+                ))
+
+                (func (export "echo") {params} {result}
+                    (canon lift
+                        (core func $i "echo")
+                        (memory $libc "memory")
+                        (realloc (func $libc "realloc"))
+                    )
+                )
+            )"#,
+        )
+        .into()
+    }
+}
+
 /// Represents a test case for calling a component function
 #[derive(Debug)]
 pub struct TestCase {
@@ -722,8 +823,42 @@ pub struct TestCase {
     pub params: Box<[Type]>,
     /// The type of the result to be returned by the function
     pub result: Type,
-    /// A WAT fragment representing the core function import and export to use for testing
-    pub import_and_export: Box<str>,
+}
+
+impl TestCase {
+    /// Generate a `Declarations` for this `TestCase` which may be used to build a component to execute the case.
+    pub fn declarations(&self) -> Declarations {
+        let mut types = String::new();
+        let name_counter = &mut 0;
+
+        let params = self
+            .params
+            .iter()
+            .map(|ty| {
+                let mut tmp = String::new();
+                write_component_type(ty, &mut tmp, name_counter, &mut types);
+                format!("(param {tmp})")
+            })
+            .collect::<Box<[_]>>()
+            .join(" ")
+            .into();
+
+        let result = {
+            let mut tmp = String::new();
+            write_component_type(&self.result, &mut tmp, name_counter, &mut types);
+            format!("(result {tmp})")
+        }
+        .into();
+
+        let import_and_export = make_import_and_export(&self.params, &self.result);
+
+        Declarations {
+            types: types.into(),
+            params,
+            result,
+            import_and_export,
+        }
+    }
 }
 
 impl<'a> Arbitrary<'a> for TestCase {
@@ -731,64 +866,14 @@ impl<'a> Arbitrary<'a> for TestCase {
     fn arbitrary(input: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         crate::init_fuzzing();
 
-        let params = input
-            .arbitrary_iter()?
-            .take(MAX_ARITY)
-            .collect::<arbitrary::Result<Box<[_]>>>()?;
-        let result = input.arbitrary()?;
-        let import_and_export = make_import_and_export(&params, &result);
-
         Ok(Self {
-            params,
-            result,
-            import_and_export,
+            params: input
+                .arbitrary_iter()?
+                .take(MAX_ARITY)
+                .collect::<arbitrary::Result<Box<[_]>>>()?,
+            result: input.arbitrary()?,
         })
     }
-}
-
-/// Generate a complete WAT file based on the specified fragments.
-///
-/// `params` should contain the "lifted" component model parameters, if any, while the `result` should contain the
-/// "lifted" result, if any.
-///
-/// `import_and_export` should be a [`TestCase::import_and_export`].
-pub fn make_component(params: &str, result: &str, import_and_export: &str) -> Box<str> {
-    format!(
-        r#"
-        (component
-            (core module $libc
-                (memory (export "memory") 1)
-                {REALLOC_AND_FREE}
-            )
-
-            (core instance $libc (instantiate $libc))
-
-            (import "{IMPORT_FUNCTION}" (func $f {params} {result}))
-
-            (core func $f_lower (canon lower (func $f) (memory $libc "memory") (realloc (func $libc "realloc"))))
-
-            (core module $m
-                (memory (import "libc" "memory") 1)
-                (func $realloc (import "libc" "realloc") (param i32 i32 i32 i32) (result i32))
-
-                {import_and_export}
-            )
-
-            (core instance $i (instantiate $m
-                (with "libc" (instance $libc))
-                (with "host" (instance (export "{IMPORT_FUNCTION}" (func $f_lower))))
-            ))
-
-            (func (export "echo") {params} {result}
-                (canon lift
-                    (core func $i "echo")
-                    (memory $libc "memory")
-                    (realloc (func $libc "realloc"))
-                )
-            )
-        )"#,
-    )
-    .into()
 }
 
 macro_rules! define_static_api_test {
@@ -798,9 +883,7 @@ macro_rules! define_static_api_test {
         /// values, asserting that they flow from host-to-guest and guest-to-host unchanged.
         pub fn $name<'a, $($param,)* R>(
             input: &mut Unstructured<'a>,
-            params: &str,
-            result: &str,
-            import_and_export: &str
+            declarations: &Declarations,
         ) -> arbitrary::Result<()>
         where
             $($param: Lift + Lower + Clone + PartialEq + Debug + Arbitrary<'a> + 'static,)*
@@ -811,7 +894,7 @@ macro_rules! define_static_api_test {
             let engine = Engine::new(&config).unwrap();
             let component = Component::new(
                 &engine,
-                make_component(params, result, import_and_export).as_bytes()
+                declarations.make_component().as_bytes()
             ).unwrap();
             let mut linker = Linker::new(&engine);
             linker
