@@ -46,11 +46,6 @@ mod component {
             StdRng::from_entropy().gen()
         };
 
-        eprintln!(
-            "Using seed {seed} to generate static component API fuzz tests.\n\
-         Set WASMTIME_FUZZ_SEED env variable to override."
-        );
-
         let mut rng = StdRng::seed_from_u64(seed);
 
         const TEST_CASE_COUNT: usize = 100;
@@ -92,8 +87,8 @@ mod component {
             let result = component_types::rust_type(&result, name_counter, &mut declarations);
 
             let test = quote!(#index => component_types::#test::<#params #result>(
-            &mut input, #component_params, #component_result, #import_and_export
-        ),);
+                &mut input, #component_params, #component_result, #import_and_export
+            ),);
 
             tests.extend(test);
         }
@@ -104,11 +99,20 @@ mod component {
                 use anyhow::Result;
                 use arbitrary::{Unstructured, Arbitrary};
                 use component_test_util::{self, Float32, Float64};
-                use std::sync::Arc;
+                use std::sync::{Arc, Once};
                 use wasmtime::component::{ComponentType, Lift, Lower};
                 use wasmtime_fuzzing::generators::component_types;
 
-                const _SEED: u64 = #seed;
+                const SEED: u64 = #seed;
+
+                static ONCE: Once = Once::new();
+
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "Seed {SEED} was used to generate static component API fuzz tests.\n\
+                         Set WASMTIME_FUZZ_SEED env variable at build time to reproduce."
+                    );
+                });
 
                 #declarations
 

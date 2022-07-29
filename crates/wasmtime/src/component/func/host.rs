@@ -74,6 +74,8 @@ impl HostFunc {
                 let my_types = my_types.clone();
 
                 move |ty, types| {
+                    // Note that we don't actually do any type checking here -- just save the types for later
+                    // reference in `call_host_dynamic`.
                     let ty = &types[ty];
                     *my_types.lock().unwrap() = Some(Types {
                         params: ty
