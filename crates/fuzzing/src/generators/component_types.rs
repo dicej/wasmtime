@@ -798,7 +798,8 @@ macro_rules! define_static_api_test {
         /// values, asserting that they flow from host-to-guest and guest-to-host unchanged.
         pub fn $name<'a, $($param,)* R>(
             input: &mut Unstructured<'a>,
-            params: &str, result: &str,
+            params: &str,
+            result: &str,
             import_and_export: &str
         ) -> arbitrary::Result<()>
         where
