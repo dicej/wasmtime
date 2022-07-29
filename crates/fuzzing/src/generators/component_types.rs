@@ -6,7 +6,7 @@
 //! parameters to the imported one and forwards the result back to the caller.  This serves to excercise Wasmtime's
 //! lifting and lowering code and verify the values remain intact during both processes.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use arbitrary::{Arbitrary, Unstructured};
 use component_test_util::REALLOC_AND_FREE;
 use proc_macro2::{Ident, TokenStream};
@@ -14,7 +14,7 @@ use quote::{format_ident, quote};
 use std::fmt::{self, Debug, Write};
 use std::iter;
 use std::ops::{ControlFlow, Deref};
-use wasmtime::component::{self, Component, Lift, Linker, Lower};
+use wasmtime::component::{self, Component, Lift, Linker, Lower, Val};
 use wasmtime::{Config, Engine, Store, StoreContextMut};
 use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 
@@ -370,249 +370,108 @@ fn variant_size_and_alignment<'a>(
     }
 }
 
-/// Represents an instance of a component interface type
-#[allow(missing_docs)]
-#[derive(Debug)]
-pub enum Value {
-    Bool(bool),
-    S8(i8),
-    U8(u8),
-    S16(i16),
-    U16(u16),
-    S32(i32),
-    U32(u32),
-    S64(i64),
-    U64(u64),
-    Float32(f32),
-    Float64(f64),
-    Char(char),
-    String(Box<str>),
-    List(Box<[Value]>),
-    Record(Box<[Value]>),
-    Variant {
-        discriminant: usize,
-        value: Box<Value>,
-    },
-    Flags {
-        count: usize,
-        value: Box<[u32]>,
-    },
-}
+/// Generate an arbitrary instance of the specified type.
+pub fn arbitrary_val(ty: &component::Type, input: &mut Unstructured) -> arbitrary::Result<Val> {
+    use component::Type;
 
-impl Value {
-    /// Generate an arbitrary instance of the specified type.
-    pub fn arbitrary(ty: &Type, input: &mut Unstructured) -> arbitrary::Result<Self> {
-        Ok(match &ty {
-            Type::Unit => Value::Record(Box::new([])),
-            Type::Bool => Value::Bool(input.arbitrary()?),
-            Type::S8 => Value::S8(input.arbitrary()?),
-            Type::U8 => Value::U8(input.arbitrary()?),
-            Type::S16 => Value::S16(input.arbitrary()?),
-            Type::U16 => Value::U16(input.arbitrary()?),
-            Type::S32 => Value::S32(input.arbitrary()?),
-            Type::U32 => Value::U32(input.arbitrary()?),
-            Type::S64 => Value::S64(input.arbitrary()?),
-            Type::U64 => Value::U64(input.arbitrary()?),
-            Type::Float32 => Value::Float32(input.arbitrary()?),
-            Type::Float64 => Value::Float64(input.arbitrary()?),
-            Type::Char => Value::Char(input.arbitrary()?),
-            Type::String => Value::String(input.arbitrary()?),
-            Type::List(ty) => {
-                let mut values = Vec::new();
-                input.arbitrary_loop(Some(MIN_LIST_LENGTH), Some(MAX_LIST_LENGTH), |input| {
-                    values.push(Value::arbitrary(ty, input)?);
+    Ok(match ty {
+        Type::Unit => Val::Unit,
+        Type::Bool => Val::Bool(input.arbitrary()?),
+        Type::S8 => Val::S8(input.arbitrary()?),
+        Type::U8 => Val::U8(input.arbitrary()?),
+        Type::S16 => Val::S16(input.arbitrary()?),
+        Type::U16 => Val::U16(input.arbitrary()?),
+        Type::S32 => Val::S32(input.arbitrary()?),
+        Type::U32 => Val::U32(input.arbitrary()?),
+        Type::S64 => Val::S64(input.arbitrary()?),
+        Type::U64 => Val::U64(input.arbitrary()?),
+        Type::Float32 => Val::Float32(input.arbitrary::<f32>()?.to_bits()),
+        Type::Float64 => Val::Float64(input.arbitrary::<f64>()?.to_bits()),
+        Type::Char => Val::Char(input.arbitrary()?),
+        Type::String => Val::String(input.arbitrary()?),
+        Type::List(list) => {
+            let mut values = Vec::new();
+            input.arbitrary_loop(Some(MIN_LIST_LENGTH), Some(MAX_LIST_LENGTH), |input| {
+                values.push(arbitrary_val(&list.ty(), input)?);
 
-                    Ok(ControlFlow::Continue(()))
-                })?;
-                Value::List(values.into())
-            }
-            Type::Record(types) => Value::Record(
-                types
-                    .0
-                    .iter()
-                    .map(|ty| Value::arbitrary(ty, input))
-                    .collect::<arbitrary::Result<_>>()?,
-            ),
-            Type::Tuple(types) => Value::Record(
-                types
-                    .0
-                    .iter()
-                    .map(|ty| Value::arbitrary(ty, input))
-                    .collect::<arbitrary::Result<_>>()?,
-            ),
-            Type::Variant(types) => {
-                let discriminant = input.int_in_range(0..=types.0.len() - 1)?;
-                Value::Variant {
-                    discriminant,
-                    value: Box::new(Value::arbitrary(&types.0[discriminant], input)?),
-                }
-            }
-            Type::Enum(units) => {
-                let discriminant = input.int_in_range(0..=units.0.len() - 1)?;
-                Value::Variant {
-                    discriminant,
-                    value: Box::new(Value::Record(Box::new([]))),
-                }
-            }
-            Type::Union(types) => {
-                let discriminant = input.int_in_range(0..=types.0.len() - 1)?;
-                Value::Variant {
-                    discriminant,
-                    value: Box::new(Value::arbitrary(&types.0[discriminant], input)?),
-                }
-            }
-            Type::Option(ty) => {
-                let discriminant = input.int_in_range(0..=1)?;
-                Value::Variant {
-                    discriminant,
-                    value: if discriminant == 0 {
-                        Box::new(Value::Record(Box::new([])))
-                    } else {
-                        Box::new(Value::arbitrary(ty, input)?)
-                    },
-                }
-            }
-            Type::Expected { ok, err } => {
-                let discriminant = input.int_in_range(0..=1)?;
-                Value::Variant {
-                    discriminant,
-                    value: if discriminant == 0 {
-                        Box::new(Value::arbitrary(ok, input)?)
-                    } else {
-                        Box::new(Value::arbitrary(err, input)?)
-                    },
-                }
-            }
-            Type::Flags(units) => Value::Flags {
-                count: units.0.len(),
-                value: iter::repeat_with(|| input.arbitrary())
-                    .take(u32_count_from_flag_count(units.0.len()))
-                    .collect::<arbitrary::Result<_>>()?,
-            },
-        })
-    }
+                Ok(ControlFlow::Continue(()))
+            })?;
 
-    /// Attempt to convert this value to a [`component::Val`] of the specified type.
-    pub fn to_val(&self, ty: &component::Type) -> anyhow::Result<component::Val> {
-        Ok(match (self, ty) {
-            (Value::Record(values), component::Type::Unit) if values.is_empty() => {
-                component::Val::Unit
-            }
-            (Value::Bool(value), component::Type::Bool) => component::Val::Bool(*value),
-            (Value::S8(value), component::Type::S8) => component::Val::S8(*value),
-            (Value::U8(value), component::Type::U8) => component::Val::U8(*value),
-            (Value::S16(value), component::Type::S16) => component::Val::S16(*value),
-            (Value::U16(value), component::Type::U16) => component::Val::U16(*value),
-            (Value::S32(value), component::Type::S32) => component::Val::S32(*value),
-            (Value::U32(value), component::Type::U32) => component::Val::U32(*value),
-            (Value::S64(value), component::Type::S64) => component::Val::S64(*value),
-            (Value::U64(value), component::Type::U64) => component::Val::U64(*value),
-            (Value::Float32(value), component::Type::Float32) => {
-                component::Val::Float32(value.to_bits())
-            }
-            (Value::Float64(value), component::Type::Float64) => {
-                component::Val::Float64(value.to_bits())
-            }
-            (Value::Char(value), component::Type::Char) => component::Val::Char(*value),
-            (Value::String(value), component::Type::String) => {
-                component::Val::String(value.clone())
-            }
-            (Value::List(values), component::Type::List(list)) => list.new_val(
-                values
-                    .iter()
-                    .map(|v| v.to_val(&list.ty()))
-                    .collect::<Result<_>>()?,
-            )?,
-            (Value::Record(values), component::Type::Record(record)) => record.new_val(
-                values
-                    .iter()
-                    .zip(record.fields())
-                    .map(|(v, field)| Ok((field.name, v.to_val(&field.ty)?)))
-                    .collect::<Result<Vec<_>>>()?,
-            )?,
-            (Value::Record(values), component::Type::Tuple(tuple)) => tuple.new_val(
-                values
-                    .iter()
-                    .zip(tuple.types())
-                    .map(|(v, ty)| v.to_val(&ty))
-                    .collect::<Result<_>>()?,
-            )?,
-            (
-                Value::Variant {
-                    discriminant,
-                    value,
-                },
-                component::Type::Variant(variant),
-            ) => variant.new_val(
-                &format!("C{discriminant}"),
-                value.to_val(
-                    &variant
-                        .cases()
-                        .nth(*discriminant)
-                        .ok_or_else(|| anyhow!("discriminant out of range"))?
-                        .ty,
-                )?,
-            )?,
-            (
-                Value::Variant {
-                    discriminant,
-                    value,
-                },
-                component::Type::Enum(en),
-            ) if value.to_val(&component::Type::Unit).is_ok() => {
-                en.new_val(&format!("C{discriminant}"))?
-            }
-            (
-                Value::Variant {
-                    discriminant,
-                    value,
-                },
-                component::Type::Union(un),
-            ) => un.new_val(
-                u32::try_from(*discriminant)?,
-                value.to_val(
-                    &un.types()
-                        .nth(*discriminant)
-                        .ok_or_else(|| anyhow!("discriminant out of range"))?,
-                )?,
-            )?,
-            (
-                Value::Variant {
-                    discriminant,
-                    value,
-                },
-                component::Type::Option(option),
-            ) => option.new_val(match discriminant {
-                0 => None,
-                1 => Some(value.to_val(&option.ty())?),
-                _ => bail!("discriminant out of range"),
-            })?,
-            (
-                Value::Variant {
-                    discriminant,
-                    value,
-                },
-                component::Type::Expected(expected),
-            ) => expected.new_val(match discriminant {
-                0 => Ok(value.to_val(&expected.ok())?),
-                1 => Err(value.to_val(&expected.err())?),
-                _ => bail!("discriminant out of range"),
-            })?,
-            (Value::Flags { count, value }, component::Type::Flags(flags)) => flags.new_val(
-                &(0..*count)
-                    .zip(flags.names())
-                    .filter_map(|(index, name)| {
-                        if value[index / 32] & (1 << (index % 32)) != 0 {
-                            Some(name)
-                        } else {
-                            None
-                        }
+            list.new_val(values.into()).unwrap()
+        }
+        Type::Record(record) => record
+            .new_val(
+                record
+                    .fields()
+                    .map(|field| Ok((field.name, arbitrary_val(&field.ty, input)?)))
+                    .collect::<arbitrary::Result<Vec<_>>>()?,
+            )
+            .unwrap(),
+        Type::Tuple(tuple) => tuple
+            .new_val(
+                tuple
+                    .types()
+                    .map(|ty| arbitrary_val(&ty, input))
+                    .collect::<arbitrary::Result<_>>()?,
+            )
+            .unwrap(),
+        Type::Variant(variant) => {
+            let mut cases = variant.cases();
+            let discriminant = input.int_in_range(0..=cases.len() - 1)?;
+            variant
+                .new_val(
+                    &format!("C{discriminant}"),
+                    arbitrary_val(&cases.nth(discriminant).unwrap().ty, input)?,
+                )
+                .unwrap()
+        }
+        Type::Enum(en) => {
+            let discriminant = input.int_in_range(0..=en.names().len() - 1)?;
+            en.new_val(&format!("C{discriminant}")).unwrap()
+        }
+        Type::Union(un) => {
+            let mut types = un.types();
+            let discriminant = input.int_in_range(0..=types.len() - 1)?;
+            un.new_val(
+                discriminant.try_into().unwrap(),
+                arbitrary_val(&types.nth(discriminant).unwrap(), input)?,
+            )
+            .unwrap()
+        }
+        Type::Option(option) => {
+            let discriminant = input.int_in_range(0..=1)?;
+            option
+                .new_val(match discriminant {
+                    0 => None,
+                    1 => Some(arbitrary_val(&option.ty(), input)?),
+                    _ => unreachable!(),
+                })
+                .unwrap()
+        }
+        Type::Expected(expected) => {
+            let discriminant = input.int_in_range(0..=1)?;
+            expected
+                .new_val(match discriminant {
+                    0 => Ok(arbitrary_val(&expected.ok(), input)?),
+                    1 => Err(arbitrary_val(&expected.err(), input)?),
+                    _ => unreachable!(),
+                })
+                .unwrap()
+        }
+        Type::Flags(flags) => flags
+            .new_val(
+                &flags
+                    .names()
+                    .filter_map(|name| {
+                        input
+                            .arbitrary()
+                            .map(|p| if p { Some(name) } else { None })
+                            .transpose()
                     })
-                    .collect::<Box<_>>(),
-            )?,
-            _ => bail!("type mismatch: {self:?} vs. {ty:?}"),
-        })
-    }
+                    .collect::<arbitrary::Result<Box<[_]>>>()?,
+            )
+            .unwrap(),
+    })
 }
 
 fn make_import_and_export(params: &[Type], result: &Type) -> Box<str> {

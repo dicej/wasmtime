@@ -1060,9 +1060,7 @@ fn set_fuel<T>(store: &mut Store<T>, fuel: u64) {
 /// creation of arbitrary types and values.
 #[cfg(feature = "component-model")]
 pub fn dynamic_component_api_case(bytes: &[u8]) -> arbitrary::Result<()> {
-    use crate::generators::component_types::{
-        self, TestCase, Value, EXPORT_FUNCTION, IMPORT_FUNCTION,
-    };
+    use crate::generators::component_types::{self, TestCase, EXPORT_FUNCTION, IMPORT_FUNCTION};
     use anyhow::Result;
     use arbitrary::Unstructured;
     use component_test_util::FuncExt;
@@ -1107,22 +1105,15 @@ pub fn dynamic_component_api_case(bytes: &[u8]) -> arbitrary::Result<()> {
     let instance = linker.instantiate(&mut store, &component).unwrap();
     let func = instance.get_func(&mut store, EXPORT_FUNCTION).unwrap();
     let params = func.params(&store);
+    let result = func.result(&store);
 
     while input.arbitrary()? {
-        let args = case
-            .params
+        let args = params
             .iter()
-            .zip(params.iter())
-            .map(|(ty, component_type)| {
-                Ok(Value::arbitrary(ty, &mut input)?
-                    .to_val(component_type)
-                    .unwrap())
-            })
+            .map(|ty| component_types::arbitrary_val(ty, &mut input))
             .collect::<arbitrary::Result<Box<[_]>>>()?;
 
-        let result = Value::arbitrary(&case.result, &mut input)?
-            .to_val(&func.result(&store))
-            .unwrap();
+        let result = component_types::arbitrary_val(&result, &mut input)?;
 
         *store.data_mut() = (args.clone(), Some(result.clone()));
 
