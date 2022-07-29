@@ -11,6 +11,8 @@ use arbitrary::{Arbitrary, Unstructured};
 use component_test_util::REALLOC_AND_FREE;
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
+use std::cell::Cell;
+use std::cmp::Ordering;
 use std::fmt::{self, Debug, Write};
 use std::iter;
 use std::ops::{ControlFlow, Deref};
@@ -102,7 +104,7 @@ impl<'a, T: Arbitrary<'a>> Arbitrary<'a> for TupleArray<T> {
 
 /// Represents a component model interface type
 #[allow(missing_docs)]
-#[derive(Arbitrary, Debug)]
+#[derive(Debug)]
 pub enum Type {
     Unit,
     Bool,
@@ -127,6 +129,72 @@ pub enum Type {
     Option(Box<Type>),
     Expected { ok: Box<Type>, err: Box<Type> },
     Flags(NonEmptyArray<()>),
+}
+
+impl<'a> Arbitrary<'a> for Type {
+    fn arbitrary(input: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        /// This must be substantially less than `wast`s `MAX_PARENS_DEPTH` (which is 100 as of this writing) to
+        /// allow for the surrounding context of the WAT file:
+        const MAX_STACK_DEPTH: u32 = 90;
+
+        thread_local! {
+            static STACK_DEPTH: Cell<u32> = Cell::new(0);
+        }
+
+        struct Probe;
+
+        impl Probe {
+            fn new() -> Self {
+                STACK_DEPTH.with(|v| v.set(v.get().checked_add(1).unwrap()));
+
+                Self
+            }
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                STACK_DEPTH.with(|v| v.set(v.get().checked_sub(1).unwrap()));
+            }
+        }
+
+        let _probe = Probe::new();
+
+        let limit = match STACK_DEPTH.with(|v| v.get().cmp(&MAX_STACK_DEPTH)) {
+            Ordering::Equal => 15,
+            Ordering::Less => 22,
+            Ordering::Greater => unreachable!(),
+        };
+
+        Ok(match input.int_in_range(0..=limit)? {
+            0 => Type::Unit,
+            1 => Type::Bool,
+            2 => Type::S8,
+            3 => Type::U8,
+            4 => Type::S16,
+            5 => Type::U16,
+            6 => Type::S32,
+            7 => Type::U32,
+            8 => Type::S64,
+            9 => Type::U64,
+            10 => Type::Float32,
+            11 => Type::Float64,
+            12 => Type::Char,
+            13 => Type::String,
+            14 => Type::Enum(input.arbitrary()?),
+            15 => Type::Flags(input.arbitrary()?),
+            16 => Type::List(input.arbitrary()?),
+            17 => Type::Record(input.arbitrary()?),
+            18 => Type::Tuple(input.arbitrary()?),
+            19 => Type::Variant(input.arbitrary()?),
+            20 => Type::Union(input.arbitrary()?),
+            21 => Type::Option(input.arbitrary()?),
+            22 => Type::Expected {
+                ok: input.arbitrary()?,
+                err: input.arbitrary()?,
+            },
+            _ => unreachable!(),
+        })
+    }
 }
 
 impl fmt::Display for Type {
