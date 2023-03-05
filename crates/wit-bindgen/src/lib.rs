@@ -111,6 +111,13 @@ impl Wasmtime {
                 Import::Function { sig, add_to_linker }
             }
             WorldItem::Interface(id) => {
+                let iface = &resolve.interfaces[*id];
+                if iface.functions.len() == 1 && "*" == iface.functions.keys().next().unwrap() {
+                    // Skip wildcard interfaces and let the application call `func_wrap` directly since we can't
+                    // know the names of the imported functions at code generation time.
+                    return;
+                }
+
                 gen.current_interface = Some(*id);
                 gen.types(*id);
                 gen.generate_trappable_error_types(TypeOwner::Interface(*id));
@@ -157,10 +164,16 @@ impl Wasmtime {
             }
             WorldItem::Type(_) => unreachable!(),
             WorldItem::Interface(id) => {
+                let iface = &resolve.interfaces[*id];
+                if iface.functions.len() == 1 && "*" == iface.functions.keys().next().unwrap() {
+                    // Skip wildcard interfaces and let the application call `typed_func` directly since we can't
+                    // know the names of the exported functions at code generation time.
+                    return;
+                }
+
                 gen.current_interface = Some(*id);
                 gen.types(*id);
                 gen.generate_trappable_error_types(TypeOwner::Interface(*id));
-                let iface = &resolve.interfaces[*id];
 
                 let camel = to_rust_upper_camel_case(name);
                 uwriteln!(gen.src, "pub struct {camel} {{");

@@ -527,4 +527,21 @@ impl Component {
     pub fn serialize(&self) -> Result<Vec<u8>> {
         Ok(self.code_object().code_memory().mmap().to_vec())
     }
+
+    /// Get the names of all the imports from the specified instance.
+    pub fn names<'a>(&'a self, instance_name: &'a str) -> impl Iterator<Item = &str> + 'a {
+        let env_component = self.env_component();
+
+        env_component
+            .imports
+            .values()
+            .filter_map(move |(import, names)| {
+                if instance_name == &env_component.import_types[*import].0 {
+                    Some(names.iter().map(String::as_str))
+                } else {
+                    None
+                }
+            })
+            .flatten()
+    }
 }
