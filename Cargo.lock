@@ -4153,7 +4153,7 @@ dependencies = [
 [[package]]
 name = "wit-parser"
 version = "0.6.4"
-source = "git+https://github.com/dicej/wasm-tools?branch=wit-templates#a2b904d9e6203c9e7b19baa0ff890a48c3c5b62d"
+source = "git+https://github.com/dicej/wasm-tools?branch=wit-templates#1c3362cc4bd005019a5c25427483438d8594f622"
 dependencies = [
  "anyhow",
  "id-arena",

@@ -1,5 +1,6 @@
 use super::{async_engine, engine};
 use anyhow::Result;
+use std::collections::HashSet;
 use wasmtime::{
     component::{Component, Linker},
     Store,
@@ -176,6 +177,16 @@ mod wildcards {
 
             let component = Component::new(&engine, COMPONENT)?;
 
+            assert_eq!(
+                ["a", "b", "c"].into_iter().collect::<HashSet<_>>(),
+                component.function_import_names("imports").collect()
+            );
+
+            assert_eq!(
+                ["x", "y", "z"].into_iter().collect::<HashSet<_>>(),
+                component.function_export_names("exports").collect()
+            );
+
             #[derive(Default)]
             struct Host;
 
@@ -184,7 +195,7 @@ mod wildcards {
             struct Match(u32);
 
             impl imports::WildcardMatch<Host> for Match {
-                fn call(&self, _host: &mut Host) -> Result<u32> {
+                fn call(&self, _host: &mut Host, _name: &str) -> Result<u32> {
                     Ok(self.0)
                 }
             }
@@ -246,7 +257,7 @@ mod wildcards {
 
             #[async_trait::async_trait]
             impl imports::WildcardMatch<Host> for Match {
-                async fn call(&self, _host: &mut Host) -> Result<u32> {
+                async fn call(&self, _host: &mut Host, _name: &str) -> Result<u32> {
                     Ok(self.0)
                 }
             }
