@@ -1,4 +1,4 @@
-use super::engine;
+use super::{async_engine, engine};
 use anyhow::Result;
 use wasmtime::{
     component::{Component, Linker},
@@ -116,118 +116,164 @@ mod one_import {
 
 mod wildcards {
     use super::*;
-    use component_test_util::TypedFuncExt;
 
-    // We won't actually use any code this produces, but it's here to assert that the macro doesn't get confused by
-    // wildcards:
-    wasmtime::component::bindgen!({
-        inline: "
-            default world wildcards {
-                import imports: interface {
-                    *: func() -> u32
+    const COMPONENT: &str = r#"
+        (component
+            (import "imports" (instance $i
+                (export "a" (func (result u32)))
+                (export "b" (func (result u32)))
+                (export "c" (func (result u32)))
+            ))
+            (core module $m
+                (import "" "a" (func (result i32)))
+                (import "" "b" (func (result i32)))
+                (import "" "c" (func (result i32)))
+                (export "x" (func 0))
+                (export "y" (func 1))
+                (export "z" (func 2))
+            )
+            (core func $a (canon lower (func $i "a")))
+            (core func $b (canon lower (func $i "b")))
+            (core func $c (canon lower (func $i "c")))
+            (core instance $j (instantiate $m
+                (with "" (instance
+                    (export "a" (func $a))
+                    (export "b" (func $b))
+                    (export "c" (func $c))
+                ))
+            ))
+            (func $x (result u32) (canon lift (core func $j "x")))
+            (func $y (result u32) (canon lift (core func $j "y")))
+            (func $z (export "z") (result u32) (canon lift (core func $j "z")))
+            (instance $k
+               (export "x" (func $x))
+               (export "y" (func $y))
+               (export "z" (func $z))
+            )
+            (export "exports" (instance $k))
+        )
+    "#;
+
+    mod sync {
+        use super::*;
+
+        wasmtime::component::bindgen!({
+            inline: "
+                default world wildcards {
+                    import imports: interface {
+                        *: func() -> u32
+                    }
+                    export exports: interface {
+                        *: func() -> u32
+                    }
                 }
-                export exports: interface {
-                    *: func() -> u32
+            "
+        });
+
+        #[test]
+        fn run() -> Result<()> {
+            let engine = engine();
+
+            let component = Component::new(&engine, COMPONENT)?;
+
+            #[derive(Default)]
+            struct Host;
+
+            impl imports::Host for Host {}
+
+            struct Match(u32);
+
+            impl imports::WildcardMatch<Host> for Match {
+                fn call(&self, _host: &mut Host) -> Result<u32> {
+                    Ok(self.0)
                 }
             }
-        "
-    });
 
-    fn lambda(
-        v: u32,
-    ) -> Box<dyn Fn(wasmtime::StoreContextMut<'_, ()>, ()) -> Result<(u32,)> + Send + Sync> {
-        Box::new(move |_, _| Ok((v,)))
+            let mut linker = Linker::new(&engine);
+            Wildcards::add_to_linker(
+                &mut linker,
+                WildcardMatches {
+                    imports: vec![("a", Match(42)), ("b", Match(43)), ("c", Match(44))],
+                },
+                |f: &mut Host| f,
+            )?;
+            let mut store = Store::new(&engine, Host::default());
+            let (wildcards, _) = Wildcards::instantiate(&mut store, &component, &linker)?;
+            for (name, value) in [("x", 42), ("y", 43), ("z", 44)] {
+                assert_eq!(
+                    value,
+                    wildcards
+                        .exports
+                        .get_wildcard_match(name)
+                        .unwrap()
+                        .call(&mut store)?
+                );
+            }
+            Ok(())
+        }
     }
 
-    #[test]
-    fn run() -> Result<()> {
-        let engine = engine();
+    mod async_ {
+        use super::*;
 
-        let component = Component::new(
-            &engine,
-            r#"
-                (component
-                    (import "imports" (instance $i
-                        (export "a" (func (result u32)))
-                        (export "b" (func (result u32)))
-                        (export "c" (func (result u32)))
-                    ))
-                    (core module $m
-                        (import "" "a" (func (result i32)))
-                        (import "" "b" (func (result i32)))
-                        (import "" "c" (func (result i32)))
-                        (export "x" (func 0))
-                        (export "y" (func 1))
-                        (export "z" (func 2))
-                    )
-                    (core func $a (canon lower (func $i "a")))
-                    (core func $b (canon lower (func $i "b")))
-                    (core func $c (canon lower (func $i "c")))
-                    (core instance $j (instantiate $m
-                        (with "" (instance
-                            (export "a" (func $a))
-                            (export "b" (func $b))
-                            (export "c" (func $c))
-                        ))
-                    ))
-                    (func $x (result u32) (canon lift (core func $j "x")))
-                    (func $y (result u32) (canon lift (core func $j "y")))
-                    (func $z (export "z") (result u32) (canon lift (core func $j "z")))
-                    (instance $k
-                       (export "x" (func $x))
-                       (export "y" (func $y))
-                       (export "z" (func $z))
-                    )
-                    (export "exports" (instance $k))
-                )
-            "#,
-        )?;
+        wasmtime::component::bindgen!({
+            inline: "
+                default world wildcards {
+                    import imports: interface {
+                        *: func() -> u32
+                    }
+                    export exports: interface {
+                        *: func() -> u32
+                    }
+                }
+            ",
+            async: true
+        });
 
-        let mut linker = Linker::<()>::new(&engine);
-        let mut instance = linker.instance("imports")?;
-        // In this simple test case, we don't really need to use `Component::names` to discover the imported
-        // function names, but in the general case, we would, so we verify they're all present.
-        for name in component.names("imports") {
-            instance.func_wrap(
-                name,
-                match name {
-                    "a" => lambda(42),
-                    "b" => lambda(43),
-                    "c" => lambda(44),
-                    _ => unreachable!(),
-                },
-            )?;
-        }
+        #[tokio::test]
+        async fn run() -> Result<()> {
+            let engine = async_engine();
 
-        let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &component)?;
-        let (mut x, mut y, mut z) = (None, None, None);
+            let component = Component::new(&engine, COMPONENT)?;
 
-        {
-            let mut exports = instance.exports(&mut store);
-            let mut exports = exports.instance("exports").unwrap();
-            // In this simple test case, we don't really need to use `ExportInstance::funcs` to discover the
-            // exported function names, but in the general case, we would, so we verify they're all present.
-            for (name, func) in exports.funcs() {
-                match name {
-                    "x" => x = Some(func),
-                    "y" => y = Some(func),
-                    "z" => z = Some(func),
-                    _ => unreachable!(),
+            #[derive(Default)]
+            struct Host;
+
+            impl imports::Host for Host {}
+
+            #[derive(Clone)]
+            struct Match(u32);
+
+            #[async_trait::async_trait]
+            impl imports::WildcardMatch<Host> for Match {
+                async fn call(&self, _host: &mut Host) -> Result<u32> {
+                    Ok(self.0)
                 }
             }
-        };
 
-        let (x, y, z) = (
-            x.unwrap().typed::<(), (u32,)>(&store)?,
-            y.unwrap().typed::<(), (u32,)>(&store)?,
-            z.unwrap().typed::<(), (u32,)>(&store)?,
-        );
-
-        assert_eq!(42, x.call_and_post_return(&mut store, ())?.0);
-        assert_eq!(43, y.call_and_post_return(&mut store, ())?.0);
-        assert_eq!(44, z.call_and_post_return(&mut store, ())?.0);
-
-        Ok(())
+            let mut linker = Linker::new(&engine);
+            Wildcards::add_to_linker(
+                &mut linker,
+                WildcardMatches {
+                    imports: vec![("a", Match(42)), ("b", Match(43)), ("c", Match(44))],
+                },
+                |f: &mut Host| f,
+            )?;
+            let mut store = Store::new(&engine, Host::default());
+            let (wildcards, _) =
+                Wildcards::instantiate_async(&mut store, &component, &linker).await?;
+            for (name, value) in [("x", 42), ("y", 43), ("z", 44)] {
+                assert_eq!(
+                    value,
+                    wildcards
+                        .exports
+                        .get_wildcard_match(name)
+                        .unwrap()
+                        .call(&mut store)
+                        .await?
+                );
+            }
+            Ok(())
+        }
     }
 }

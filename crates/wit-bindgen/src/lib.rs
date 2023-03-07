@@ -104,20 +104,13 @@ impl Wasmtime {
         let mut gen = InterfaceGenerator::new(self, resolve);
         let import = match item {
             WorldItem::Function(func) => {
-                gen.generate_function_trait_sig(TypeOwner::None, &func);
+                gen.generate_function_trait_sig(TypeOwner::None, &func, &func.name);
                 let sig = mem::take(&mut gen.src).into();
-                gen.generate_add_function_to_linker(TypeOwner::None, &func, "linker");
+                gen.generate_add_function_to_linker(TypeOwner::None, &func, "linker", None);
                 let add_to_linker = gen.src.into();
                 Import::Function { sig, add_to_linker }
             }
             WorldItem::Interface(id) => {
-                let iface = &resolve.interfaces[*id];
-                if iface.functions.len() == 1 && "*" == iface.functions.keys().next().unwrap() {
-                    // Skip wildcard interfaces and let the application call `func_wrap` directly since we can't
-                    // know the names of the imported functions at code generation time.
-                    return;
-                }
-
                 gen.current_interface = Some(*id);
                 gen.types(*id);
                 gen.generate_trappable_error_types(TypeOwner::Interface(*id));
@@ -164,29 +157,62 @@ impl Wasmtime {
             }
             WorldItem::Type(_) => unreachable!(),
             WorldItem::Interface(id) => {
-                let iface = &resolve.interfaces[*id];
-                if iface.functions.len() == 1 && "*" == iface.functions.keys().next().unwrap() {
-                    // Skip wildcard interfaces and let the application call `typed_func` directly since we can't
-                    // know the names of the exported functions at code generation time.
-                    return;
-                }
-
                 gen.current_interface = Some(*id);
                 gen.types(*id);
                 gen.generate_trappable_error_types(TypeOwner::Interface(*id));
+                let iface = &resolve.interfaces[*id];
+
+                let wildcard = iface.functions.values().find(|func| "*" == &func.name);
+
+                if let Some(wildcard) = wildcard {
+                    uwriteln!(gen.src, "pub struct WildcardMatch {{");
+                    uwriteln!(gen.src, "name: String,");
+                    uwriteln!(gen.src, "func: wasmtime::component::TypedFunc<(");
+                    for (_, ty) in wildcard.params.iter() {
+                        gen.print_ty(ty, TypeMode::AllBorrowed("'_"));
+                        gen.push_str(", ");
+                    }
+                    uwriteln!(gen.src, "), (");
+                    for ty in wildcard.results.iter_types() {
+                        gen.print_ty(ty, TypeMode::Owned);
+                        gen.push_str(", ");
+                    }
+                    uwriteln!(gen.src, ")>,");
+                    uwriteln!(gen.src, "}}");
+                    uwriteln!(gen.src, "impl WildcardMatch {{");
+                    gen.define_rust_guest_export(Some(name), wildcard);
+                    uwriteln!(gen.src, "}}");
+                }
 
                 let camel = to_rust_upper_camel_case(name);
                 uwriteln!(gen.src, "pub struct {camel} {{");
                 for (_, func) in iface.functions.iter() {
-                    uwriteln!(
-                        gen.src,
-                        "{}: wasmtime::component::Func,",
-                        func.name.to_snake_case()
-                    );
+                    if "*" == &func.name {
+                        uwriteln!(
+                            gen.src,
+                            "__wildcard_matches: std::collections::HashMap<String, WildcardMatch>,"
+                        );
+                    } else {
+                        uwriteln!(
+                            gen.src,
+                            "{}: wasmtime::component::Func,",
+                            func.name.to_snake_case()
+                        );
+                    }
                 }
                 uwriteln!(gen.src, "}}");
 
                 uwriteln!(gen.src, "impl {camel} {{");
+                if wildcard.is_some() {
+                    uwrite!(
+                        gen.src,
+                        "
+                            pub fn get_wildcard_match(&self, name: &str) -> Option<&WildcardMatch> {{
+                                self.__wildcard_matches.get(name)
+                            }}
+                        "
+                    );
+                }
                 uwrite!(
                     gen.src,
                     "
@@ -197,9 +223,62 @@ impl Wasmtime {
                 );
                 let mut fields = Vec::new();
                 for (_, func) in iface.functions.iter() {
-                    let (name, getter) = gen.extract_typed_function(func);
-                    uwriteln!(gen.src, "let {name} = {getter};");
-                    fields.push(name);
+                    if "*" == &func.name {
+                        uwriteln!(
+                            gen.src,
+                            "let mut __wildcard_matches = std::collections::HashMap::new();"
+                        );
+                        uwriteln!(
+                            gen.src,
+                            "let mut funcs = __exports.funcs()\
+                             .map(|(n, _)| n.to_owned()).collect::<std::vec::Vec<_>>();"
+                        );
+                        uwriteln!(gen.src, "for name in funcs {{");
+                        if iface.functions.len() > 1 {
+                            uwriteln!(gen.src, "match &name {{");
+                            uwriteln!(
+                                gen.src,
+                                "{} => (),",
+                                iface
+                                    .functions
+                                    .values()
+                                    .filter_map(|func| if "*" == &func.name {
+                                        None
+                                    } else {
+                                        Some(format!("\"{}\"", func.name))
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("|")
+                            );
+                            uwriteln!(gen.src, "_ => ");
+                        }
+                        uwriteln!(
+                            gen.src,
+                            "__wildcard_matches.insert(name.clone(), WildcardMatch {{ \
+                             name: name.clone(), func: __exports.typed_func::<("
+                        );
+                        for (_, ty) in func.params.iter() {
+                            gen.print_ty(ty, TypeMode::AllBorrowed("'_"));
+                            gen.push_str(", ");
+                        }
+                        uwriteln!(gen.src, "), (");
+                        for ty in func.results.iter_types() {
+                            gen.print_ty(ty, TypeMode::Owned);
+                            gen.push_str(", ");
+                        }
+                        uwriteln!(gen.src, ")>(&name)?}})");
+                        if iface.functions.len() > 1 {
+                            uwriteln!(gen.src, ",}}");
+                        } else {
+                            uwriteln!(gen.src, ";");
+                        }
+                        uwriteln!(gen.src, "}}");
+                        fields.push("__wildcard_matches".to_owned());
+                    } else {
+                        let (name, getter) = gen.extract_typed_function(func);
+                        uwriteln!(gen.src, "let {name} = {getter};");
+                        fields.push(name);
+                    }
                 }
                 uwriteln!(gen.src, "Ok({camel} {{");
                 for name in fields {
@@ -208,7 +287,9 @@ impl Wasmtime {
                 uwriteln!(gen.src, "}})");
                 uwriteln!(gen.src, "}}");
                 for (_, func) in iface.functions.iter() {
-                    gen.define_rust_guest_export(Some(name), func);
+                    if "*" != &func.name {
+                        gen.define_rust_guest_export(Some(name), func);
+                    }
                 }
                 uwriteln!(gen.src, "}}");
 
@@ -250,6 +331,52 @@ impl Wasmtime {
     }
 
     fn finish(&mut self, resolve: &Resolve, world: WorldId) -> String {
+        let mut wildcard_imports = Vec::new();
+        {
+            let world = &resolve.worlds[world];
+            for (name, import) in world.imports.iter() {
+                match import {
+                    WorldItem::Interface(id) => {
+                        let iface = &resolve.interfaces[*id];
+                        if iface.functions.values().any(|func| "*" == &func.name) {
+                            wildcard_imports.push(name);
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
+
+        let wildcard_matches = if wildcard_imports.is_empty() {
+            String::new()
+        } else {
+            let types = (0..wildcard_imports.len())
+                .map(|i| format!("W{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let fields = wildcard_imports
+                .iter()
+                .enumerate()
+                .map(|(i, name)| format!("{name}: Vec<(&'a str, W{i})>, "))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            uwriteln!(
+                self.src,
+                "pub struct WildcardMatches<'a, {types}> {{ {fields} }}"
+            );
+
+            format!("matches: WildcardMatches<'_, {types}>, ")
+        };
+
+        let wildcard_types = wildcard_imports
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!(", W{i}: {name}::WildcardMatch<U> + Send + Sync + 'static"))
+            .collect::<Vec<_>>()
+            .concat();
+
         let camel = to_rust_upper_camel_case(&resolve.worlds[world].name);
         uwriteln!(self.src, "pub struct {camel} {{");
         for (name, (ty, _)) in self.exports.fields.iter() {
@@ -269,7 +396,7 @@ impl Wasmtime {
         uwriteln!(self.src, "use wasmtime::component::__internal::anyhow;");
 
         uwriteln!(self.src, "impl {camel} {{");
-        self.toplevel_add_to_linker(resolve, world);
+        self.toplevel_add_to_linker(resolve, world, &wildcard_matches, &wildcard_types);
         uwriteln!(
             self.src,
             "
@@ -388,7 +515,13 @@ impl Wasmtime {
         uwriteln!(self.src, "}}");
     }
 
-    fn toplevel_add_to_linker(&mut self, resolve: &Resolve, world: WorldId) {
+    fn toplevel_add_to_linker(
+        &mut self,
+        resolve: &Resolve,
+        world: WorldId,
+        wildcard_matches: &str,
+        wildcard_types: &str,
+    ) {
         if self.imports.is_empty() {
             return;
         }
@@ -407,8 +540,9 @@ impl Wasmtime {
         uwrite!(
             self.src,
             "
-                pub fn add_to_linker<T, U>(
+                pub fn add_to_linker<T, U{wildcard_types}>(
                     linker: &mut wasmtime::component::Linker<T>,
+                    {wildcard_matches}
                     get: impl Fn(&mut T) -> &mut U + Send + Sync + Copy + 'static,
                 ) -> wasmtime::Result<()>
                     where U: \
@@ -439,7 +573,15 @@ impl Wasmtime {
         self.src.push_str(maybe_send);
         self.src.push_str(",\n{\n");
         for name in interfaces.iter() {
-            uwriteln!(self.src, "{name}::add_to_linker(linker, get)?;");
+            uwriteln!(
+                self.src,
+                "{name}::add_to_linker(linker,{} get)?;",
+                if wildcard_matches.is_empty() {
+                    String::new()
+                } else {
+                    format!("matches.{name}, ")
+                }
+            );
         }
         if !functions.is_empty() {
             uwriteln!(self.src, "Self::add_root_to_linker(linker, get)?;");
@@ -968,6 +1110,20 @@ impl<'a> InterfaceGenerator<'a> {
         let iface = &self.resolve.interfaces[id];
         let owner = TypeOwner::Interface(id);
 
+        let wildcard = iface.functions.values().find(|func| "*" == &func.name);
+
+        if let Some(wildcard) = wildcard {
+            let bound = if self.gen.opts.async_ {
+                uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]");
+                ": Clone"
+            } else {
+                ""
+            };
+            uwriteln!(self.src, "pub trait WildcardMatch<T>{bound} {{");
+            self.generate_function_trait_sig(owner, wildcard, "call");
+            uwriteln!(self.src, "}}");
+        }
+
         if self.gen.opts.async_ {
             uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]")
         }
@@ -975,20 +1131,34 @@ impl<'a> InterfaceGenerator<'a> {
         // this import.
         uwriteln!(self.src, "pub trait Host: Sized {{");
         for (_, func) in iface.functions.iter() {
-            self.generate_function_trait_sig(owner, func);
+            if "*" != &func.name {
+                self.generate_function_trait_sig(owner, func, &func.name);
+            }
         }
         uwriteln!(self.src, "}}");
 
-        let where_clause = if self.gen.opts.async_ {
-            format!("T: Send, U: Host + Send")
+        let (wildcard_matches_type, wildcard_where_clause, wildcard_matches) = if wildcard.is_some()
+        {
+            (
+                ", V",
+                ", V: WildcardMatch<U> + Send + Sync + 'static",
+                "wildcard_matches: Vec<(&str, V)>,",
+            )
         } else {
-            format!("U: Host")
+            ("", "", "")
+        };
+
+        let where_clause = if self.gen.opts.async_ {
+            format!("T: Send, U: Host + Send{wildcard_where_clause}")
+        } else {
+            format!("U: Host{wildcard_where_clause}")
         };
         uwriteln!(
             self.src,
             "
-                pub fn add_to_linker<T, U>(
+                pub fn add_to_linker<T, U{wildcard_matches_type}>(
                     linker: &mut wasmtime::component::Linker<T>,
+                    {wildcard_matches}
                     get: impl Fn(&mut T) -> &mut U + Send + Sync + Copy + 'static,
                 ) -> wasmtime::Result<()>
                     where {where_clause},
@@ -997,28 +1167,47 @@ impl<'a> InterfaceGenerator<'a> {
         );
         uwriteln!(self.src, "let mut inst = linker.instance(\"{name}\")?;");
         for (_, func) in iface.functions.iter() {
-            self.generate_add_function_to_linker(owner, func, "inst");
+            if "*" == &func.name {
+                uwriteln!(self.src, "for (name, match_) in wildcard_matches {{");
+                self.generate_add_function_to_linker(owner, func, "inst", Some(("name", "match_")));
+                uwriteln!(self.src, "}}");
+            } else {
+                self.generate_add_function_to_linker(owner, func, "inst", None);
+            }
         }
         uwriteln!(self.src, "Ok(())");
         uwriteln!(self.src, "}}");
     }
 
-    fn generate_add_function_to_linker(&mut self, owner: TypeOwner, func: &Function, linker: &str) {
+    fn generate_add_function_to_linker(
+        &mut self,
+        owner: TypeOwner,
+        func: &Function,
+        linker: &str,
+        wildcard_match: Option<(&str, &str)>,
+    ) {
         uwrite!(
             self.src,
-            "{linker}.{}(\"{}\", ",
+            "{linker}.{}({}, ",
             if self.gen.opts.async_ {
                 "func_wrap_async"
             } else {
                 "func_wrap"
             },
-            func.name
+            wildcard_match
+                .map(|(n, _)| n.to_owned())
+                .unwrap_or(format!("\"{}\"", func.name))
         );
-        self.generate_guest_import_closure(owner, func);
+        self.generate_guest_import_closure(owner, func, wildcard_match);
         uwriteln!(self.src, ")?;")
     }
 
-    fn generate_guest_import_closure(&mut self, owner: TypeOwner, func: &Function) {
+    fn generate_guest_import_closure(
+        &mut self,
+        owner: TypeOwner,
+        func: &Function,
+        wildcard_match: Option<(&str, &str)>,
+    ) {
         // Generate the closure that's passed to a `Linker`, the final piece of
         // codegen here.
         self.src
@@ -1033,8 +1222,11 @@ impl<'a> InterfaceGenerator<'a> {
             self.print_ty(&param.1, TypeMode::Owned);
             self.src.push_str(", ");
         }
-        self.src.push_str(") |");
+        self.src.push_str(") |{");
         if self.gen.opts.async_ {
+            if let Some((_, match_)) = wildcard_match {
+                uwriteln!(self.src, "let {match_} = match_.clone();");
+            }
             self.src.push_str(" Box::new(async move { \n");
         } else {
             self.src.push_str(" { \n");
@@ -1047,7 +1239,7 @@ impl<'a> InterfaceGenerator<'a> {
                        tracing::Level::TRACE,
                        \"wit-bindgen guest import\",
                        module = \"{}\",
-                       function = \"{}\",
+                       function = {},
                    );
                    let _enter = span.enter();
                ",
@@ -1059,13 +1251,20 @@ impl<'a> InterfaceGenerator<'a> {
                     TypeOwner::World(id) => &self.resolve.worlds[id].name,
                     TypeOwner::None => "<no owner>",
                 },
-                func.name,
+                wildcard_match
+                    .map(|(n, _)| n.to_owned())
+                    .unwrap_or(format!("\"{}\"", func.name))
             ));
         }
 
-        self.src.push_str("let host = get(caller.data_mut());\n");
+        self.src
+            .push_str("let mut host = get(caller.data_mut());\n");
 
-        uwrite!(self.src, "let r = host.{}(", func.name.to_snake_case());
+        if let Some((_, match_)) = wildcard_match {
+            uwrite!(self.src, "let r = {match_}.call(&mut host, ");
+        } else {
+            uwrite!(self.src, "let r = host.{}(", func.name.to_snake_case());
+        }
         for (i, _) in func.params.iter().enumerate() {
             uwrite!(self.src, "arg{},", i);
         }
@@ -1097,21 +1296,25 @@ impl<'a> InterfaceGenerator<'a> {
 
         if self.gen.opts.async_ {
             // Need to close Box::new and async block
-            self.src.push_str("})");
+            self.src.push_str("})}");
         } else {
-            self.src.push_str("}");
+            self.src.push_str("}}");
         }
     }
 
-    fn generate_function_trait_sig(&mut self, owner: TypeOwner, func: &Function) {
+    fn generate_function_trait_sig(&mut self, owner: TypeOwner, func: &Function, name: &str) {
         self.rustdoc(&func.docs);
 
         if self.gen.opts.async_ {
             self.push_str("async ");
         }
         self.push_str("fn ");
-        self.push_str(&to_rust_ident(&func.name));
-        self.push_str("(&mut self, ");
+        self.push_str(&to_rust_ident(name));
+        if "*" == &func.name {
+            self.push_str("(&self, __host: &mut T, ");
+        } else {
+            self.push_str("(&mut self, ");
+        }
         for (name, param) in func.params.iter() {
             let name = to_rust_ident(name);
             self.push_str(&name);
@@ -1178,8 +1381,12 @@ impl<'a> InterfaceGenerator<'a> {
         self.rustdoc(&func.docs);
         uwrite!(
             self.src,
-            "pub {async_} fn call_{}<S: wasmtime::AsContextMut>(&self, mut store: S, ",
-            func.name.to_snake_case(),
+            "pub {async_} fn call{}<S: wasmtime::AsContextMut>(&self, mut store: S, ",
+            if "*" == &func.name {
+                String::new()
+            } else {
+                format!("_{}", func.name.to_snake_case())
+            }
         );
         for (i, param) in func.params.iter().enumerate() {
             uwrite!(self.src, "arg{}: ", i);
@@ -1203,32 +1410,40 @@ impl<'a> InterfaceGenerator<'a> {
                        tracing::Level::TRACE,
                        \"wit-bindgen guest export\",
                        module = \"{}\",
-                       function = \"{}\",
+                       function = {},
                    );
                    let _enter = span.enter();
                ",
                 ns.unwrap_or("default"),
-                func.name,
+                if "*" == &func.name {
+                    "self.name".to_owned()
+                } else {
+                    format!("\"{}\"", func.name)
+                }
             ));
         }
 
-        self.src.push_str("let callee = unsafe {\n");
-        self.src.push_str("wasmtime::component::TypedFunc::<(");
-        for (_, ty) in func.params.iter() {
-            self.print_ty(ty, TypeMode::AllBorrowed("'_"));
-            self.push_str(", ");
+        if "*" == &func.name {
+            self.src.push_str("let callee = self.func;\n");
+        } else {
+            self.src.push_str("let callee = unsafe {\n");
+            self.src.push_str("wasmtime::component::TypedFunc::<(");
+            for (_, ty) in func.params.iter() {
+                self.print_ty(ty, TypeMode::AllBorrowed("'_"));
+                self.push_str(", ");
+            }
+            self.src.push_str("), (");
+            for ty in func.results.iter_types() {
+                self.print_ty(ty, TypeMode::Owned);
+                self.push_str(", ");
+            }
+            uwriteln!(
+                self.src,
+                ")>::new_unchecked(self.{})",
+                func.name.to_snake_case()
+            );
+            self.src.push_str("};\n");
         }
-        self.src.push_str("), (");
-        for ty in func.results.iter_types() {
-            self.print_ty(ty, TypeMode::Owned);
-            self.push_str(", ");
-        }
-        uwriteln!(
-            self.src,
-            ")>::new_unchecked(self.{})",
-            func.name.to_snake_case()
-        );
-        self.src.push_str("};\n");
         self.src.push_str("let (");
         for (i, _) in func.results.iter_types().enumerate() {
             uwrite!(self.src, "ret{},", i);
