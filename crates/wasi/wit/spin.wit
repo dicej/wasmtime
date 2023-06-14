@@ -1,8 +1,6 @@
-package wasmtime:wasi
+package fermyon:spin
 
-// All of the same imports available in the wasi:cli/command world, but no
-// export required:
-world preview1-adapter-reactor {
+world reactor {
   import wasi:clocks/wall-clock
   import wasi:clocks/monotonic-clock
   import wasi:clocks/timezone
@@ -30,4 +28,16 @@ world preview1-adapter-reactor {
   import wasi:cli/terminal-stdin
   import wasi:cli/terminal-stdout
   import wasi:cli/terminal-stderr
+
+  import config
+  import postgres
+  import mysql
+  import sqlite
+  import redis
+  import key-value
+  import http
+  import llm
+
+  export inbound-http
+  export inbound-redis
 }
