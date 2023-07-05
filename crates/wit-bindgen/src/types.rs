@@ -120,6 +120,8 @@ impl Types {
                     info |= self.type_info(resolve, &field.ty);
                 }
             }
+            TypeDefKind::Resource => {}
+            TypeDefKind::Handle(_) => {}
             TypeDefKind::Tuple(t) => {
                 for ty in t.types.iter() {
                     info |= self.type_info(resolve, ty);
