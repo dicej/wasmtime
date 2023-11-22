@@ -88,6 +88,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         network: Resource<Network>,
         remote_address: IpSocketAddress,
     ) -> SocketResult<()> {
+        eprintln!("connect to {remote_address:?}");
         let table = self.table_mut();
         let r = {
             let socket = table.get(&this)?;
