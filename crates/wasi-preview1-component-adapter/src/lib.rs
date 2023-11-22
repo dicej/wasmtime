@@ -94,6 +94,20 @@ impl<T, E> TrappingUnwrap<T> for Result<T, E> {
     }
 }
 
+/// Allocate a file descriptor which will generate an `ERRNO_BADF` if used for
+/// any purpose except `fd_close`.
+///
+/// This is intended for use by `wasi-libc` during its incremental transition
+/// from WASI Preview 1 to Preview 2.  It will use this function to reserve
+/// descriptors for its own use, valid only for use with libc functions.
+#[no_mangle]
+pub unsafe extern "C" fn adapter_open_badfd(fd: *mut u32) -> bool {
+    State::with(|state| {
+        *fd = state.descriptors_mut().open(Descriptor::Bad)?;
+        Ok(())
+    }) == wasi::ERRNO_SUCCESS
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn cabi_import_realloc(
     old_ptr: *mut u8,
@@ -580,7 +594,7 @@ pub unsafe extern "C" fn fd_fdstat_get(fd: Fd, stat: *mut Fdstat) -> Errno {
                 });
                 Ok(())
             }
-            Descriptor::Closed(_) => Err(ERRNO_BADF),
+            Descriptor::Closed(_) | Descriptor::Bad => Err(ERRNO_BADF),
             Descriptor::Streams(Streams {
                 input: _,
                 output: _,
@@ -629,7 +643,7 @@ pub unsafe extern "C" fn fd_fdstat_set_rights(
         let ds = state.descriptors();
         match ds.get(fd)? {
             Descriptor::Streams(..) => Ok(()),
-            Descriptor::Closed(..) => Err(wasi::ERRNO_BADF),
+            Descriptor::Closed(..) | Descriptor::Bad => Err(wasi::ERRNO_BADF),
         }
     })
 }
@@ -922,7 +936,7 @@ pub unsafe extern "C" fn fd_read(
                 forget(data);
                 Ok(())
             }
-            Descriptor::Closed(_) => Err(ERRNO_BADF),
+            Descriptor::Closed(_) | Descriptor::Bad => Err(ERRNO_BADF),
         }
     })
 }
@@ -1304,7 +1318,7 @@ pub unsafe extern "C" fn fd_write(
                     *nwritten = nbytes;
                     Ok(())
                 }
-                Descriptor::Closed(_) => Err(ERRNO_BADF),
+                Descriptor::Closed(_) | Descriptor::Bad => Err(ERRNO_BADF),
             }
         })
     } else {
