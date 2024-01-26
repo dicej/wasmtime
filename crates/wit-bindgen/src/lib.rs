@@ -6,6 +6,7 @@ use indexmap::{IndexMap, IndexSet};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
+use std::iter;
 use std::mem;
 use std::process::{Command, Stdio};
 use wit_parser::*;
@@ -108,6 +109,8 @@ pub struct Opts {
     /// Remapping of interface names to rust module names.
     /// TODO: is there a better type to use for the value of this map?
     pub with: HashMap<String, String>,
+
+    pub isyswasfa: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +163,17 @@ impl Opts {
         let mut r = Wasmtime::default();
         r.sizes.fill(resolve);
         r.opts = self.clone();
+
+        if r.opts.isyswasfa {
+            if matches!(r.opts.async_, AsyncConfig::None) {
+                r.opts.async_ = AsyncConfig::OnlyImports(HashSet::new());
+            }
+            r.opts.with.insert(
+                "isyswasfa:isyswasfa/isyswasfa".into(),
+                "::isyswasfa_host::interface".into(),
+            );
+        }
+
         r.generate(resolve, world)
     }
 }
@@ -979,7 +993,13 @@ impl<'a> InterfaceGenerator<'a> {
                 uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]")
             }
 
-            uwriteln!(self.src, "pub trait Host{camel} {{");
+            let bounds = if self.gen.opts.isyswasfa {
+                ": isyswasfa_host::IsyswasfaView + Send + 'static"
+            } else {
+                ""
+            };
+
+            uwriteln!(self.src, "pub trait Host{camel}{bounds} {{");
 
             let functions = match resource.owner {
                 TypeOwner::World(id) => self.resolve.worlds[id]
@@ -1517,13 +1537,22 @@ impl<'a> InterfaceGenerator<'a> {
         // this import which additionally inherits from all resource traits
         // for this interface defined by `type_resource`.
         uwrite!(self.src, "pub trait Host");
+        let mut saw_resources = false;
         for (i, resource) in get_resources(self.resolve, id).enumerate() {
+            saw_resources = true;
             if i == 0 {
                 uwrite!(self.src, ": ");
             } else {
                 uwrite!(self.src, " + ");
             }
             uwrite!(self.src, "Host{}", resource.to_upper_camel_case());
+        }
+        if self.gen.opts.isyswasfa {
+            let token = if saw_resources { " + " } else { ": " };
+            uwrite!(
+                self.src,
+                "{token} isyswasfa_host::IsyswasfaView + Send + 'static"
+            );
         }
         uwriteln!(self.src, " {{");
         for (_, func) in iface.functions.iter() {
@@ -1808,7 +1837,70 @@ impl<'a> InterfaceGenerator<'a> {
             self.push_str(">");
         }
 
-        self.push_str(";\n");
+        let async_name = if self.gen.opts.isyswasfa {
+            if let Some(prefix) = func.name.strip_suffix("-isyswasfa") {
+                let params = iter::once("self.state()".to_owned())
+                    .chain(func.params.iter().map(|(name, _)| to_rust_ident(name)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                uwriteln!(
+                    self.src,
+                    "{{
+                         let future = Self::{}({params});
+                         self.isyswasfa().first_poll(future)
+                     }}",
+                    to_rust_ident(prefix)
+                );
+
+                Some(prefix)
+            } else if func.name.ends_with("-isyswasfa-result") {
+                self.src.push_str("{ self.isyswasfa().get_ready(ready) }");
+                None
+            } else {
+                self.src.push_str(";\n");
+                None
+            }
+        } else {
+            self.src.push_str(";\n");
+            None
+        };
+
+        if let Some(prefix) = async_name {
+            let func = &Function {
+                name: prefix.into(),
+                kind: func.kind.clone(),
+                params: func.params.clone(),
+                results: if let Results::Anon(Type::Id(id)) = &func.results {
+                    if let TypeDefKind::Result(Result_ { ok: Some(ok), .. }) =
+                        &self.resolve.types[*id].kind
+                    {
+                        Results::Anon(*ok)
+                    } else {
+                        unreachable!()
+                    }
+                } else {
+                    unreachable!()
+                },
+                docs: func.docs.clone(),
+            };
+
+            self.push_str("async fn ");
+            self.push_str(&rust_function_name(func));
+            self.push_str("(state: Self::State, ");
+            for (name, param) in func.params.iter() {
+                let name = to_rust_ident(name);
+                self.push_str(&name);
+                self.push_str(": ");
+                self.print_ty(param, TypeMode::Owned);
+                self.push_str(",");
+            }
+            self.push_str(")");
+            self.push_str(" -> ");
+            self.push_str("wasmtime::Result<");
+            self.print_result_ty(&func.results, TypeMode::Owned);
+            self.push_str(">;\n");
+        }
     }
 
     fn extract_typed_function(&mut self, func: &Function) -> (String, String) {
@@ -1945,6 +2037,69 @@ impl<'a> InterfaceGenerator<'a> {
 
         // End function body
         self.src.push_str("}\n");
+
+        if self.gen.opts.isyswasfa {
+            if let Some(prefix) = func.name.strip_suffix("-isyswasfa") {
+                let func = &Function {
+                    name: prefix.into(),
+                    kind: func.kind.clone(),
+                    params: func.params.clone(),
+                    results: if let Results::Anon(Type::Id(id)) = &func.results {
+                        if let TypeDefKind::Result(Result_ { ok: Some(ok), .. }) =
+                            &self.resolve.types[*id].kind
+                        {
+                            Results::Anon(*ok)
+                        } else {
+                            unreachable!()
+                        }
+                    } else {
+                        unreachable!()
+                    },
+                    docs: func.docs.clone(),
+                };
+
+                self.rustdoc(&func.docs);
+
+                let name = func.item_name().to_snake_case();
+
+                uwrite!(
+                    self.src,
+                    "pub async fn call_{name}<S: wasmtime::AsContextMut>(&self, mut store: S, "
+                );
+
+                for (i, param) in func.params.iter().enumerate() {
+                    uwrite!(self.src, "arg{i}: ");
+                    self.print_ty(&param.1, TypeMode::AllBorrowed("'_"));
+                    self.push_str(",");
+                }
+
+                self.src.push_str(") -> wasmtime::Result<");
+                self.print_result_ty(&func.results, TypeMode::Owned);
+
+                self.src
+                .push_str("> where <S as wasmtime::AsContext>::Data: isyswasfa_host::IsyswasfaView + Send {\n");
+
+                let params = iter::once("&mut store".to_owned())
+                    .chain((0..func.params.len()).map(|i| format!("arg{i}")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                uwrite!(
+                    self.src,
+                    "
+                        match self.call_{name}_isyswasfa({params}).await? {{
+                            Ok(result) => Ok(result),
+                            Err(pending) => {{
+                                let ready = isyswasfa_host::await_ready(&mut store, pending).await?;
+                                self.call_{name}_isyswasfa_result(store, ready).await
+                            }}
+                        }}
+                    "
+                );
+
+                self.src.push_str("}\n");
+            }
+        }
     }
 
     fn rustdoc(&mut self, docs: &Docs) {

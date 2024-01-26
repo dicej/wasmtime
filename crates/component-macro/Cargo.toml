@@ -26,6 +26,7 @@ syn = { workspace = true, features = ["extra-traits"] }
 wasmtime-component-util = { workspace = true }
 wasmtime-wit-bindgen = { workspace = true }
 wit-parser = { workspace = true }
+isyswasfa-transform = { path = "../../../transform" }
 
 [dev-dependencies]
 wasmtime = { path = '../wasmtime', features = ['component-model'] }

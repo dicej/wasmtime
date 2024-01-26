@@ -134,6 +134,7 @@ impl Parse for Config {
                         opts.only_interfaces = true;
                     }
                     Opt::With(val) => opts.with.extend(val),
+                    Opt::Isyswasfa(val) => opts.isyswasfa = val,
                 }
             }
         } else {
@@ -148,6 +149,11 @@ impl Parse for Config {
         let world = resolve
             .select_world(pkg, world.as_deref())
             .map_err(|e| Error::new(call_site, format!("{e:?}")))?;
+        let (resolve, world) = if opts.isyswasfa {
+            isyswasfa_transform::transform(&resolve, world, None)
+        } else {
+            (resolve, world)
+        };
         Ok(Config {
             opts,
             resolve,
@@ -207,6 +213,7 @@ mod kw {
     syn::custom_keyword!(with);
     syn::custom_keyword!(except_imports);
     syn::custom_keyword!(only_imports);
+    syn::custom_keyword!(isyswasfa);
 }
 
 enum Opt {
@@ -219,6 +226,7 @@ enum Opt {
     Ownership(Ownership),
     Interfaces(syn::LitStr),
     With(HashMap<String, String>),
+    Isyswasfa(bool),
 }
 
 impl Parse for Opt {
@@ -336,6 +344,10 @@ impl Parse for Opt {
             let fields: Punctuated<(String, String), Token![,]> =
                 contents.parse_terminated(with_field_parse, Token![,])?;
             Ok(Opt::With(HashMap::from_iter(fields)))
+        } else if l.peek(kw::isyswasfa) {
+            input.parse::<kw::isyswasfa>()?;
+            input.parse::<Token![:]>()?;
+            Ok(Opt::Isyswasfa(input.parse::<syn::LitBool>()?.value))
         } else {
             Err(l.error())
         }
