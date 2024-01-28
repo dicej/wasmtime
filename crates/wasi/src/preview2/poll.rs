@@ -18,8 +18,8 @@ pub type ClosureFuture = Box<dyn Fn() -> PollableFuture<'static> + Send + 'stati
 /// or writable. So, rather than containing a Future, which can only become Ready once, a
 /// Pollable contains a way to create a Future in each call to `poll`.
 pub struct Pollable {
-    index: u32,
-    make_future: MakeFuture,
+    pub index: u32,
+    pub make_future: MakeFuture,
     remove_index_on_delete: Option<fn(&mut ResourceTable, u32) -> Result<()>>,
 }
 
@@ -131,7 +131,6 @@ impl<T: WasiView> crate::preview2::bindings::io::poll::HostPollable for T {
         let table = self.table();
         let pollable = table.get(&pollable)?;
         let ready = (pollable.make_future)(table.get_any_mut(pollable.index)?);
-        futures::pin_mut!(ready);
         Ok(matches!(
             futures::future::poll_immediate(ready).await,
             Some(())
