@@ -170,7 +170,15 @@ impl Opts {
             }
             r.opts.with.insert(
                 "isyswasfa:isyswasfa/isyswasfa".into(),
-                "::isyswasfa_host::interface".into(),
+                "::isyswasfa_host::isyswasfa_interface".into(),
+            );
+            r.opts.with.insert(
+                "wasi:io/poll".into(),
+                "::isyswasfa_host::wasi_poll_interface".into(),
+            );
+            r.opts.with.insert(
+                "isyswasfa:io/poll".into(),
+                "::isyswasfa_host::isyswasfa_poll_interface".into(),
             );
         }
 
@@ -1872,10 +1880,9 @@ impl<'a> InterfaceGenerator<'a> {
                 kind: func.kind.clone(),
                 params: func.params.clone(),
                 results: if let Results::Anon(Type::Id(id)) = &func.results {
-                    if let TypeDefKind::Result(Result_ { ok: Some(ok), .. }) =
-                        &self.resolve.types[*id].kind
-                    {
-                        Results::Anon(*ok)
+                    if let TypeDefKind::Result(Result_ { ok, .. }) = &self.resolve.types[*id].kind {
+                        ok.map(|ok| Results::Anon(ok))
+                            .unwrap_or_else(|| Results::Named(Vec::new()))
                     } else {
                         unreachable!()
                     }
