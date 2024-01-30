@@ -177,6 +177,10 @@ impl Opts {
                 "::isyswasfa_host::wasi_poll_interface".into(),
             );
             r.opts.with.insert(
+                "wasi:io/streams".into(),
+                "::isyswasfa_host::wasi_streams_interface".into(),
+            );
+            r.opts.with.insert(
                 "isyswasfa:io/poll".into(),
                 "::isyswasfa_host::isyswasfa_poll_interface".into(),
             );
