@@ -1850,7 +1850,7 @@ impl<'a> InterfaceGenerator<'a> {
         }
 
         let async_name = if self.gen.opts.isyswasfa {
-            if let Some(prefix) = func.name.strip_suffix("-isyswasfa") {
+            if let Some(prefix) = func.name.strip_suffix("-isyswasfa-start") {
                 let params = iter::once("self.state()".to_owned())
                     .chain(func.params.iter().map(|(name, _)| to_rust_ident(name)))
                     .collect::<Vec<_>>()
@@ -1862,7 +1862,7 @@ impl<'a> InterfaceGenerator<'a> {
                          let future = Self::{}({params});
                          self.isyswasfa().first_poll(future)
                      }}",
-                    to_rust_ident(prefix)
+                    to_rust_ident(func.item_name().strip_suffix("-isyswasfa-start").unwrap())
                 );
 
                 Some(prefix)
@@ -2050,7 +2050,7 @@ impl<'a> InterfaceGenerator<'a> {
         self.src.push_str("}\n");
 
         if self.gen.opts.isyswasfa {
-            if let Some(prefix) = func.name.strip_suffix("-isyswasfa") {
+            if let Some(prefix) = func.name.strip_suffix("-isyswasfa-start") {
                 let func = &Function {
                     name: prefix.into(),
                     kind: func.kind.clone(),
@@ -2098,7 +2098,7 @@ impl<'a> InterfaceGenerator<'a> {
                 uwrite!(
                     self.src,
                     "
-                        match self.call_{name}_isyswasfa({params}).await? {{
+                        match self.call_{name}_isyswasfa_start({params}).await? {{
                             Ok(result) => Ok(result),
                             Err(pending) => {{
                                 let ready = isyswasfa_host::await_ready(&mut store, pending).await?;
