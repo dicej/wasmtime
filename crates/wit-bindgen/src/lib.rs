@@ -1006,7 +1006,7 @@ impl<'a> InterfaceGenerator<'a> {
             }
 
             let bounds = if self.gen.opts.isyswasfa {
-                ": isyswasfa_host::IsyswasfaView + Send + 'static"
+                ": isyswasfa_host::IsyswasfaView"
             } else {
                 ""
             };
@@ -1561,10 +1561,7 @@ impl<'a> InterfaceGenerator<'a> {
         }
         if self.gen.opts.isyswasfa {
             let token = if saw_resources { " + " } else { ": " };
-            uwrite!(
-                self.src,
-                "{token} isyswasfa_host::IsyswasfaView + Send + 'static"
-            );
+            uwrite!(self.src, "{token} isyswasfa_host::IsyswasfaView");
         }
         uwriteln!(self.src, " {{");
         for (_, func) in iface.functions.iter() {
@@ -1851,16 +1848,18 @@ impl<'a> InterfaceGenerator<'a> {
 
         let async_name = if self.gen.opts.isyswasfa {
             if let Some(prefix) = func.name.strip_suffix("-isyswasfa-start") {
-                let params = iter::once("self.state()".to_owned())
-                    .chain(func.params.iter().map(|(name, _)| to_rust_ident(name)))
+                let params = func
+                    .params
+                    .iter()
+                    .map(|(name, _)| to_rust_ident(name))
                     .collect::<Vec<_>>()
                     .join(", ");
 
                 uwriteln!(
                     self.src,
                     "{{
-                         let future = Self::{}({params});
-                         self.isyswasfa().first_poll(future)
+                         let future = self.{}({params})?;
+                         ::isyswasfa_host::IsyswasfaCtx::first_poll(self, future)
                      }}",
                     to_rust_ident(func.item_name().strip_suffix("-isyswasfa-start").unwrap())
                 );
@@ -1896,9 +1895,9 @@ impl<'a> InterfaceGenerator<'a> {
                 docs: func.docs.clone(),
             };
 
-            self.push_str("async fn ");
+            self.push_str("fn ");
             self.push_str(&rust_function_name(func));
-            self.push_str("(state: Self::State, ");
+            self.push_str("(&mut self, ");
             for (name, param) in func.params.iter() {
                 let name = to_rust_ident(name);
                 self.push_str(&name);
@@ -1908,9 +1907,11 @@ impl<'a> InterfaceGenerator<'a> {
             }
             self.push_str(")");
             self.push_str(" -> ");
-            self.push_str("wasmtime::Result<");
+            self.push_str(
+                "wasmtime::Result<impl ::std::future::Future<Output = impl FnOnce(&mut Self) -> wasmtime::Result<",
+            );
             self.print_result_ty(&func.results, TypeMode::Owned);
-            self.push_str(">;\n");
+            self.push_str("> + 'static> + Send + 'static>;\n");
         }
     }
 
@@ -2087,8 +2088,9 @@ impl<'a> InterfaceGenerator<'a> {
                 self.src.push_str(") -> wasmtime::Result<");
                 self.print_result_ty(&func.results, TypeMode::Owned);
 
-                self.src
-                .push_str("> where <S as wasmtime::AsContext>::Data: isyswasfa_host::IsyswasfaView + Send {\n");
+                self.src.push_str(
+                    "> where <S as wasmtime::AsContext>::Data: isyswasfa_host::IsyswasfaView {\n",
+                );
 
                 let params = iter::once("&mut store".to_owned())
                     .chain((0..func.params.len()).map(|i| format!("arg{i}")))
