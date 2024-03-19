@@ -1591,7 +1591,7 @@ dependencies = [
 name = "isyswasfa-transform"
 version = "0.1.0"
 dependencies = [
- "wit-parser",
+ "wit-parser 0.13.1",
 ]
 
 [[package]]
@@ -2615,7 +2615,7 @@ version = "0.0.0"
 dependencies = [
  "cargo_metadata",
  "heck",
- "wit-component 0.20.0",
+ "wit-component 0.201.0",
 ]
 
 [[package]]
@@ -3104,6 +3104,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-encoder"
+version = "0.201.0"
+source = "git+https://github.com/dicej/wasm-tools?branch=adapt-world-imports#a3e308dbe3b1555c7873ce199adf81e76ea01224"
+dependencies = [
+ "leb128",
+]
+
+[[package]]
 name = "wasm-metadata"
 version = "0.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3117,6 +3125,21 @@ dependencies = [
  "spdx",
  "wasm-encoder 0.40.0",
  "wasmparser 0.120.0",
+]
+
+[[package]]
+name = "wasm-metadata"
+version = "0.201.0"
+source = "git+https://github.com/dicej/wasm-tools?branch=adapt-world-imports#a3e308dbe3b1555c7873ce199adf81e76ea01224"
+dependencies = [
+ "anyhow",
+ "indexmap 2.1.0",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "spdx",
+ "wasm-encoder 0.201.0",
+ "wasmparser 0.201.0",
 ]
 
 [[package]]
@@ -3201,6 +3224,16 @@ name = "wasmparser"
 version = "0.120.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9148127f39cbffe43efee8d5442b16ecdba21567785268daa1ec9e134389705"
+dependencies = [
+ "bitflags 2.4.1",
+ "indexmap 2.1.0",
+ "semver",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.201.0"
+source = "git+https://github.com/dicej/wasm-tools?branch=adapt-world-imports#a3e308dbe3b1555c7873ce199adf81e76ea01224"
 dependencies = [
  "bitflags 2.4.1",
  "indexmap 2.1.0",
@@ -3404,7 +3437,7 @@ dependencies = [
  "wast 70.0.1",
  "wat",
  "windows-sys 0.52.0",
- "wit-component 0.20.0",
+ "wit-component 0.201.0",
 ]
 
 [[package]]
@@ -3434,7 +3467,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-component-util",
  "wasmtime-wit-bindgen",
- "wit-parser",
+ "wit-parser 0.201.0",
 ]
 
 [[package]]
@@ -3796,7 +3829,7 @@ dependencies = [
  "anyhow",
  "heck",
  "indexmap 2.1.0",
- "wit-parser",
+ "wit-parser 0.201.0",
 ]
 
 [[package]]
@@ -4178,7 +4211,7 @@ checksum = "147bee3fde39f80da448dc971d3357c34f5810605e0ba59345ebe576002371c8"
 dependencies = [
  "anyhow",
  "wit-component 0.18.2",
- "wit-parser",
+ "wit-parser 0.13.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -4189,7 +4222,7 @@ checksum = "3033046c0f9112a67dc6c1e4281347c8d5f1e01d4cafc01321c259d45e3b8e4f"
 dependencies = [
  "anyhow",
  "heck",
- "wasm-metadata",
+ "wasm-metadata 0.10.16",
  "wit-bindgen-core",
  "wit-component 0.18.2",
 ]
@@ -4223,16 +4256,15 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "wasm-encoder 0.38.1",
- "wasm-metadata",
+ "wasm-metadata 0.10.16",
  "wasmparser 0.118.1",
- "wit-parser",
+ "wit-parser 0.13.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "wit-component"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fa6229817f3a3e4a7fafe02e063b5dc64b73b286fb0e0c14addbc0d47809c9b"
+version = "0.201.0"
+source = "git+https://github.com/dicej/wasm-tools?branch=adapt-world-imports#a3e308dbe3b1555c7873ce199adf81e76ea01224"
 dependencies = [
  "anyhow",
  "bitflags 2.4.1",
@@ -4241,10 +4273,25 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
- "wasm-encoder 0.40.0",
- "wasm-metadata",
- "wasmparser 0.120.0",
- "wit-parser",
+ "wasm-encoder 0.201.0",
+ "wasm-metadata 0.201.0",
+ "wasmparser 0.201.0",
+ "wit-parser 0.201.0",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.13.1"
+dependencies = [
+ "anyhow",
+ "id-arena",
+ "indexmap 2.1.0",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -4262,6 +4309,23 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "unicode-xid",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.201.0"
+source = "git+https://github.com/dicej/wasm-tools?branch=adapt-world-imports#a3e308dbe3b1555c7873ce199adf81e76ea01224"
+dependencies = [
+ "anyhow",
+ "id-arena",
+ "indexmap 2.1.0",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-xid",
+ "wasmparser 0.201.0",
 ]
 
 [[package]]

@@ -239,8 +239,11 @@ wasmprinter = "0.2.77"
 wasm-encoder = "0.40.0"
 wasm-smith = "0.15.0"
 wasm-mutate = "0.2.45"
-wit-parser = "0.13.1"
-wit-component = "0.20.0"
+# TODO: switch to upstream release versions of these deps once
+# https://github.com/bytecodealliance/wasm-tools/pull/1459 is merged and
+# released:
+wit-parser = { git = "https://github.com/dicej/wasm-tools", branch = "adapt-world-imports" }
+wit-component = { git = "https://github.com/dicej/wasm-tools", branch = "adapt-world-imports" }
 
 # Non-Bytecode Alliance maintained dependencies:
 # --------------------------
