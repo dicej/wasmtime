@@ -671,6 +671,24 @@ impl<'a> Inliner<'a> {
                     .push((*ty, dfg::Trampoline::ResourceDrop(id)));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
+            AsyncStart(component_type, core_type) => {
+                let component_type = types
+                    .convert_component_func_type(frame.translation.types_ref(), *component_type)?;
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*core_type, dfg::Trampoline::AsyncStart(component_type)));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            AsyncReturn(component_type, core_type) => {
+                let component_type = types
+                    .convert_component_func_type(frame.translation.types_ref(), *component_type)?;
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*core_type, dfg::Trampoline::AsyncReturn(component_type)));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
 
             ModuleStatic(idx) => {
                 frame.modules.push(ModuleDef::Static(*idx));
@@ -994,6 +1012,7 @@ impl<'a> Inliner<'a> {
             memory64,
             realloc,
             post_return,
+            async_: options.async_,
         }
     }
 
@@ -1015,6 +1034,7 @@ impl<'a> Inliner<'a> {
             memory,
             realloc,
             post_return,
+            async_: options.async_,
         }
     }
 

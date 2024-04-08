@@ -185,6 +185,9 @@ enum LocalInitializer<'data> {
     ResourceRep(AliasableResourceId, ModuleInternedTypeIndex),
     ResourceDrop(AliasableResourceId, ModuleInternedTypeIndex),
 
+    AsyncStart(ComponentFuncTypeId, ModuleInternedTypeIndex),
+    AsyncReturn(ComponentFuncTypeId, ModuleInternedTypeIndex),
+
     // core wasm modules
     ModuleStatic(StaticModuleIndex),
 
@@ -252,6 +255,8 @@ struct LocalCanonicalOptions {
     memory: Option<MemoryIndex>,
     realloc: Option<FuncIndex>,
     post_return: Option<FuncIndex>,
+    async_: bool,
+    callback: Option<FuncIndex>,
 }
 
 enum Action {
@@ -513,6 +518,26 @@ impl<'a, 'data> Translator<'a, 'data> {
                             let ty = self.core_func_signature(core_func_index);
                             core_func_index += 1;
                             LocalInitializer::ResourceRep(resource, ty)
+                        }
+                        wasmparser::CanonicalFunction::AsyncStart {
+                            component_type_index,
+                        } => {
+                            let component_type = types
+                                .component_any_type_at(component_type_index)
+                                .unwrap_func();
+                            let core_type = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::AsyncStart(component_type, core_type)
+                        }
+                        wasmparser::CanonicalFunction::AsyncReturn {
+                            component_type_index,
+                        } => {
+                            let component_type = types
+                                .component_any_type_at(component_type_index)
+                                .unwrap_func();
+                            let core_type = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::AsyncReturn(component_type, core_type)
                         }
                     };
                     self.result.initializers.push(init);
@@ -862,6 +887,8 @@ impl<'a, 'data> Translator<'a, 'data> {
             memory: None,
             realloc: None,
             post_return: None,
+            async_: false,
+            callback: None,
         };
         for opt in opts {
             match opt {
@@ -885,6 +912,11 @@ impl<'a, 'data> Translator<'a, 'data> {
                 wasmparser::CanonicalOption::PostReturn(idx) => {
                     let idx = FuncIndex::from_u32(*idx);
                     ret.post_return = Some(idx);
+                }
+                wasmparser::CanonicalOption::Async => ret.async_ = true,
+                wasmparser::CanonicalOption::Callback(idx) => {
+                    let idx = FuncIndex::from_u32(*idx);
+                    ret.callback = Some(idx);
                 }
             }
         }

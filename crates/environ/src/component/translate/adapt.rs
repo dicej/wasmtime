@@ -160,6 +160,8 @@ pub struct AdapterOptions {
     pub realloc: Option<dfg::CoreDef>,
     /// An optional definition of a `post-return` to use.
     pub post_return: Option<dfg::CoreDef>,
+    /// TODO: docs
+    pub async_: bool,
 }
 
 impl<'data> Translator<'_, 'data> {

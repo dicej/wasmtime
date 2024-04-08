@@ -43,6 +43,8 @@ pub struct Options {
     ///
     /// This defaults to utf-8 but can be changed if necessary.
     string_encoding: StringEncoding,
+
+    async_: bool,
 }
 
 // The `Options` structure stores raw pointers but they're never used unless a
@@ -66,12 +68,14 @@ impl Options {
         memory: Option<NonNull<VMMemoryDefinition>>,
         realloc: Option<NonNull<VMFuncRef>>,
         string_encoding: StringEncoding,
+        async_: bool,
     ) -> Options {
         Options {
             store_id,
             memory,
             realloc,
             string_encoding,
+            async_,
         }
     }
 
@@ -161,6 +165,11 @@ impl Options {
     /// Returns the id of the store that this `Options` is connected to.
     pub fn store_id(&self) -> StoreId {
         self.store_id
+    }
+
+    /// TODO: docs
+    pub fn async_(&self) -> bool {
+        self.async_
     }
 }
 

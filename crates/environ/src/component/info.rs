@@ -439,6 +439,9 @@ pub struct CanonicalOptions {
 
     /// The post-return function used by these options, if specified.
     pub post_return: Option<RuntimePostReturnIndex>,
+
+    /// TODO: docs
+    pub async_: bool,
 }
 
 /// Possible encodings of strings within the component model.
@@ -545,6 +548,12 @@ pub enum Trampoline {
     /// Same as `ResourceNew`, but for the `resource.drop` intrinsic.
     ResourceDrop(TypeResourceTableIndex),
 
+    /// TODO: docs
+    AsyncStart(TypeFuncIndex),
+
+    /// TODO: docs
+    AsyncReturn(TypeFuncIndex),
+
     /// An intrinsic used by FACT-generated modules which will transfer an owned
     /// resource from one table to another. Used in component-to-component
     /// adapter trampolines.
@@ -585,6 +594,8 @@ impl Trampoline {
             ResourceNew(i) => format!("component-resource-new[{}]", i.as_u32()),
             ResourceRep(i) => format!("component-resource-rep[{}]", i.as_u32()),
             ResourceDrop(i) => format!("component-resource-drop[{}]", i.as_u32()),
+            AsyncStart(i) => format!("async-start[{}]", i.as_u32()),
+            AsyncReturn(i) => format!("async-return[{}]", i.as_u32()),
             ResourceTransferOwn => format!("component-resource-transfer-own"),
             ResourceTransferBorrow => format!("component-resource-transfer-borrow"),
             ResourceEnterCall => format!("component-resource-enter-call"),

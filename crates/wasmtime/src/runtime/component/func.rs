@@ -1,11 +1,14 @@
+use crate::component::concurrent;
 use crate::component::instance::{Instance, InstanceData};
-use crate::component::storage::storage_as_slice;
+use crate::component::storage::{slice_to_storage, slice_to_storage_mut, storage_as_slice};
 use crate::component::types::Type;
 use crate::component::values::Val;
 use crate::store::{StoreOpaque, Stored};
 use crate::{AsContext, AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{bail, Context, Result};
+use std::any::Any;
 use std::mem::{self, MaybeUninit};
+use std::pin::pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use wasmtime_environ::component::{
@@ -129,7 +132,15 @@ impl Func {
             ExportFunction { func_ref }
         });
         let component_instance = options.instance;
-        let options = unsafe { Options::new(store.id(), memory, realloc, options.string_encoding) };
+        let options = unsafe {
+            Options::new(
+                store.id(),
+                memory,
+                realloc,
+                options.string_encoding,
+                options.async_,
+            )
+        };
         Func(store.store_data_mut().insert(FuncData {
             export,
             options,
@@ -435,6 +446,120 @@ impl Func {
         )
     }
 
+    fn call_raw_async<
+        T: Send,
+        Params: Send + Sync + 'static,
+        Return: Send + Sync + 'static,
+        LowerParams,
+        LowerReturn,
+    >(
+        &self,
+        store: &mut StoreContextMut<T>,
+        params: Params,
+        lower: impl FnOnce(
+                &mut LowerContext<T>,
+                &Params,
+                InterfaceType,
+                &mut MaybeUninit<LowerParams>,
+            ) -> Result<()>
+            + Send
+            + Sync
+            + 'static,
+        lift: impl FnOnce(&mut LiftContext, InterfaceType, &LowerReturn) -> Result<Return>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Result<Return>
+    where
+        LowerParams: Copy,
+        LowerReturn: Copy,
+    {
+        let me = self.0;
+        let FuncData { export, .. } = store.0[me];
+
+        store.concurrent_state().lift_result = Some(Box::new(move |store, lowered| {
+            let FuncData {
+                options,
+                instance,
+                ty,
+                ..
+            } = store.0[me];
+
+            let instance = store.0[instance.0].as_ref().unwrap();
+            let types = instance.component_types().clone();
+            let instance_ptr = instance.instance_ptr();
+
+            unsafe {
+                Ok(Box::new(lift(
+                    &mut LiftContext::new(store.0, &options, &types, instance_ptr),
+                    InterfaceType::Tuple(types[ty].results),
+                    slice_to_storage(lowered),
+                )?) as Box<dyn Any + Send + Sync>)
+            }
+        }));
+
+        store.concurrent_state().lower_params = Some(Box::new(move |store, lowered| {
+            let FuncData {
+                options,
+                instance,
+                component_instance,
+                ty,
+                ..
+            } = store.0[me];
+
+            let instance = store.0[instance.0].as_ref().unwrap();
+            let types = instance.component_types().clone();
+            let instance_ptr = instance.instance_ptr();
+            let mut flags = instance.instance().instance_flags(component_instance);
+
+            unsafe {
+                flags.set_may_leave(false);
+                let mut cx =
+                    LowerContext::new(store.as_context_mut(), &options, &types, instance_ptr);
+                cx.enter_call();
+                let result = lower(
+                    &mut cx,
+                    &params,
+                    InterfaceType::Tuple(types[ty].params),
+                    slice_to_storage_mut(lowered),
+                );
+                flags.set_may_leave(true);
+                result
+            }
+        }));
+
+        let context = unsafe {
+            let mut space = MaybeUninit::<ValRaw>::uninit();
+            crate::Func::call_unchecked_raw(store, export.func_ref, space.as_mut_ptr(), 1)?;
+            space.assume_init().get_i32()
+        };
+
+        if context == 0 {
+            if let Some(result) = store.concurrent_state().result.take() {
+                return Ok(*result.downcast().unwrap());
+            } else {
+                // TODO: add a specific variant to `Trap` for this case
+                bail!(crate::Trap::NoAsyncResult);
+            }
+        } else {
+            store.concurrent_state().context = context;
+            {
+                let async_cx = store.0.async_cx().expect("async cx");
+                let mut future = pin!(concurrent::poll_loop(store));
+                unsafe {
+                    async_cx.block_on(future.as_mut())??;
+                }
+            }
+            return Ok(*store
+                .concurrent_state()
+                .result
+                .take()
+                .unwrap()
+                .downcast()
+                .unwrap());
+        }
+    }
+
     /// Invokes the underlying wasm function, lowering arguments and lifting the
     /// result.
     ///
@@ -470,7 +595,7 @@ impl Func {
 
         let space = &mut MaybeUninit::<ParamsAndResults<LowerParams, LowerReturn>>::uninit();
 
-        // Double-check the size/alignemnt of `space`, just in case.
+        // Double-check the size/alignment of `space`, just in case.
         //
         // Note that this alone is not enough to guarantee the validity of the
         // `unsafe` block below, but it's definitely required. In any case LLVM

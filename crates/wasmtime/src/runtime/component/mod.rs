@@ -42,6 +42,7 @@
 #![cfg_attr(docsrs, doc(cfg(feature = "component-model")))]
 
 mod component;
+pub(crate) mod concurrent;
 mod func;
 mod instance;
 mod linker;

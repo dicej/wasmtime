@@ -108,6 +108,7 @@ pub type VMLoweringCallee = extern "C" fn(
     opt_memory: *mut VMMemoryDefinition,
     opt_realloc: *mut VMFuncRef,
     string_encoding: StringEncoding,
+    async_: bool,
     args_and_results: *mut mem::MaybeUninit<ValRaw>,
     nargs_and_results: usize,
 );
@@ -123,6 +124,14 @@ pub struct VMLowering {
     /// The host data pointer (think void* pointer) to get passed to `callee`.
     pub data: *mut u8,
 }
+
+/// TODO: docs
+pub type VMAsyncCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    ty: TypeFuncIndex,
+    args_and_results: *mut mem::MaybeUninit<ValRaw>,
+    nargs_and_results: usize,
+);
 
 /// This is a marker type to represent the underlying allocation of a
 /// `VMComponentContext`.
@@ -432,6 +441,14 @@ impl ComponentInstance {
             let offset = self.offsets.resource_destructor(idx);
             debug_assert!(*self.vmctx_plus_offset::<usize>(offset) != INVALID_PTR);
             *self.vmctx_plus_offset(offset)
+        }
+    }
+
+    /// TODO: docs
+    pub fn set_async_callbacks(&mut self, start: VMAsyncCallback, return_: VMAsyncCallback) {
+        unsafe {
+            *self.vmctx_plus_offset_mut(self.offsets.async_start()) = start;
+            *self.vmctx_plus_offset_mut(self.offsets.async_return()) = return_;
         }
     }
 
@@ -753,6 +770,11 @@ impl OwnedComponentInstance {
     /// See `ComponentInstance::resource_types`
     pub fn resource_types_mut(&mut self) -> &mut Arc<dyn Any + Send + Sync> {
         unsafe { &mut (*self.ptr.as_ptr()).resource_types }
+    }
+
+    /// TODO: docs
+    pub fn set_async_callbacks(&mut self, start: VMAsyncCallback, return_: VMAsyncCallback) {
+        unsafe { self.instance_mut().set_async_callbacks(start, return_) }
     }
 }
 

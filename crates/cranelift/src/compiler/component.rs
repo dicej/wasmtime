@@ -5,7 +5,7 @@ use crate::{
     ALWAYS_TRAP_CODE, CANNOT_ENTER_CODE,
 };
 use anyhow::Result;
-use cranelift_codegen::ir::{self, InstBuilder, MemFlags};
+use cranelift_codegen::ir::{self, InstBuilder, MemFlags, Value};
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_wasm::ModuleInternedTypeIndex;
@@ -103,6 +103,12 @@ impl<'a> TrampolineCompiler<'a> {
             Trampoline::ResourceNew(ty) => self.translate_resource_new(*ty),
             Trampoline::ResourceRep(ty) => self.translate_resource_rep(*ty),
             Trampoline::ResourceDrop(ty) => self.translate_resource_drop(*ty),
+            Trampoline::AsyncStart(ty) => {
+                self.translate_async_start_or_return(*ty, self.offsets.async_start())
+            }
+            Trampoline::AsyncReturn(ty) => {
+                self.translate_async_start_or_return(*ty, self.offsets.async_return())
+            }
             Trampoline::ResourceTransferOwn => {
                 self.translate_resource_libcall(host::resource_transfer_own)
             }
@@ -118,6 +124,100 @@ impl<'a> TrampolineCompiler<'a> {
         }
     }
 
+    fn store_wasm_arguments(&mut self, args: &[Value]) -> (Value, Value) {
+        let pointer_type = self.isa.pointer_type();
+        let wasm_func_ty = &self.types[self.signature];
+
+        // More handling is necessary here if this changes
+        assert!(matches!(
+            NativeRet::classify(pointer_type, wasm_func_ty),
+            NativeRet::Bare
+        ));
+
+        match self.abi {
+            Abi::Wasm | Abi::Native => {
+                let (ptr, len) = self.compiler.allocate_stack_array_and_spill_args(
+                    wasm_func_ty,
+                    &mut self.builder,
+                    args,
+                );
+                let len = self.builder.ins().iconst(pointer_type, i64::from(len));
+                (ptr, len)
+            }
+            Abi::Array => {
+                let params = self.builder.func.dfg.block_params(self.block0);
+                (params[2], params[3])
+            }
+        }
+    }
+
+    fn load_wasm_results(&mut self, values_vec_ptr: Value, values_vec_len: Value) {
+        let wasm_func_ty = &self.types[self.signature];
+
+        match self.abi {
+            Abi::Wasm | Abi::Native => {
+                // After the host function has returned the results are loaded from
+                // `values_vec_ptr` and then returned.
+                let results = self.compiler.load_values_from_array(
+                    wasm_func_ty.returns(),
+                    &mut self.builder,
+                    values_vec_ptr,
+                    values_vec_len,
+                );
+                self.builder.ins().return_(&results);
+            }
+            Abi::Array => {
+                self.builder.ins().return_(&[]);
+            }
+        }
+    }
+
+    fn translate_async_start_or_return(&mut self, ty: TypeFuncIndex, offset: u32) {
+        let pointer_type = self.isa.pointer_type();
+        let args = self.builder.func.dfg.block_params(self.block0).to_vec();
+        let vmctx = args[0];
+
+        let (values_vec_ptr, values_vec_len) = self.store_wasm_arguments(&args[2..]);
+
+        let mut callee_args = Vec::new();
+        let mut host_sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
+
+        // vmctx: *mut VMComponentContext
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        callee_args.push(vmctx);
+
+        // ty: TypeFuncIndex,
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        callee_args.push(
+            self.builder
+                .ins()
+                .iconst(ir::types::I32, i64::from(ty.as_u32())),
+        );
+
+        // storage: *mut ValRaw
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        callee_args.push(values_vec_ptr);
+
+        // storage_len: usize
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        callee_args.push(values_vec_len);
+
+        // Load host function pointer from the vmcontext and then call that
+        // indirect function pointer with the list of arguments.
+        let host_fn = self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(offset).unwrap(),
+        );
+        let host_sig = self.builder.import_signature(host_sig);
+        self.builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &callee_args);
+
+        self.load_wasm_results(values_vec_ptr, values_vec_len);
+    }
+
     fn translate_lower_import(
         &mut self,
         index: LoweredIndex,
@@ -127,31 +227,10 @@ impl<'a> TrampolineCompiler<'a> {
         let pointer_type = self.isa.pointer_type();
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
-        let wasm_func_ty = &self.types[self.signature];
-
-        // More handling is necessary here if this changes
-        assert!(matches!(
-            NativeRet::classify(pointer_type, wasm_func_ty),
-            NativeRet::Bare
-        ));
 
         // Start off by spilling all the wasm arguments into a stack slot to be
         // passed to the host function.
-        let (values_vec_ptr, values_vec_len) = match self.abi {
-            Abi::Wasm | Abi::Native => {
-                let (ptr, len) = self.compiler.allocate_stack_array_and_spill_args(
-                    wasm_func_ty,
-                    &mut self.builder,
-                    &args[2..],
-                );
-                let len = self.builder.ins().iconst(pointer_type, i64::from(len));
-                (ptr, len)
-            }
-            Abi::Array => {
-                let params = self.builder.func.dfg.block_params(self.block0);
-                (params[2], params[3])
-            }
-        };
+        let (values_vec_ptr, values_vec_len) = self.store_wasm_arguments(&args[2..]);
 
         // Below this will incrementally build both the signature of the host
         // function we're calling as well as the list of arguments since the
@@ -165,6 +244,7 @@ impl<'a> TrampolineCompiler<'a> {
             realloc,
             post_return,
             string_encoding,
+            async_,
         } = *options;
 
         // vmctx: *mut VMComponentContext
@@ -233,6 +313,14 @@ impl<'a> TrampolineCompiler<'a> {
                 .iconst(ir::types::I8, i64::from(string_encoding as u8)),
         );
 
+        // async_: bool
+        host_sig.params.push(ir::AbiParam::new(ir::types::I8));
+        callee_args.push(
+            self.builder
+                .ins()
+                .iconst(ir::types::I8, if async_ { 1 } else { 0 }),
+        );
+
         // storage: *mut ValRaw
         host_sig.params.push(ir::AbiParam::new(pointer_type));
         callee_args.push(values_vec_ptr);
@@ -254,22 +342,7 @@ impl<'a> TrampolineCompiler<'a> {
             .ins()
             .call_indirect(host_sig, host_fn, &callee_args);
 
-        match self.abi {
-            Abi::Wasm | Abi::Native => {
-                // After the host function has returned the results are loaded from
-                // `values_vec_ptr` and then returned.
-                let results = self.compiler.load_values_from_array(
-                    wasm_func_ty.returns(),
-                    &mut self.builder,
-                    values_vec_ptr,
-                    values_vec_len,
-                );
-                self.builder.ins().return_(&results);
-            }
-            Abi::Array => {
-                self.builder.ins().return_(&[]);
-            }
-        }
+        self.load_wasm_results(values_vec_ptr, values_vec_len);
     }
 
     fn translate_resource_new(&mut self, resource: TypeResourceTableIndex) {

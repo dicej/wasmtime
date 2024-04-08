@@ -201,6 +201,7 @@ mod kw {
     syn::custom_keyword!(with);
     syn::custom_keyword!(except_imports);
     syn::custom_keyword!(only_imports);
+    syn::custom_keyword!(concurrent);
 }
 
 enum Opt {
@@ -237,7 +238,9 @@ impl Parse for Opt {
         } else if l.peek(Token![async]) {
             let span = input.parse::<Token![async]>()?.span;
             input.parse::<Token![:]>()?;
-            if input.peek(syn::LitBool) {
+            if input.peek(kw::concurrent) {
+                Ok(Opt::Async(AsyncConfig::Concurrent, span))
+            } else if input.peek(syn::LitBool) {
                 match input.parse::<syn::LitBool>()?.value {
                     true => Ok(Opt::Async(AsyncConfig::All, span)),
                     false => Ok(Opt::Async(AsyncConfig::None, span)),

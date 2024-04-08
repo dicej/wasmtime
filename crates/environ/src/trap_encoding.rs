@@ -95,7 +95,9 @@ pub enum Trap {
     /// would have violated the reentrance rules of the component model,
     /// triggering a trap instead.
     CannotEnterComponent,
-    // if adding a variant here be sure to update the `check!` macro below
+
+    /// TODO: docs
+    NoAsyncResult, // if adding a variant here be sure to update the `check!` macro below
 }
 
 impl Trap {
@@ -128,6 +130,7 @@ impl Trap {
             AtomicWaitNonSharedMemory
             NullReference
             CannotEnterComponent
+            NoAsyncResult
         }
 
         None
@@ -155,6 +158,7 @@ impl fmt::Display for Trap {
             AtomicWaitNonSharedMemory => "atomic wait on non-shared memory",
             NullReference => "null reference",
             CannotEnterComponent => "cannot enter component instance",
+            NoAsyncResult => "async-lifted export failed to produce a result",
         };
         write!(f, "wasm trap: {desc}")
     }

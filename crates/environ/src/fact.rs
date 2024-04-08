@@ -123,6 +123,7 @@ struct Options {
     /// An optionally-specified function to be used to allocate space for
     /// types such as strings as they go into a module.
     realloc: Option<FuncIndex>,
+    async_: bool,
 }
 
 enum Context {
@@ -249,6 +250,7 @@ impl<'a> Module<'a> {
             memory64,
             realloc,
             post_return: _, // handled above
+            async_,
         } = options;
         let flags = self.import_global(
             "flags",
@@ -296,6 +298,7 @@ impl<'a> Module<'a> {
                 memory64: *memory64,
                 memory,
                 realloc,
+                async_: *async_,
             },
         }
     }

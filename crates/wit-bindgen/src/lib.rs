@@ -125,6 +125,7 @@ pub enum AsyncConfig {
     None,
     /// All generated functions should be `async`.
     All,
+    Concurrent,
     /// These imported functions should not be async, but everything else is.
     AllExceptImports(HashSet<String>),
     /// These functions are the only imports that are async, all other imports
@@ -138,7 +139,7 @@ impl AsyncConfig {
     pub fn is_import_async(&self, f: &str) -> bool {
         match self {
             AsyncConfig::None => false,
-            AsyncConfig::All => true,
+            AsyncConfig::All | AsyncConfig::Concurrent => true,
             AsyncConfig::AllExceptImports(set) => !set.contains(f),
             AsyncConfig::OnlyImports(set) => set.contains(f),
         }
@@ -147,9 +148,10 @@ impl AsyncConfig {
     pub fn maybe_async(&self) -> bool {
         match self {
             AsyncConfig::None => false,
-            AsyncConfig::All | AsyncConfig::AllExceptImports(_) | AsyncConfig::OnlyImports(_) => {
-                true
-            }
+            AsyncConfig::All
+            | AsyncConfig::Concurrent
+            | AsyncConfig::AllExceptImports(_)
+            | AsyncConfig::OnlyImports(_) => true,
         }
     }
 }
@@ -1756,7 +1758,7 @@ impl<'a> InterfaceGenerator<'a> {
         self.src.push_str(") : (");
 
         for (_, ty) in func.params.iter() {
-            // Lift is required to be impled for this type, so we can't use
+            // Lift is required to be implied for this type, so we can't use
             // a borrowed type:
             self.print_ty(ty, TypeMode::Owned);
             self.src.push_str(", ");
@@ -1975,12 +1977,8 @@ impl<'a> InterfaceGenerator<'a> {
         self.src.push_str(") -> wasmtime::Result<");
         self.print_result_ty(&func.results, TypeMode::Owned);
 
-        if is_async {
-            self.src
-                .push_str("> where <S as wasmtime::AsContext>::Data: Send {\n");
-        } else {
-            self.src.push_str("> {\n");
-        }
+        self.src
+            .push_str("> where <S as wasmtime::AsContext>::Data: Send + 'static {\n");
 
         if self.gen.opts.tracing {
             let ns = match ns {

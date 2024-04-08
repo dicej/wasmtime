@@ -264,6 +264,8 @@ pub enum Trampoline {
     ResourceNew(TypeResourceTableIndex),
     ResourceRep(TypeResourceTableIndex),
     ResourceDrop(TypeResourceTableIndex),
+    AsyncStart(TypeFuncIndex),
+    AsyncReturn(TypeFuncIndex),
     ResourceTransferOwn,
     ResourceTransferBorrow,
     ResourceEnterCall,
@@ -279,6 +281,7 @@ pub struct CanonicalOptions {
     pub memory: Option<MemoryId>,
     pub realloc: Option<ReallocId>,
     pub post_return: Option<PostReturnId>,
+    pub async_: bool,
 }
 
 /// Same as `info::Resource`
@@ -519,6 +522,7 @@ impl LinearizeDfg<'_> {
             memory,
             realloc,
             post_return,
+            async_: options.async_,
         }
     }
 
@@ -598,6 +602,8 @@ impl LinearizeDfg<'_> {
             Trampoline::ResourceNew(ty) => info::Trampoline::ResourceNew(*ty),
             Trampoline::ResourceDrop(ty) => info::Trampoline::ResourceDrop(*ty),
             Trampoline::ResourceRep(ty) => info::Trampoline::ResourceRep(*ty),
+            Trampoline::AsyncStart(ty) => info::Trampoline::AsyncStart(*ty),
+            Trampoline::AsyncReturn(ty) => info::Trampoline::AsyncReturn(*ty),
             Trampoline::ResourceTransferOwn => info::Trampoline::ResourceTransferOwn,
             Trampoline::ResourceTransferBorrow => info::Trampoline::ResourceTransferBorrow,
             Trampoline::ResourceEnterCall => info::Trampoline::ResourceEnterCall,

@@ -154,7 +154,15 @@ where
     /// Panics if this is called on a function in an asynchronous store. This
     /// only works with functions defined within a synchonous store. Also
     /// panics if `store` does not own this function.
-    pub fn call(&self, store: impl AsContextMut, params: Params) -> Result<Return> {
+    pub fn call<T: Send + 'static>(
+        &self,
+        store: impl AsContextMut<Data = T>,
+        params: Params,
+    ) -> Result<Return>
+    where
+        Params: Send + Sync + 'static,
+        Return: Send + Sync + 'static,
+    {
         assert!(
             !store.as_context().async_support(),
             "must use `call_async` when async support is enabled on the config"
@@ -171,15 +179,14 @@ where
     /// panics if `store` does not own this function.
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
-    pub async fn call_async<T>(
+    pub async fn call_async<T: Send + 'static>(
         &self,
         mut store: impl AsContextMut<Data = T>,
         params: Params,
     ) -> Result<Return>
     where
-        T: Send,
-        Params: Send + Sync,
-        Return: Send + Sync,
+        Params: Send + Sync + 'static,
+        Return: Send + Sync + 'static,
     {
         let mut store = store.as_context_mut();
         assert!(
@@ -191,8 +198,53 @@ where
             .await?
     }
 
-    fn call_impl(&self, mut store: impl AsContextMut, params: Params) -> Result<Return> {
+    fn call_impl<T: Send + 'static>(
+        &self,
+        mut store: impl AsContextMut<Data = T>,
+        params: Params,
+    ) -> Result<Return>
+    where
+        Params: Send + Sync + 'static,
+        Return: Send + Sync + 'static,
+    {
         let store = &mut store.as_context_mut();
+
+        if store.0[self.func.0].options.async_() {
+            return if Params::flatten_count() <= MAX_FLAT_RESULTS {
+                if Return::flatten_count() <= MAX_FLAT_PARAMS {
+                    self.func.call_raw_async(
+                        store,
+                        params,
+                        Self::lower_stack_args,
+                        Self::lift_stack_result,
+                    )
+                } else {
+                    self.func.call_raw_async(
+                        store,
+                        params,
+                        Self::lower_stack_args,
+                        Self::lift_heap_result,
+                    )
+                }
+            } else {
+                if Return::flatten_count() <= MAX_FLAT_PARAMS {
+                    self.func.call_raw_async(
+                        store,
+                        params,
+                        Self::lower_heap_args,
+                        Self::lift_stack_result,
+                    )
+                } else {
+                    self.func.call_raw_async(
+                        store,
+                        params,
+                        Self::lower_heap_args,
+                        Self::lift_heap_result,
+                    )
+                }
+            };
+        }
+
         // Note that this is in theory simpler than it might read at this time.
         // Here we're doing a runtime dispatch on the `flatten_count` for the
         // params/results to see whether they're inbounds. This creates 4 cases
