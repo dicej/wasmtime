@@ -194,6 +194,14 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
             // Similarly, the `async-return` function may write its result to
             // global variables from which the adapter function can read and
             // return them via the stack to the caller.
+            //
+            // TODO: More than one of these calls can be made from the same
+            // instance concurrently when the caller instance was itself called
+            // via a async-without-callback-lifted export.  In that case, these
+            // globals could be clobbered by other calls between when we write
+            // to them and read from them.  We need to refactor this to save the
+            // values in host-managed, task-local storage rather than global
+            // variables.
             let lower_sig = module.types.signature(&adapter.lower, Context::Lower);
             let param_globals = if lower_sig.params_indirect {
                 None
@@ -440,7 +448,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             i32::try_from(adapter.lower.instance.as_u32()).unwrap(),
         ));
         self.instruction(I32Const(
-            i32::try_from(self.types[adapter.lift.ty].params.as_u32()).unwrap(),
+            i32::try_from(self.types[adapter.lift.ty].results.as_u32()).unwrap(),
         ));
         self.instruction(LocalGet(0));
         self.instruction(LocalGet(1));
@@ -495,7 +503,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             i32::try_from(adapter.lower.instance.as_u32()).unwrap(),
         ));
         self.instruction(I32Const(
-            i32::try_from(self.types[adapter.lift.ty].params.as_u32()).unwrap(),
+            i32::try_from(self.types[adapter.lift.ty].results.as_u32()).unwrap(),
         ));
 
         let results_local = if let Some(globals) = param_globals {
@@ -575,7 +583,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             i32::try_from(adapter.lower.instance.as_u32()).unwrap(),
         ));
         self.instruction(I32Const(
-            i32::try_from(self.types[adapter.lift.ty].params.as_u32()).unwrap(),
+            i32::try_from(self.types[adapter.lift.ty].results.as_u32()).unwrap(),
         ));
         self.instruction(LocalGet(0));
         self.instruction(LocalGet(1));

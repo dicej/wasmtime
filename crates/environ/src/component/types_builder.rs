@@ -429,6 +429,11 @@ impl ComponentTypesBuilder {
         Ok(ret)
     }
 
+    /// Retrieve Wasmtime's type representation of the `error-context` type.
+    pub fn error_context_type(&mut self) -> Result<TypeComponentLocalErrorContextTableIndex> {
+        self.error_context_table_type()
+    }
+
     pub(crate) fn valtype(
         &mut self,
         types: TypesRef<'_>,
