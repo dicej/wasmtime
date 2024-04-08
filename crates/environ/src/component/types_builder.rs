@@ -443,6 +443,11 @@ impl ComponentTypesBuilder {
         Ok(ret)
     }
 
+    /// Retrieve Wasmtime's type representation of the `error-context` type.
+    pub fn error_context_type(&mut self) -> Result<TypeComponentLocalErrorContextTableIndex> {
+        self.error_context_table_type()
+    }
+
     fn valtype(&mut self, types: TypesRef<'_>, ty: &ComponentValType) -> Result<InterfaceType> {
         assert_eq!(types.id(), self.module_types.validator_id());
         match ty {

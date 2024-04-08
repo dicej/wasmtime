@@ -1,3 +1,4 @@
+use crate::component::concurrent;
 use crate::component::func::HostFunc;
 use crate::component::matching::InstanceType;
 use crate::component::{
@@ -48,7 +49,7 @@ pub(crate) struct InstanceData {
     // of the component can be thrown away (theoretically).
     component: Component,
 
-    state: OwnedComponentInstance,
+    pub(crate) state: OwnedComponentInstance,
 
     /// Arguments that this instance used to be instantiated.
     ///
@@ -515,6 +516,36 @@ impl<'a> Instantiator<'a> {
     fn run<T>(&mut self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
         let env_component = self.component.env_component();
 
+        self.data.state.set_async_callbacks(
+            concurrent::task_backpressure::<T>,
+            concurrent::task_return::<T>,
+            concurrent::task_wait::<T>,
+            concurrent::task_poll::<T>,
+            concurrent::task_yield::<T>,
+            concurrent::subtask_drop::<T>,
+            concurrent::async_enter::<T>,
+            concurrent::async_exit::<T>,
+            concurrent::future_new::<T>,
+            concurrent::future_write::<T>,
+            concurrent::future_read::<T>,
+            concurrent::future_cancel_write::<T>,
+            concurrent::future_cancel_read::<T>,
+            concurrent::future_close_writable::<T>,
+            concurrent::future_close_readable::<T>,
+            concurrent::stream_new::<T>,
+            concurrent::stream_write::<T>,
+            concurrent::stream_read::<T>,
+            concurrent::stream_cancel_write::<T>,
+            concurrent::stream_cancel_read::<T>,
+            concurrent::stream_close_writable::<T>,
+            concurrent::stream_close_readable::<T>,
+            concurrent::flat_stream_write::<T>,
+            concurrent::flat_stream_read::<T>,
+            concurrent::error_context_new::<T>,
+            concurrent::error_context_debug_message::<T>,
+            concurrent::error_context_drop::<T>,
+        );
+
         // Before all initializers are processed configure all destructors for
         // host-defined resources. No initializer will correspond to these and
         // it's required to happen before they're needed, so execute this first.
@@ -608,8 +639,7 @@ impl<'a> Instantiator<'a> {
                 }
 
                 GlobalInitializer::ExtractCallback(callback) => {
-                    _ = callback;
-                    todo!()
+                    self.extract_callback(store.0, callback)
                 }
 
                 GlobalInitializer::ExtractPostReturn(post_return) => {
@@ -657,6 +687,16 @@ impl<'a> Instantiator<'a> {
             _ => unreachable!(),
         };
         self.data.state.set_runtime_realloc(realloc.index, func_ref);
+    }
+
+    fn extract_callback(&mut self, store: &mut StoreOpaque, callback: &ExtractCallback) {
+        let func_ref = match self.data.lookup_def(store, &callback.def) {
+            crate::runtime::vm::Export::Function(f) => f.func_ref,
+            _ => unreachable!(),
+        };
+        self.data
+            .state
+            .set_runtime_callback(callback.index, func_ref);
     }
 
     fn extract_post_return(&mut self, store: &mut StoreOpaque, post_return: &ExtractPostReturn) {
@@ -821,12 +861,24 @@ impl<T> InstancePre<T> {
     where
         T: Send,
     {
-        let mut store = store.as_context_mut();
+        let store = store.as_context_mut();
         assert!(
             store.0.async_support(),
             "must use sync instantiation when async support is disabled"
         );
-        store.on_fiber(|store| self.instantiate_impl(store)).await?
+        #[cfg(feature = "component-model-async")]
+        {
+            // TODO: do we need to return the store here due to the possible
+            // invalidation of the reference we were passed?
+            concurrent::on_fiber(store, None, move |store| self.instantiate_impl(store))
+                .await?
+                .0
+        }
+        #[cfg(not(feature = "component-model-async"))]
+        {
+            let mut store = store;
+            store.on_fiber(|store| self.instantiate_impl(store)).await?
+        }
     }
 
     fn instantiate_impl(&self, mut store: impl AsContextMut<Data = T>) -> Result<Instance> {
