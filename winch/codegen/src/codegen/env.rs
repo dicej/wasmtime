@@ -334,7 +334,7 @@ impl<'a, 'translation, 'data, P: PtrSize> FuncEnv<'a, 'translation, 'data, P> {
         match callee {
             Callee::Local(idx) | Callee::Import(idx) => {
                 let types = self.translation.get_types();
-                let ty = types[types.core_function_at(idx.as_u32())].unwrap_func();
+                let ty = types[types.as_ref().core_function_at(idx.as_u32())].unwrap_func();
                 let val = || {
                     let converter = TypeConverter::new(self.translation, self.types);
                     let ty = converter.convert_func_type(&ty);

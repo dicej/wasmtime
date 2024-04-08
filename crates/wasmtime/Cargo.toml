@@ -60,6 +60,7 @@ smallvec = { workspace = true, optional = true }
 hashbrown = { workspace = true }
 libm = "0.2.7"
 bitflags = { workspace = true }
+futures = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-sys]
 workspace = true

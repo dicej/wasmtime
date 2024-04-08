@@ -8,7 +8,7 @@ package wasi:io@0.2.1;
 @since(version = 0.2.0)
 interface streams {
     @since(version = 0.2.0)
-    use error.{error};
+    use %error.{%error};
     @since(version = 0.2.0)
     use poll.{pollable};
 

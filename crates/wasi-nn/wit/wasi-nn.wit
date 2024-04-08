@@ -61,13 +61,13 @@ interface tensor {
 /// A `graph` is a loaded instance of a specific ML model (e.g., MobileNet) for a specific ML
 /// framework (e.g., TensorFlow):
 interface graph {
-    use errors.{error};
+    use errors.{%error};
     use tensor.{tensor};
     use inference.{graph-execution-context};
 
     /// An execution graph for performing inference (i.e., a model).
     resource graph {
-        init-execution-context: func() -> result<graph-execution-context, error>;
+        init-execution-context: func() -> result<graph-execution-context, %error>;
     }
 
     /// Describes the encoding of the graph. This allows the API to be implemented by various
@@ -96,20 +96,20 @@ interface graph {
     type graph-builder = list<u8>;
 
     /// Load a `graph` from an opaque sequence of bytes to use for inference.
-    load: func(builder: list<graph-builder>, encoding: graph-encoding, target: execution-target) -> result<graph, error>;
+    load: func(builder: list<graph-builder>, encoding: graph-encoding, target: execution-target) -> result<graph, %error>;
 
     /// Load a `graph` by name.
     ///
     /// How the host expects the names to be passed and how it stores the graphs for retrieval via
     /// this function is **implementation-specific**. This allows hosts to choose name schemes that
     /// range from simple to complex (e.g., URLs?) and caching mechanisms of various kinds.
-    load-by-name: func(name: string) -> result<graph, error>;
+    load-by-name: func(name: string) -> result<graph, %error>;
 }
 
 /// An inference "session" is encapsulated by a `graph-execution-context`. This structure binds a
 /// `graph` to input tensors before `compute`-ing an inference:
 interface inference {
-    use errors.{error};
+    use errors.{%error};
     use tensor.{tensor, tensor-data};
 
     /// Bind a `graph` to the input and output tensors for an inference.
@@ -118,17 +118,17 @@ interface inference {
     /// (https://github.com/WebAssembly/wasi-nn/issues/43)
     resource graph-execution-context {
         /// Define the inputs to use for inference.
-        set-input: func(name: string, tensor: tensor) -> result<_, error>;
+        set-input: func(name: string, tensor: tensor) -> result<_, %error>;
 
         /// Compute the inference on the given inputs.
         ///
         /// Note the expected sequence of calls: `set-input`, `compute`, `get-output`. TODO: this
         /// expectation could be removed as a part of
         /// https://github.com/WebAssembly/wasi-nn/issues/43.
-        compute: func() -> result<_, error>;
+        compute: func() -> result<_, %error>;
 
         /// Extract the outputs after inference.
-        get-output: func(name: string) -> result<tensor, error>;
+        get-output: func(name: string) -> result<tensor, %error>;
     }
 }
 
@@ -156,7 +156,7 @@ interface errors {
         unknown
     }
 
-    resource error {
+    resource %error {
         /// Return the error code.
         code: func() -> error-code;
 

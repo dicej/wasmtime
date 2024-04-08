@@ -85,7 +85,9 @@ pub enum Trap {
     /// would have violated the reentrance rules of the component model,
     /// triggering a trap instead.
     CannotEnterComponent,
-    // if adding a variant here be sure to update the `check!` macro below
+
+    /// TODO: docs
+    NoAsyncResult, // if adding a variant here be sure to update the `check!` macro below
 }
 
 impl Trap {
@@ -120,6 +122,7 @@ impl Trap {
             ArrayOutOfBounds
             AllocationTooLarge
             CannotEnterComponent
+            NoAsyncResult
         }
 
         None
@@ -149,6 +152,7 @@ impl fmt::Display for Trap {
             ArrayOutOfBounds => "out of bounds array access",
             AllocationTooLarge => "allocation size too large",
             CannotEnterComponent => "cannot enter component instance",
+            NoAsyncResult => "async-lifted export failed to produce a result",
         };
         write!(f, "wasm trap: {desc}")
     }

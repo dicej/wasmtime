@@ -57,6 +57,8 @@ pub struct ComponentDfg {
     /// used by the host)
     pub reallocs: Intern<ReallocId, CoreDef>,
 
+    pub callbacks: Intern<CallbackId, CoreDef>,
+
     /// Same as `reallocs`, but for post-return.
     pub post_returns: Intern<PostReturnId, CoreDef>,
 
@@ -103,7 +105,7 @@ pub struct ComponentDfg {
     /// The values here are the module that the adapter is present within along
     /// as the core wasm index of the export corresponding to the lowered
     /// version of the adapter.
-    pub adapter_paritionings: PrimaryMap<AdapterId, (AdapterModuleId, EntityIndex)>,
+    pub adapter_partitionings: PrimaryMap<AdapterId, (AdapterModuleId, EntityIndex)>,
 
     /// Defined resources in this component sorted by index with metadata about
     /// each resource.
@@ -163,6 +165,7 @@ id! {
     pub struct InstanceId(u32);
     pub struct MemoryId(u32);
     pub struct ReallocId(u32);
+    pub struct CallbackId(u32);
     pub struct AdapterId(u32);
     pub struct PostReturnId(u32);
     pub struct AdapterModuleId(u32);
@@ -211,7 +214,7 @@ pub enum CoreDef {
     /// This is a special variant not present in `info::CoreDef` which
     /// represents that this definition refers to a fused adapter function. This
     /// adapter is fully processed after the initial translation and
-    /// identificatino of adapters.
+    /// identification of adapters.
     ///
     /// During translation into `info::CoreDef` this variant is erased and
     /// replaced by `info::CoreDef::Export` since adapters are always
@@ -269,10 +272,73 @@ pub enum Trampoline {
     ResourceNew(TypeResourceTableIndex),
     ResourceRep(TypeResourceTableIndex),
     ResourceDrop(TypeResourceTableIndex),
+    AsyncStart(TypeFuncIndex),
+    AsyncReturn(TypeFuncIndex),
+    FutureNew {
+        ty: TypeFutureTableIndex,
+        memory: MemoryId,
+    },
+    FutureSend {
+        ty: TypeFutureTableIndex,
+        options: CanonicalOptions,
+    },
+    FutureReceive {
+        ty: TypeFutureTableIndex,
+        options: CanonicalOptions,
+    },
+    FutureDropSender {
+        ty: TypeFutureTableIndex,
+    },
+    FutureDropReceiver {
+        ty: TypeFutureTableIndex,
+    },
+    StreamNew {
+        ty: TypeStreamTableIndex,
+        memory: MemoryId,
+    },
+    StreamSend {
+        ty: TypeStreamTableIndex,
+        options: CanonicalOptions,
+    },
+    StreamReceive {
+        ty: TypeStreamTableIndex,
+        options: CanonicalOptions,
+    },
+    StreamDropSender {
+        ty: TypeStreamTableIndex,
+    },
+    StreamDropReceiver {
+        ty: TypeStreamTableIndex,
+    },
+    ErrorDrop {
+        ty: TypeErrorTableIndex,
+    },
+    TaskWait {
+        memory: MemoryId,
+    },
     ResourceTransferOwn,
     ResourceTransferBorrow,
     ResourceEnterCall,
     ResourceExitCall,
+    AsyncEnterCall,
+    AsyncExitCall(Option<CallbackId>),
+    FutureTransfer,
+    StreamTransfer,
+    ErrorTransfer,
+}
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct FutureInfo {
+    pub instance: RuntimeComponentInstanceIndex,
+    pub payload_type: Option<InterfaceType>,
+}
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct StreamInfo {
+    pub instance: RuntimeComponentInstanceIndex,
+    pub payload_type: InterfaceType,
 }
 
 /// Same as `info::CanonicalOptions`
@@ -283,7 +349,9 @@ pub struct CanonicalOptions {
     pub string_encoding: StringEncoding,
     pub memory: Option<MemoryId>,
     pub realloc: Option<ReallocId>,
+    pub callback: Option<CallbackId>,
     pub post_return: Option<PostReturnId>,
+    pub async_: bool,
 }
 
 /// Same as `info::Resource`
@@ -348,7 +416,7 @@ impl<K: EntityRef, V> Default for Intern<K, V> {
 
 impl ComponentDfg {
     /// Consumes the intermediate `ComponentDfg` to produce a final `Component`
-    /// with a linear innitializer list.
+    /// with a linear initializer list.
     pub fn finish(
         self,
         wasmtime_types: &mut ComponentTypesBuilder,
@@ -360,6 +428,7 @@ impl ComponentDfg {
             runtime_memories: Default::default(),
             runtime_post_return: Default::default(),
             runtime_reallocs: Default::default(),
+            runtime_callbacks: Default::default(),
             runtime_instances: Default::default(),
             num_lowerings: 0,
             trampolines: Default::default(),
@@ -400,6 +469,7 @@ impl ComponentDfg {
                 num_runtime_memories: linearize.runtime_memories.len() as u32,
                 num_runtime_post_returns: linearize.runtime_post_return.len() as u32,
                 num_runtime_reallocs: linearize.runtime_reallocs.len() as u32,
+                num_runtime_callbacks: linearize.runtime_callbacks.len() as u32,
                 num_runtime_instances: linearize.runtime_instances.len() as u32,
                 imports: self.imports,
                 import_types: self.import_types,
@@ -431,6 +501,7 @@ struct LinearizeDfg<'a> {
     trampoline_map: HashMap<TrampolineIndex, TrampolineIndex>,
     runtime_memories: HashMap<MemoryId, RuntimeMemoryIndex>,
     runtime_reallocs: HashMap<ReallocId, RuntimeReallocIndex>,
+    runtime_callbacks: HashMap<CallbackId, RuntimeCallbackIndex>,
     runtime_post_return: HashMap<PostReturnId, RuntimePostReturnIndex>,
     runtime_instances: HashMap<RuntimeInstance, RuntimeInstanceIndex>,
     num_lowerings: u32,
@@ -539,13 +610,16 @@ impl LinearizeDfg<'_> {
     fn options(&mut self, options: &CanonicalOptions) -> info::CanonicalOptions {
         let memory = options.memory.map(|mem| self.runtime_memory(mem));
         let realloc = options.realloc.map(|mem| self.runtime_realloc(mem));
+        let callback = options.callback.map(|mem| self.runtime_callback(mem));
         let post_return = options.post_return.map(|mem| self.runtime_post_return(mem));
         info::CanonicalOptions {
             instance: options.instance,
             string_encoding: options.string_encoding,
             memory,
             realloc,
+            callback,
             post_return,
+            async_: options.async_,
         }
     }
 
@@ -564,6 +638,15 @@ impl LinearizeDfg<'_> {
             |me| &mut me.runtime_reallocs,
             |me, realloc| me.core_def(&me.dfg.reallocs[realloc]),
             |index, def| GlobalInitializer::ExtractRealloc(ExtractRealloc { index, def }),
+        )
+    }
+
+    fn runtime_callback(&mut self, callback: CallbackId) -> RuntimeCallbackIndex {
+        self.intern(
+            callback,
+            |me| &mut me.runtime_callbacks,
+            |me, callback| me.core_def(&me.dfg.callbacks[callback]),
+            |index, def| GlobalInitializer::ExtractCallback(ExtractCallback { index, def }),
         )
     }
 
@@ -625,10 +708,55 @@ impl LinearizeDfg<'_> {
             Trampoline::ResourceNew(ty) => info::Trampoline::ResourceNew(*ty),
             Trampoline::ResourceDrop(ty) => info::Trampoline::ResourceDrop(*ty),
             Trampoline::ResourceRep(ty) => info::Trampoline::ResourceRep(*ty),
+            Trampoline::AsyncStart(ty) => info::Trampoline::AsyncStart(*ty),
+            Trampoline::AsyncReturn(ty) => info::Trampoline::AsyncReturn(*ty),
+            Trampoline::FutureNew { ty, memory, .. } => info::Trampoline::FutureNew {
+                ty: *ty,
+                memory: self.runtime_memory(*memory),
+            },
+            Trampoline::FutureSend { ty, options } => info::Trampoline::FutureSend {
+                ty: *ty,
+                options: self.options(options),
+            },
+            Trampoline::FutureReceive { ty, options } => info::Trampoline::FutureReceive {
+                ty: *ty,
+                options: self.options(options),
+            },
+            Trampoline::FutureDropSender { ty } => info::Trampoline::FutureDropSender { ty: *ty },
+            Trampoline::FutureDropReceiver { ty } => {
+                info::Trampoline::FutureDropReceiver { ty: *ty }
+            }
+            Trampoline::StreamNew { ty, memory, .. } => info::Trampoline::StreamNew {
+                ty: *ty,
+                memory: self.runtime_memory(*memory),
+            },
+            Trampoline::StreamSend { ty, options } => info::Trampoline::StreamSend {
+                ty: *ty,
+                options: self.options(options),
+            },
+            Trampoline::StreamReceive { ty, options } => info::Trampoline::StreamReceive {
+                ty: *ty,
+                options: self.options(options),
+            },
+            Trampoline::StreamDropSender { ty } => info::Trampoline::StreamDropSender { ty: *ty },
+            Trampoline::StreamDropReceiver { ty } => {
+                info::Trampoline::StreamDropReceiver { ty: *ty }
+            }
+            Trampoline::ErrorDrop { ty } => info::Trampoline::ErrorDrop { ty: *ty },
+            Trampoline::TaskWait { memory } => info::Trampoline::TaskWait {
+                memory: self.runtime_memory(*memory),
+            },
             Trampoline::ResourceTransferOwn => info::Trampoline::ResourceTransferOwn,
             Trampoline::ResourceTransferBorrow => info::Trampoline::ResourceTransferBorrow,
             Trampoline::ResourceEnterCall => info::Trampoline::ResourceEnterCall,
             Trampoline::ResourceExitCall => info::Trampoline::ResourceExitCall,
+            Trampoline::AsyncEnterCall => info::Trampoline::AsyncEnterCall,
+            Trampoline::AsyncExitCall(callback) => {
+                info::Trampoline::AsyncExitCall(callback.map(|v| self.runtime_callback(v)))
+            }
+            Trampoline::FutureTransfer => info::Trampoline::FutureTransfer,
+            Trampoline::StreamTransfer => info::Trampoline::StreamTransfer,
+            Trampoline::ErrorTransfer => info::Trampoline::ErrorTransfer,
         };
         let i1 = self.trampolines.push(*signature);
         let i2 = self.trampoline_defs.push(trampoline);
@@ -650,7 +778,7 @@ impl LinearizeDfg<'_> {
     }
 
     fn adapter(&mut self, adapter: AdapterId) -> info::CoreExport<EntityIndex> {
-        let (adapter_module, entity_index) = self.dfg.adapter_paritionings[adapter];
+        let (adapter_module, entity_index) = self.dfg.adapter_partitionings[adapter];
 
         // Instantiates the adapter module if it hasn't already been
         // instantiated or otherwise returns the index that the module was

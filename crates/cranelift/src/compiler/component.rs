@@ -2,7 +2,7 @@
 
 use crate::{compiler::Compiler, TRAP_ALWAYS, TRAP_CANNOT_ENTER, TRAP_INTERNAL_ASSERT};
 use anyhow::Result;
-use cranelift_codegen::ir::{self, InstBuilder, MemFlags};
+use cranelift_codegen::ir::{self, InstBuilder, MemFlags, Value};
 use cranelift_codegen::isa::{CallConv, TargetIsa};
 use cranelift_frontend::FunctionBuilder;
 use std::any::Any;
@@ -20,6 +20,12 @@ struct TrampolineCompiler<'a> {
     block0: ir::Block,
     signature: ModuleInternedTypeIndex,
     tunables: &'a Tunables,
+}
+
+enum Options<'a> {
+    None,
+    Memory(RuntimeMemoryIndex),
+    Any(&'a CanonicalOptions),
 }
 
 #[derive(Copy, Clone)]
@@ -96,19 +102,346 @@ impl<'a> TrampolineCompiler<'a> {
             Trampoline::ResourceNew(ty) => self.translate_resource_new(*ty),
             Trampoline::ResourceRep(ty) => self.translate_resource_rep(*ty),
             Trampoline::ResourceDrop(ty) => self.translate_resource_drop(*ty),
+            Trampoline::AsyncStart(ty) => {
+                self.translate_async_start_or_return(*ty, self.offsets.async_start())
+            }
+            Trampoline::AsyncReturn(ty) => {
+                self.translate_async_start_or_return(*ty, self.offsets.async_return())
+            }
+            Trampoline::FutureNew { ty, memory } => self.translate_future_or_stream_call(
+                ty.as_u32(),
+                Options::Memory(*memory),
+                self.offsets.future_new(),
+                vec![ir::AbiParam::new(ir::types::I32)],
+                Vec::new(),
+            ),
+            Trampoline::FutureSend { ty, options } => self.translate_future_or_stream_call(
+                ty.as_u32(),
+                Options::Any(options),
+                self.offsets.future_send(),
+                vec![
+                    ir::AbiParam::new(ir::types::I32),
+                    ir::AbiParam::new(ir::types::I32),
+                    ir::AbiParam::new(ir::types::I32),
+                ],
+                vec![ir::AbiParam::new(ir::types::I32)],
+            ),
+            Trampoline::FutureReceive { ty, options } => self.translate_future_or_stream_call(
+                ty.as_u32(),
+                Options::Any(&options),
+                self.offsets.future_receive(),
+                vec![
+                    ir::AbiParam::new(ir::types::I32),
+                    ir::AbiParam::new(ir::types::I32),
+                    ir::AbiParam::new(ir::types::I32),
+                ],
+                vec![ir::AbiParam::new(ir::types::I32)],
+            ),
+            Trampoline::FutureDropSender { ty } => self.translate_future_or_stream_call(
+                ty.as_u32(),
+                Options::None,
+                self.offsets.future_drop_sender(),
+                vec![ir::AbiParam::new(ir::types::I32)],
+                Vec::new(),
+            ),
+            Trampoline::FutureDropReceiver { ty } => self.translate_future_or_stream_call(
+                ty.as_u32(),
+                Options::None,
+                self.offsets.future_drop_receiver(),
+                vec![ir::AbiParam::new(ir::types::I32)],
+                Vec::new(),
+            ),
+            Trampoline::StreamNew { ty, memory } => self.translate_future_or_stream_call(
+                ty.as_u32(),
+                Options::Memory(*memory),
+                self.offsets.stream_new(),
+                vec![ir::AbiParam::new(ir::types::I32)],
+                Vec::new(),
+            ),
+            Trampoline::StreamSend { ty, options } => {
+                if let Some(info) = self.flat_stream_element_info(*ty) {
+                    self.translate_flat_stream_call(
+                        *ty,
+                        options,
+                        self.offsets.flat_stream_send(),
+                        &info,
+                    )
+                } else {
+                    self.translate_future_or_stream_call(
+                        ty.as_u32(),
+                        Options::Any(options),
+                        self.offsets.stream_send(),
+                        vec![
+                            ir::AbiParam::new(ir::types::I32),
+                            ir::AbiParam::new(ir::types::I32),
+                            ir::AbiParam::new(ir::types::I32),
+                        ],
+                        vec![ir::AbiParam::new(ir::types::I32)],
+                    )
+                }
+            }
+            Trampoline::StreamReceive { ty, options } => {
+                if let Some(info) = self.flat_stream_element_info(*ty) {
+                    self.translate_flat_stream_call(
+                        *ty,
+                        options,
+                        self.offsets.flat_stream_receive(),
+                        &info,
+                    )
+                } else {
+                    self.translate_future_or_stream_call(
+                        ty.as_u32(),
+                        Options::Any(options),
+                        self.offsets.stream_receive(),
+                        vec![
+                            ir::AbiParam::new(ir::types::I32),
+                            ir::AbiParam::new(ir::types::I32),
+                            ir::AbiParam::new(ir::types::I32),
+                        ],
+                        vec![ir::AbiParam::new(ir::types::I32)],
+                    )
+                }
+            }
+            Trampoline::StreamDropSender { ty } => self.translate_future_or_stream_call(
+                ty.as_u32(),
+                Options::None,
+                self.offsets.stream_drop_sender(),
+                vec![ir::AbiParam::new(ir::types::I32)],
+                Vec::new(),
+            ),
+            Trampoline::StreamDropReceiver { ty } => self.translate_future_or_stream_call(
+                ty.as_u32(),
+                Options::None,
+                self.offsets.stream_drop_receiver(),
+                vec![ir::AbiParam::new(ir::types::I32)],
+                Vec::new(),
+            ),
+            Trampoline::ErrorDrop { ty } => self.translate_error_drop_call(*ty),
+            Trampoline::TaskWait { memory } => self.translate_task_wait_call(*memory),
             Trampoline::ResourceTransferOwn => {
-                self.translate_resource_libcall(host::resource_transfer_own)
+                self.translate_host_libcall(host::resource_transfer_own)
             }
             Trampoline::ResourceTransferBorrow => {
-                self.translate_resource_libcall(host::resource_transfer_borrow)
+                self.translate_host_libcall(host::resource_transfer_borrow)
             }
-            Trampoline::ResourceEnterCall => {
-                self.translate_resource_libcall(host::resource_enter_call)
+            Trampoline::ResourceEnterCall => self.translate_host_libcall(host::resource_enter_call),
+            Trampoline::ResourceExitCall => self.translate_host_libcall(host::resource_exit_call),
+            Trampoline::AsyncEnterCall => {
+                let pointer_type = self.isa.pointer_type();
+                self.translate_async_enter_or_exit(
+                    self.offsets.async_enter(),
+                    None,
+                    vec![
+                        ir::AbiParam::new(pointer_type),
+                        ir::AbiParam::new(pointer_type),
+                        ir::AbiParam::new(pointer_type),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                    ],
+                    Vec::new(),
+                )
             }
-            Trampoline::ResourceExitCall => {
-                self.translate_resource_libcall(host::resource_exit_call)
+            Trampoline::AsyncExitCall(callback) => {
+                let pointer_type = self.isa.pointer_type();
+                self.translate_async_enter_or_exit(
+                    self.offsets.async_exit(),
+                    Some(*callback),
+                    vec![
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(pointer_type),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                    ],
+                    vec![ir::AbiParam::new(ir::types::I32)],
+                )
+            }
+            Trampoline::FutureTransfer => self.translate_host_libcall(host::future_transfer),
+            Trampoline::StreamTransfer => self.translate_host_libcall(host::stream_transfer),
+            Trampoline::ErrorTransfer => self.translate_host_libcall(host::error_transfer),
+        }
+    }
+
+    fn flat_stream_element_info(&self, ty: TypeStreamTableIndex) -> Option<CanonicalAbiInfo> {
+        let payload = self.types[self.types[ty].ty].payload;
+        match payload {
+            InterfaceType::Bool
+            | InterfaceType::S8
+            | InterfaceType::U8
+            | InterfaceType::S16
+            | InterfaceType::U16
+            | InterfaceType::S32
+            | InterfaceType::U32
+            | InterfaceType::S64
+            | InterfaceType::U64
+            | InterfaceType::Float32
+            | InterfaceType::Float64
+            | InterfaceType::Char => Some(self.types.canonical_abi(&payload).clone()),
+            // TODO: Recursively check for other "flat" types (i.e. those without pointers or handles),
+            // e.g. `record`s, `variant`s, etc. which contain only flat types.
+            _ => None,
+        }
+    }
+
+    fn store_wasm_arguments(&mut self, args: &[Value]) -> (Value, Value) {
+        let pointer_type = self.isa.pointer_type();
+        let wasm_func_ty = &self.types[self.signature].unwrap_func();
+
+        // Start off by spilling all the wasm arguments into a stack slot to be
+        // passed to the host function.
+        match self.abi {
+            Abi::Wasm => {
+                let (ptr, len) = self.compiler.allocate_stack_array_and_spill_args(
+                    wasm_func_ty,
+                    &mut self.builder,
+                    args,
+                );
+                let len = self.builder.ins().iconst(pointer_type, i64::from(len));
+                (ptr, len)
+            }
+            Abi::Array => {
+                let params = self.builder.func.dfg.block_params(self.block0);
+                (params[2], params[3])
             }
         }
+    }
+
+    fn load_wasm_results(&mut self, values_vec_ptr: Value, values_vec_len: Value) {
+        let wasm_func_ty = &self.types[self.signature].unwrap_func();
+
+        match self.abi {
+            Abi::Wasm => {
+                // After the host function has returned the results are loaded from
+                // `values_vec_ptr` and then returned.
+                let results = self.compiler.load_values_from_array(
+                    wasm_func_ty.returns(),
+                    &mut self.builder,
+                    values_vec_ptr,
+                    values_vec_len,
+                );
+                self.builder.ins().return_(&results);
+            }
+            Abi::Array => {
+                self.builder.ins().return_(&[]);
+            }
+        }
+    }
+
+    fn translate_async_start_or_return(&mut self, ty: TypeFuncIndex, offset: u32) {
+        let pointer_type = self.isa.pointer_type();
+        let args = self.builder.func.dfg.block_params(self.block0).to_vec();
+        let vmctx = args[0];
+
+        let (values_vec_ptr, values_vec_len) = self.store_wasm_arguments(&args[2..]);
+
+        let mut callee_args = Vec::new();
+        let mut host_sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
+
+        // vmctx: *mut VMComponentContext
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        callee_args.push(vmctx);
+
+        // ty: TypeFuncIndex,
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        callee_args.push(
+            self.builder
+                .ins()
+                .iconst(ir::types::I32, i64::from(ty.as_u32())),
+        );
+
+        // storage: *mut ValRaw
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        callee_args.push(values_vec_ptr);
+
+        // storage_len: usize
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        callee_args.push(values_vec_len);
+
+        // Load host function pointer from the vmcontext and then call that
+        // indirect function pointer with the list of arguments.
+        let host_fn = self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(offset).unwrap(),
+        );
+        let host_sig = self.builder.import_signature(host_sig);
+        self.builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &callee_args);
+
+        self.load_wasm_results(values_vec_ptr, values_vec_len);
+    }
+
+    fn translate_async_enter_or_exit(
+        &mut self,
+        offset: u32,
+        callback: Option<Option<RuntimeCallbackIndex>>,
+        params: Vec<ir::AbiParam>,
+        results: Vec<ir::AbiParam>,
+    ) {
+        match self.abi {
+            Abi::Wasm => {}
+
+            // These trampolines can only actually be called by Wasm, so
+            // let's assert that here.
+            Abi::Array => {
+                self.builder.ins().trap(TRAP_INTERNAL_ASSERT);
+                return;
+            }
+        }
+
+        let pointer_type = self.isa.pointer_type();
+        let args = self.builder.func.dfg.block_params(self.block0).to_vec();
+        let vmctx = args[0];
+
+        let mut callee_args = Vec::new();
+        let mut host_sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
+
+        // vmctx: *mut VMComponentContext
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        callee_args.push(vmctx);
+
+        if let Some(callback) = callback {
+            // callback: *mut VMFuncRef
+            host_sig.params.push(ir::AbiParam::new(pointer_type));
+            if let Some(callback) = callback {
+                callee_args.push(self.builder.ins().load(
+                    pointer_type,
+                    MemFlags::trusted(),
+                    vmctx,
+                    i32::try_from(self.offsets.runtime_callback(callback)).unwrap(),
+                ));
+            } else {
+                callee_args.push(self.builder.ins().iconst(pointer_type, 0));
+            }
+        }
+
+        // remaining parameters
+        host_sig.params.extend(params);
+        callee_args.extend(args[2..].iter().copied());
+
+        host_sig.returns.extend(results);
+
+        // Load host function pointer from the vmcontext and then call that
+        // indirect function pointer with the list of arguments.
+        let host_fn = self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(offset).unwrap(),
+        );
+        let host_sig = self.builder.import_signature(host_sig);
+        let call = self
+            .builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &callee_args);
+
+        let results = self.builder.func.dfg.inst_results(call).to_vec();
+        self.builder.ins().return_(&results);
     }
 
     fn translate_lower_import(
@@ -150,9 +483,13 @@ impl<'a> TrampolineCompiler<'a> {
             instance,
             memory,
             realloc,
+            callback,
             post_return,
             string_encoding,
+            async_,
         } = *options;
+
+        assert!(callback.is_none());
 
         // vmctx: *mut VMComponentContext
         host_sig.params.push(ir::AbiParam::new(pointer_type));
@@ -220,6 +557,14 @@ impl<'a> TrampolineCompiler<'a> {
                 .iconst(ir::types::I8, i64::from(string_encoding as u8)),
         );
 
+        // async_: bool
+        host_sig.params.push(ir::AbiParam::new(ir::types::I8));
+        callee_args.push(
+            self.builder
+                .ins()
+                .iconst(ir::types::I8, if async_ { 1 } else { 0 }),
+        );
+
         // storage: *mut ValRaw
         host_sig.params.push(ir::AbiParam::new(pointer_type));
         callee_args.push(values_vec_ptr);
@@ -241,22 +586,7 @@ impl<'a> TrampolineCompiler<'a> {
             .ins()
             .call_indirect(host_sig, host_fn, &callee_args);
 
-        match self.abi {
-            Abi::Wasm => {
-                // After the host function has returned the results are loaded from
-                // `values_vec_ptr` and then returned.
-                let results = self.compiler.load_values_from_array(
-                    wasm_func_ty.returns(),
-                    &mut self.builder,
-                    values_vec_ptr,
-                    values_vec_len,
-                );
-                self.builder.ins().return_(&results);
-            }
-            Abi::Array => {
-                self.builder.ins().return_(&[]);
-            }
-        }
+        self.load_wasm_results(values_vec_ptr, values_vec_len);
     }
 
     fn translate_always_trap(&mut self) {
@@ -535,7 +865,7 @@ impl<'a> TrampolineCompiler<'a> {
     ///
     /// Only intended for simple trampolines and effectively acts as a bridge
     /// from the wasm abi to host.
-    fn translate_resource_libcall(
+    fn translate_host_libcall(
         &mut self,
         get_libcall: fn(&dyn TargetIsa, &mut ir::Function) -> (ir::SigRef, u32),
     ) {
@@ -560,6 +890,296 @@ impl<'a> TrampolineCompiler<'a> {
             .builder
             .ins()
             .call_indirect(host_sig, host_fn, &host_args);
+        let results = self.builder.func.dfg.inst_results(call).to_vec();
+        self.builder.ins().return_(&results);
+    }
+
+    fn translate_future_or_stream_call(
+        &mut self,
+        ty: u32,
+        options: Options,
+        offset: u32,
+        params: Vec<ir::AbiParam>,
+        results: Vec<ir::AbiParam>,
+    ) {
+        match self.abi {
+            Abi::Wasm => {}
+
+            // These trampolines can only actually be called by Wasm, so
+            // let's assert that here.
+            Abi::Array => {
+                self.builder.ins().trap(TRAP_INTERNAL_ASSERT);
+                return;
+            }
+        }
+
+        let pointer_type = self.isa.pointer_type();
+        let args = self.builder.func.dfg.block_params(self.block0).to_vec();
+        let vmctx = args[0];
+        let mut host_args = vec![vmctx];
+        let mut host_sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+
+        let (memory, others) = match options {
+            Options::None => (None, None),
+            Options::Memory(memory) => (Some(memory), None),
+            Options::Any(options) => (
+                Some(options.memory.unwrap()),
+                Some((options.realloc, options.string_encoding)),
+            ),
+        };
+
+        if let Some(memory) = memory {
+            // memory: *mut VMMemoryDefinition
+            host_sig.params.push(ir::AbiParam::new(pointer_type));
+            host_args.push(self.builder.ins().load(
+                pointer_type,
+                MemFlags::trusted(),
+                vmctx,
+                i32::try_from(self.offsets.runtime_memory(memory)).unwrap(),
+            ));
+        }
+
+        if let Some((realloc, string_encoding)) = others {
+            // realloc: *mut VMFuncRef
+            host_sig.params.push(ir::AbiParam::new(pointer_type));
+            host_args.push(match realloc {
+                Some(idx) => self.builder.ins().load(
+                    pointer_type,
+                    MemFlags::trusted(),
+                    vmctx,
+                    i32::try_from(self.offsets.runtime_realloc(idx)).unwrap(),
+                ),
+                None => self.builder.ins().iconst(pointer_type, 0),
+            });
+
+            // string_encoding: StringEncoding
+            host_sig.params.push(ir::AbiParam::new(ir::types::I8));
+            host_args.push(
+                self.builder
+                    .ins()
+                    .iconst(ir::types::I8, i64::from(string_encoding as u8)),
+            );
+        }
+
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        host_args.push(self.builder.ins().iconst(ir::types::I32, i64::from(ty)));
+
+        host_sig.params.extend(params);
+        host_args.extend(args[2..].iter().copied());
+
+        host_sig.returns.extend(results);
+
+        // Load host function pointer from the vmcontext and then call that
+        // indirect function pointer with the list of arguments.
+        let host_fn = self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(offset).unwrap(),
+        );
+        let host_sig = self.builder.import_signature(host_sig);
+        let call = self
+            .builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &host_args);
+
+        let results = self.builder.func.dfg.inst_results(call).to_vec();
+        self.builder.ins().return_(&results);
+    }
+
+    fn translate_flat_stream_call(
+        &mut self,
+        ty: TypeStreamTableIndex,
+        options: &CanonicalOptions,
+        offset: u32,
+        info: &CanonicalAbiInfo,
+    ) {
+        match self.abi {
+            Abi::Wasm => {}
+
+            // These trampolines can only actually be called by Wasm, so
+            // let's assert that here.
+            Abi::Array => {
+                self.builder.ins().trap(TRAP_INTERNAL_ASSERT);
+                return;
+            }
+        }
+
+        let pointer_type = self.isa.pointer_type();
+        let args = self.builder.func.dfg.block_params(self.block0).to_vec();
+        let vmctx = args[0];
+        let mut host_args = vec![vmctx];
+        let mut host_sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+
+        // memory: *mut VMMemoryDefinition
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        host_args.push(self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(self.offsets.runtime_memory(options.memory.unwrap())).unwrap(),
+        ));
+
+        // realloc: *mut VMFuncRef
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        host_args.push(match options.realloc {
+            Some(idx) => self.builder.ins().load(
+                pointer_type,
+                MemFlags::trusted(),
+                vmctx,
+                i32::try_from(self.offsets.runtime_realloc(idx)).unwrap(),
+            ),
+            None => self.builder.ins().iconst(pointer_type, 0),
+        });
+
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        host_args.push(
+            self.builder
+                .ins()
+                .iconst(ir::types::I32, i64::from(ty.as_u32())),
+        );
+
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        host_args.push(
+            self.builder
+                .ins()
+                .iconst(ir::types::I32, i64::from(info.size32)),
+        );
+
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        host_args.push(
+            self.builder
+                .ins()
+                .iconst(ir::types::I32, i64::from(info.align32)),
+        );
+
+        host_sig.params.extend(vec![
+            ir::AbiParam::new(ir::types::I32),
+            ir::AbiParam::new(ir::types::I32),
+            ir::AbiParam::new(ir::types::I32),
+        ]);
+        host_args.extend(args[2..].iter().copied());
+
+        host_sig
+            .returns
+            .extend(vec![ir::AbiParam::new(ir::types::I32)]);
+
+        // Load host function pointer from the vmcontext and then call that
+        // indirect function pointer with the list of arguments.
+        let host_fn = self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(offset).unwrap(),
+        );
+        let host_sig = self.builder.import_signature(host_sig);
+        let call = self
+            .builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &host_args);
+
+        let results = self.builder.func.dfg.inst_results(call).to_vec();
+        self.builder.ins().return_(&results);
+    }
+
+    fn translate_error_drop_call(&mut self, ty: TypeErrorTableIndex) {
+        match self.abi {
+            Abi::Wasm => {}
+
+            // These trampolines can only actually be called by Wasm, so
+            // let's assert that here.
+            Abi::Array => {
+                self.builder.ins().trap(TRAP_INTERNAL_ASSERT);
+                return;
+            }
+        }
+
+        let pointer_type = self.isa.pointer_type();
+        let args = self.builder.func.dfg.block_params(self.block0).to_vec();
+        let vmctx = args[0];
+        let mut host_args = vec![vmctx];
+        let mut host_sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        host_args.push(
+            self.builder
+                .ins()
+                .iconst(ir::types::I32, i64::from(ty.as_u32())),
+        );
+
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        host_args.extend(args[2..].iter().copied());
+
+        // Load host function pointer from the vmcontext and then call that
+        // indirect function pointer with the list of arguments.
+        let offset = self.offsets.error_drop();
+        let host_fn = self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(offset).unwrap(),
+        );
+        let host_sig = self.builder.import_signature(host_sig);
+        let call = self
+            .builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &host_args);
+
+        let results = self.builder.func.dfg.inst_results(call).to_vec();
+        self.builder.ins().return_(&results);
+    }
+
+    fn translate_task_wait_call(&mut self, memory: RuntimeMemoryIndex) {
+        match self.abi {
+            Abi::Wasm => {}
+
+            // These trampolines can only actually be called by Wasm, so
+            // let's assert that here.
+            Abi::Array => {
+                self.builder.ins().trap(TRAP_INTERNAL_ASSERT);
+                return;
+            }
+        }
+
+        let pointer_type = self.isa.pointer_type();
+        let args = self.builder.func.dfg.block_params(self.block0).to_vec();
+        let vmctx = args[0];
+        let mut host_args = vec![vmctx];
+        let mut host_sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+
+        // memory: *mut VMMemoryDefinition
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        host_args.push(self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(self.offsets.runtime_memory(memory)).unwrap(),
+        ));
+
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        host_args.extend(args[2..].iter().copied());
+
+        host_sig.returns.push(ir::AbiParam::new(ir::types::I32));
+
+        // Load host function pointer from the vmcontext and then call that
+        // indirect function pointer with the list of arguments.
+        let offset = self.offsets.task_wait();
+        let host_fn = self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(offset).unwrap(),
+        );
+        let host_sig = self.builder.import_signature(host_sig);
+        let call = self
+            .builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &host_args);
+
         let results = self.builder.func.dfg.inst_results(call).to_vec();
         self.builder.ins().return_(&results);
     }

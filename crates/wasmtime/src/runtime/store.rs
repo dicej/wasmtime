@@ -76,6 +76,7 @@
 //! contents of `StoreOpaque`. This is an invariant that we, as the authors of
 //! `wasmtime`, must uphold for the public interface to be safe.
 
+use crate::component::concurrent::{self, ConcurrentState};
 use crate::hash_set::HashSet;
 use crate::instance::InstanceData;
 use crate::linker::Definition;
@@ -225,6 +226,8 @@ pub struct StoreInner<T> {
         Option<Box<dyn FnMut(StoreContextMut<T>) -> Result<UpdateDeadline> + Send + Sync>>,
     // for comments about `ManuallyDrop`, see `Store::into_data`
     data: ManuallyDrop<T>,
+    #[cfg(feature = "async")]
+    concurrent_state: ConcurrentState<T>,
 }
 
 enum ResourceLimiterInner<T> {
@@ -577,6 +580,8 @@ impl<T> Store<T> {
             call_hook: None,
             epoch_deadline_behavior: None,
             data: ManuallyDrop::new(data),
+            #[cfg(feature = "async")]
+            concurrent_state: Default::default(),
         });
 
         // Wasmtime uses the callee argument to host functions to learn about
@@ -1090,6 +1095,33 @@ impl<'a, T> StoreContextMut<'a, T> {
         self.0.data_mut()
     }
 
+    /// TODO: docs
+    #[cfg(feature = "async")]
+    pub async fn wait(self) -> Result<()>
+    where
+        T: Send + 'static,
+    {
+        concurrent::poll(self).await.map(drop)
+    }
+
+    /// TODO: docs
+    #[cfg(feature = "async")]
+    pub async fn wait_until<U>(self, future: impl Future<Output = U>) -> Result<U>
+    where
+        T: Send + 'static,
+    {
+        concurrent::poll_until(self, future).await.map(|(_, v)| v)
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn concurrent_state(&mut self) -> &mut ConcurrentState<T> {
+        self.0.concurrent_state()
+    }
+
+    pub(crate) fn has_pkey(&self) -> bool {
+        self.0.pkey.is_some()
+    }
+
     /// Returns the underlying [`Engine`] this store is connected to.
     pub fn engine(&self) -> &Engine {
         self.0.engine()
@@ -1173,6 +1205,11 @@ impl<T> StoreInner<T> {
     #[inline]
     fn data_mut(&mut self) -> &mut T {
         &mut self.data
+    }
+
+    #[cfg(feature = "async")]
+    fn concurrent_state(&mut self) -> &mut ConcurrentState<T> {
+        &mut self.concurrent_state
     }
 
     #[inline]

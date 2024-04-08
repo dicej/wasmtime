@@ -1,15 +1,17 @@
+use crate::component::concurrent;
 use crate::component::instance::{Instance, InstanceData};
-use crate::component::storage::storage_as_slice;
+use crate::component::storage::{slice_to_storage, slice_to_storage_mut, storage_as_slice};
 use crate::component::types::Type;
 use crate::component::values::Val;
 use crate::prelude::*;
 use crate::runtime::vm::component::ResourceTables;
-use crate::runtime::vm::{Export, ExportFunction};
+use crate::runtime::vm::{Export, ExportFunction, VMStore};
 use crate::store::{StoreOpaque, Stored};
 use crate::{AsContext, AsContextMut, StoreContextMut, ValRaw};
 use alloc::sync::Arc;
 use core::mem::{self, MaybeUninit};
 use core::ptr::NonNull;
+use std::any::Any;
 use wasmtime_environ::component::{
     CanonicalOptions, ComponentTypes, CoreDef, InterfaceType, RuntimeComponentInstanceIndex,
     TypeFuncIndex, TypeTuple, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
@@ -36,16 +38,16 @@ union ParamsAndResults<Params: Copy, Return: Copy> {
 /// [`wasmtime::Func`](crate::Func) it's possible to call functions either
 /// synchronously or asynchronously and either typed or untyped.
 #[derive(Copy, Clone, Debug)]
-pub struct Func(Stored<FuncData>);
+pub struct Func(pub(crate) Stored<FuncData>);
 
 #[doc(hidden)]
 pub struct FuncData {
     export: ExportFunction,
     ty: TypeFuncIndex,
     types: Arc<ComponentTypes>,
-    options: Options,
+    pub(crate) options: Options,
     instance: Instance,
-    component_instance: RuntimeComponentInstanceIndex,
+    pub(crate) component_instance: RuntimeComponentInstanceIndex,
     post_return: Option<ExportFunction>,
     post_return_arg: Option<ValRaw>,
 }
@@ -72,7 +74,19 @@ impl Func {
             ExportFunction { func_ref }
         });
         let component_instance = options.instance;
-        let options = unsafe { Options::new(store.id(), memory, realloc, options.string_encoding) };
+        let callback = options
+            .callback
+            .map(|i| data.instance().runtime_callback(i));
+        let options = unsafe {
+            Options::new(
+                store.id(),
+                memory,
+                realloc,
+                options.string_encoding,
+                options.async_,
+                callback,
+            )
+        };
         Func(store.store_data_mut().insert(FuncData {
             export,
             options,
@@ -267,9 +281,9 @@ impl Func {
     /// Panics if this is called on a function in an asynchronous store. This
     /// only works with functions defined within a synchronous store. Also
     /// panics if `store` does not own this function.
-    pub fn call(
+    pub fn call<U: 'static>(
         &self,
-        mut store: impl AsContextMut,
+        mut store: impl AsContextMut<Data = U>,
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
@@ -299,7 +313,7 @@ impl Func {
         results: &mut [Val],
     ) -> Result<()>
     where
-        T: Send,
+        T: Send + 'static,
     {
         let mut store = store.as_context_mut();
         assert!(
@@ -308,16 +322,24 @@ impl Func {
         );
         store
             .on_fiber(|store| self.call_impl(store, params, results))
-            .await?
+            .await
+            .map_err(|v| {
+                eprintln!("call_async trouble: {v:?}");
+                v
+            })?
+            .map_err(|v| {
+                eprintln!("call_async trouble 2: {v:?}");
+                v
+            })
     }
 
-    fn call_impl(
+    fn call_impl<U: 'static>(
         &self,
-        mut store: impl AsContextMut,
+        mut store: impl AsContextMut<Data = U>,
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
-        let store = &mut store.as_context_mut();
+        let store = store.as_context_mut();
 
         let param_tys = self.params(&store);
         let result_tys = self.results(&store);
@@ -377,6 +399,56 @@ impl Func {
         )
     }
 
+    fn call_raw_async<
+        'a,
+        T: Send + 'static,
+        Params: Send + Sync + 'static,
+        Return: Send + Sync + 'static,
+        LowerParams,
+        LowerReturn,
+    >(
+        &self,
+        mut store: StoreContextMut<'a, T>,
+        params: Params,
+        lower: impl FnOnce(
+                &mut LowerContext<T>,
+                &Params,
+                InterfaceType,
+                &mut MaybeUninit<LowerParams>,
+            ) -> Result<()>
+            + Send
+            + Sync
+            + 'static,
+        lift: impl FnOnce(&mut LiftContext, InterfaceType, &LowerReturn) -> Result<Return>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Result<(Return, StoreContextMut<'a, T>)>
+    where
+        LowerParams: Copy,
+        LowerReturn: Copy,
+    {
+        let me = self.0;
+        let export = store.0[me].export;
+
+        concurrent::enter(
+            store.as_context_mut(),
+            lower_params::<Params, LowerParams, T>,
+            (me, params, lower),
+            lift_results::<Return, LowerReturn, T>,
+            (me, lift),
+        )?;
+
+        let context = unsafe {
+            let mut space = MaybeUninit::<ValRaw>::uninit();
+            crate::Func::call_unchecked_raw(&mut store, export.func_ref, space.as_mut_ptr(), 1)?;
+            space.assume_init().get_u32()
+        };
+
+        let callback = store.0[me].options.callback.unwrap();
+        concurrent::exit(store, callback, context)
+    }
+
     /// Invokes the underlying wasm function, lowering arguments and lifting the
     /// result.
     ///
@@ -387,7 +459,7 @@ impl Func {
     /// happening.
     fn call_raw<T, Params: ?Sized, Return, LowerParams, LowerReturn>(
         &self,
-        store: &mut StoreContextMut<'_, T>,
+        mut store: StoreContextMut<'_, T>,
         params: &Params,
         lower: impl FnOnce(
             &mut LowerContext<'_, T>,
@@ -466,7 +538,7 @@ impl Func {
             // on the correctness of this module and `ComponentType`
             // implementations, hence `ComponentType` being an `unsafe` trait.
             crate::Func::call_unchecked_raw(
-                store,
+                &mut store,
                 export.func_ref,
                 space.as_mut_ptr().cast(),
                 mem::size_of_val(space) / mem::size_of::<ValRaw>(),
@@ -639,7 +711,7 @@ impl Func {
         Ok(())
     }
 
-    fn store_args<T>(
+    fn store_args<T: 'static>(
         &self,
         cx: &mut LowerContext<'_, T>,
         params_ty: &TypeTuple,
@@ -684,5 +756,94 @@ impl Func {
             *slot = Val::load(cx, *ty, &bytes[offset..][..abi.size32 as usize])?;
         }
         Ok(())
+    }
+}
+
+fn lower_params<Params, LowerParams, T>(
+    (me, params, lower): (
+        Stored<FuncData>,
+        Params,
+        impl FnOnce(
+                &mut LowerContext<T>,
+                &Params,
+                InterfaceType,
+                &mut MaybeUninit<LowerParams>,
+            ) -> Result<()>
+            + Send
+            + Sync
+            + 'static,
+    ),
+    store: *mut dyn VMStore,
+    lowered: &mut [MaybeUninit<ValRaw>],
+) -> Result<()> {
+    let mut store = unsafe { StoreContextMut::from_raw(store) };
+    let FuncData {
+        options,
+        instance,
+        component_instance,
+        ty,
+        ..
+    } = store.0[me];
+
+    let instance = store.0[instance.0].as_ref().unwrap();
+    let types = instance.component_types().clone();
+    let instance_ptr = instance.instance_ptr();
+    let mut flags = instance.instance().instance_flags(component_instance);
+
+    unsafe {
+        if !flags.may_enter() {
+            bail!(crate::Trap::CannotEnterComponent);
+        }
+        flags.set_may_enter(false);
+
+        flags.set_may_leave(false);
+        let mut cx = LowerContext::new(store.as_context_mut(), &options, &types, instance_ptr);
+        cx.enter_call();
+        let result = lower(
+            &mut cx,
+            &params,
+            InterfaceType::Tuple(types[ty].params),
+            slice_to_storage_mut(lowered),
+        );
+        flags.set_may_leave(true);
+        result?;
+        Ok(())
+    }
+}
+
+fn lift_results<Return: Send + Sync + 'static, LowerReturn, T>(
+    (me, lift): (
+        Stored<FuncData>,
+        impl FnOnce(&mut LiftContext, InterfaceType, &LowerReturn) -> Result<Return>
+            + Send
+            + Sync
+            + 'static,
+    ),
+    store: *mut dyn VMStore,
+    lowered: &[ValRaw],
+) -> Result<Option<Box<dyn Any + Send + Sync>>> {
+    let store = unsafe { StoreContextMut::<T>::from_raw(store) };
+    let FuncData {
+        options,
+        instance,
+        component_instance,
+        ty,
+        ..
+    } = store.0[me];
+
+    let instance = store.0[instance.0].as_ref().unwrap();
+    let types = instance.component_types().clone();
+    let instance_ptr = instance.instance_ptr();
+    let mut flags = instance.instance().instance_flags(component_instance);
+
+    store.0[me].post_return_arg = Some(ValRaw::i32(0));
+
+    unsafe {
+        flags.set_needs_post_return(true);
+        Ok(Some(Box::new(lift(
+            &mut LiftContext::new(store.0, &options, &types, instance_ptr),
+            InterfaceType::Tuple(types[ty].results),
+            slice_to_storage(lowered),
+        )?) as Box<dyn Any + Send + Sync>))
     }
 }

@@ -86,6 +86,9 @@ pub enum Val {
     Result(Result<Option<Box<Val>>, Option<Box<Val>>>),
     Flags(Vec<String>),
     Resource(ResourceAny),
+    Future(u32),
+    Stream(u32),
+    Error(u32),
 }
 
 impl Val {
@@ -197,6 +200,9 @@ impl Val {
                 }
 
                 Val::Flags(flags.into())
+            }
+            InterfaceType::Future(_) | InterfaceType::Stream(_) | InterfaceType::Error(_) => {
+                todo!()
             }
         })
     }
@@ -319,6 +325,9 @@ impl Val {
                 }
                 Val::Flags(flags.into())
             }
+            InterfaceType::Future(_) | InterfaceType::Stream(_) | InterfaceType::Error(_) => {
+                todo!()
+            }
         })
     }
 
@@ -429,6 +438,9 @@ impl Val {
                 Ok(())
             }
             (InterfaceType::Flags(_), _) => unexpected(ty, self),
+            (InterfaceType::Future(_) | InterfaceType::Stream(_) | InterfaceType::Error(_), _) => {
+                todo!()
+            }
         }
     }
 
@@ -566,6 +578,9 @@ impl Val {
                 Ok(())
             }
             (InterfaceType::Flags(_), _) => unexpected(ty, self),
+            (InterfaceType::Future(_) | InterfaceType::Stream(_) | InterfaceType::Error(_), _) => {
+                todo!()
+            }
         }
     }
 
@@ -593,6 +608,9 @@ impl Val {
             Val::Result(_) => "result",
             Val::Resource(_) => "resource",
             Val::Flags(_) => "flags",
+            Val::Future(_) => "future",
+            Val::Stream(_) => "stream",
+            Val::Error(_) => "error",
         }
     }
 }
@@ -658,6 +676,12 @@ impl PartialEq for Val {
             (Self::Flags(_), _) => false,
             (Self::Resource(l), Self::Resource(r)) => l == r,
             (Self::Resource(_), _) => false,
+            (Self::Future(l), Self::Future(r)) => l == r,
+            (Self::Future(_), _) => false,
+            (Self::Stream(l), Self::Stream(r)) => l == r,
+            (Self::Stream(_), _) => false,
+            (Self::Error(l), Self::Error(r)) => l == r,
+            (Self::Error(_), _) => false,
         }
     }
 }

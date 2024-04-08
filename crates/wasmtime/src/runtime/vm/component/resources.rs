@@ -78,9 +78,10 @@ pub struct ResourceTable {
     next: u32,
     /// Runtime state of all slots.
     slots: Vec<Slot>,
+    count: u32,
 }
 
-enum Slot {
+pub enum Slot {
     /// This slot is free and points to the next free slot, forming a linked
     /// list of free slots.
     Free { next: u32 },
@@ -291,7 +292,8 @@ impl ResourceTables<'_> {
 }
 
 impl ResourceTable {
-    fn insert(&mut self, new: Slot) -> Result<u32> {
+    /// TODO: docs
+    pub fn insert(&mut self, new: Slot) -> Result<u32> {
         let next = self.next as usize;
         if next == self.slots.len() {
             self.slots.push(Slot::Free {
@@ -303,6 +305,7 @@ impl ResourceTable {
             Slot::Free { next } => next,
             _ => unreachable!(),
         };
+        self.count += 1;
 
         // The component model reserves index 0 as never allocatable so add one
         // to the table index to start the numbering at 1 instead. Also note
@@ -322,7 +325,8 @@ impl ResourceTable {
         usize::try_from(idx).ok()
     }
 
-    fn rep(&self, idx: u32) -> Result<u32> {
+    /// TODO: docs    
+    pub fn rep(&self, idx: u32) -> Result<u32> {
         let slot = self
             .handle_index_to_table_index(idx)
             .and_then(|i| self.slots.get(i));
@@ -342,10 +346,17 @@ impl ResourceTable {
         }
     }
 
-    fn remove(&mut self, idx: u32) -> Result<Slot> {
+    /// TODO: docs
+    pub fn remove(&mut self, idx: u32) -> Result<Slot> {
         let to_fill = Slot::Free { next: self.next };
         let ret = mem::replace(self.get_mut(idx)?, to_fill);
         self.next = idx - 1;
+        self.count -= 1;
         Ok(ret)
+    }
+
+    /// TODO: docs    
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }

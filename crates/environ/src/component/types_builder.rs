@@ -25,7 +25,7 @@ pub use resources::ResourcesBuilder;
 /// Some more information about this can be found in #4814
 const MAX_TYPE_DEPTH: u32 = 100;
 
-/// Structured used to build a [`ComponentTypes`] during translation.
+/// Structure used to build a [`ComponentTypes`] during translation.
 ///
 /// This contains tables to intern any component types found as well as
 /// managing building up core wasm [`ModuleTypes`] as well.
@@ -39,6 +39,11 @@ pub struct ComponentTypesBuilder {
     flags: HashMap<TypeFlags, TypeFlagsIndex>,
     options: HashMap<TypeOption, TypeOptionIndex>,
     results: HashMap<TypeResult, TypeResultIndex>,
+    futures: HashMap<TypeFuture, TypeFutureIndex>,
+    streams: HashMap<TypeStream, TypeStreamIndex>,
+    future_tables: HashMap<TypeFutureTable, TypeFutureTableIndex>,
+    stream_tables: HashMap<TypeStreamTable, TypeStreamTableIndex>,
+    error_tables: HashMap<TypeErrorTable, TypeErrorTableIndex>,
 
     component_types: ComponentTypes,
     module_types: ModuleTypesBuilder,
@@ -64,15 +69,16 @@ where
 macro_rules! intern_and_fill_flat_types {
     ($me:ident, $name:ident, $val:ident) => {{
         if let Some(idx) = $me.$name.get(&$val) {
-            return *idx;
+            *idx
+        } else {
+            let idx = $me.component_types.$name.push($val.clone());
+            let mut info = TypeInformation::new();
+            info.$name($me, &$val);
+            let idx2 = $me.type_info.$name.push(info);
+            assert_eq!(idx, idx2);
+            $me.$name.insert($val, idx);
+            idx
         }
-        let idx = $me.component_types.$name.push($val.clone());
-        let mut info = TypeInformation::new();
-        info.$name($me, &$val);
-        let idx2 = $me.type_info.$name.push(info);
-        assert_eq!(idx, idx2);
-        $me.$name.insert($val, idx);
-        return idx;
     }};
 }
 
@@ -91,6 +97,11 @@ impl ComponentTypesBuilder {
             flags: HashMap::default(),
             options: HashMap::default(),
             results: HashMap::default(),
+            futures: HashMap::default(),
+            streams: HashMap::default(),
+            future_tables: HashMap::default(),
+            stream_tables: HashMap::default(),
+            error_tables: HashMap::default(),
             component_types: ComponentTypes::default(),
             type_info: TypeInformationCache::default(),
             resources: ResourcesBuilder::default(),
@@ -357,7 +368,8 @@ impl ComponentTypesBuilder {
         })
     }
 
-    fn defined_type(
+    /// TODO: docs
+    pub fn defined_type(
         &mut self,
         types: types::TypesRef<'_>,
         id: types::ComponentDefinedTypeId,
@@ -389,12 +401,24 @@ impl ComponentTypesBuilder {
             types::ComponentDefinedType::Borrow(r) => {
                 InterfaceType::Borrow(self.resource_id(r.resource()))
             }
+            types::ComponentDefinedType::Future(ty) => {
+                InterfaceType::Future(self.future_table_type(types, ty)?)
+            }
+            types::ComponentDefinedType::Stream(ty) => {
+                InterfaceType::Stream(self.stream_table_type(types, ty)?)
+            }
+            types::ComponentDefinedType::Error => InterfaceType::Error(self.error_table_type()?),
         };
         let info = self.type_information(&ret);
         if info.depth > MAX_TYPE_DEPTH {
             bail!("type nesting is too deep");
         }
         Ok(ret)
+    }
+
+    /// TODO: docs
+    pub fn error_type(&mut self) -> Result<TypeErrorTableIndex> {
+        self.error_table_type()
     }
 
     fn valtype(
@@ -512,6 +536,10 @@ impl ComponentTypesBuilder {
     ) -> Result<TypeOptionIndex> {
         assert_eq!(types.id(), self.module_types.validator_id());
         let ty = self.valtype(types, ty)?;
+        self.option_type_from_interface_type(ty)
+    }
+
+    fn option_type_from_interface_type(&mut self, ty: InterfaceType) -> Result<TypeOptionIndex> {
         let (info, abi) = VariantInfo::new([None, Some(self.component_types.canonical_abi(&ty))]);
         Ok(self.add_option_type(TypeOption { ty, abi, info }))
     }
@@ -531,11 +559,64 @@ impl ComponentTypesBuilder {
             Some(ty) => Some(self.valtype(types, ty)?),
             None => None,
         };
+        self.result_type_from_interface_types(ok, err)
+    }
+
+    fn result_type_from_interface_types(
+        &mut self,
+        ok: Option<InterfaceType>,
+        err: Option<InterfaceType>,
+    ) -> Result<TypeResultIndex> {
         let (info, abi) = VariantInfo::new([
             ok.as_ref().map(|t| self.component_types.canonical_abi(t)),
             err.as_ref().map(|t| self.component_types.canonical_abi(t)),
         ]);
         Ok(self.add_result_type(TypeResult { ok, err, abi, info }))
+    }
+
+    fn future_table_type(
+        &mut self,
+        types: types::TypesRef<'_>,
+        ty: &Option<types::ComponentValType>,
+    ) -> Result<TypeFutureTableIndex> {
+        let payload = ty.as_ref().map(|ty| self.valtype(types, ty)).transpose()?;
+        let error = Some(InterfaceType::Error(self.error_type()?));
+        let send_result = self.result_type_from_interface_types(None, error)?;
+        let receive_result = self.result_type_from_interface_types(payload, error)?;
+        let ty = self.add_future_type(TypeFuture { payload });
+        Ok(self.add_future_table_type(TypeFutureTable {
+            ty,
+            instance: self.resources.get_current_instance().unwrap(),
+            send_result,
+            receive_result,
+        }))
+    }
+
+    fn stream_table_type(
+        &mut self,
+        types: types::TypesRef<'_>,
+        ty: &types::ComponentValType,
+    ) -> Result<TypeStreamTableIndex> {
+        let payload = self.valtype(types, ty)?;
+        let list = self.list_type_from_interface_type(payload)?;
+        let error = Some(InterfaceType::Error(self.error_type()?));
+        let send_result = self.result_type_from_interface_types(None, error)?;
+        let result =
+            self.result_type_from_interface_types(Some(InterfaceType::List(list)), error)?;
+        let receive_option = self.option_type_from_interface_type(InterfaceType::Result(result))?;
+        let ty = self.add_stream_type(TypeStream { payload, list });
+        Ok(self.add_stream_table_type(TypeStreamTable {
+            ty,
+            instance: self.resources.get_current_instance().unwrap(),
+            send_result,
+            receive_option,
+        }))
+    }
+
+    fn error_table_type(&mut self) -> Result<TypeErrorTableIndex> {
+        Ok(self.add_error_table_type(TypeErrorTable {
+            instance: self.resources.get_current_instance().unwrap(),
+        }))
     }
 
     fn list_type(
@@ -545,6 +626,10 @@ impl ComponentTypesBuilder {
     ) -> Result<TypeListIndex> {
         assert_eq!(types.id(), self.module_types.validator_id());
         let element = self.valtype(types, ty)?;
+        self.list_type_from_interface_type(element)
+    }
+
+    fn list_type_from_interface_type(&mut self, element: InterfaceType) -> Result<TypeListIndex> {
         Ok(self.add_list_type(TypeList { element }))
     }
 
@@ -599,6 +684,43 @@ impl ComponentTypesBuilder {
         intern_and_fill_flat_types!(self, lists, ty)
     }
 
+    /// TODO: docs
+    pub fn add_future_type(&mut self, ty: TypeFuture) -> TypeFutureIndex {
+        intern(&mut self.futures, &mut self.component_types.futures, ty)
+    }
+
+    /// TODO: docs
+    pub fn add_future_table_type(&mut self, ty: TypeFutureTable) -> TypeFutureTableIndex {
+        intern(
+            &mut self.future_tables,
+            &mut self.component_types.future_tables,
+            ty,
+        )
+    }
+
+    /// TODO: docs
+    pub fn add_stream_type(&mut self, ty: TypeStream) -> TypeStreamIndex {
+        intern(&mut self.streams, &mut self.component_types.streams, ty)
+    }
+
+    /// TODO: docs
+    pub fn add_stream_table_type(&mut self, ty: TypeStreamTable) -> TypeStreamTableIndex {
+        intern(
+            &mut self.stream_tables,
+            &mut self.component_types.stream_tables,
+            ty,
+        )
+    }
+
+    /// TODO: docs
+    pub fn add_error_table_type(&mut self, ty: TypeErrorTable) -> TypeErrorTableIndex {
+        intern(
+            &mut self.error_tables,
+            &mut self.component_types.error_tables,
+            ty,
+        )
+    }
+
     /// Returns the canonical ABI information about the specified type.
     pub fn canonical_abi(&self, ty: &InterfaceType) -> &CanonicalAbiInfo {
         self.component_types.canonical_abi(ty)
@@ -629,7 +751,10 @@ impl ComponentTypesBuilder {
             | InterfaceType::U32
             | InterfaceType::S32
             | InterfaceType::Char
-            | InterfaceType::Own(_) => {
+            | InterfaceType::Own(_)
+            | InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::Error(_) => {
                 static INFO: TypeInformation = TypeInformation::primitive(FlatType::I32);
                 &INFO
             }

@@ -9,7 +9,7 @@
 /// wit. Future version of the interface will instead extend these methods on the base `bucket`
 /// resource.
 interface atomics {
-  	use store.{bucket, error};
+  	use store.{bucket, %error};
 
   	/// Atomically increment the value associated with the key in the store by the given delta. It
 	/// returns the new value.
@@ -18,5 +18,5 @@ interface atomics {
 	/// to the given delta. 
 	///
 	/// If any other error occurs, it returns an `Err(error)`.
-	increment: func(bucket: borrow<bucket>, key: string, delta: u64) -> result<u64, error>;
+	increment: func(bucket: borrow<bucket>, key: string, delta: u64) -> result<u64, %error>;
 }

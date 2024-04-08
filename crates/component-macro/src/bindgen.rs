@@ -1,14 +1,15 @@
 use proc_macro2::{Span, TokenStream};
 use quote::ToTokens;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use syn::parse::{Error, Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::{braced, token, Token};
-use wasmtime_wit_bindgen::{AsyncConfig, Opts, Ownership, TrappableError, TrappableImports};
+use wasmtime_wit_bindgen::{
+    AsyncConfig, CallStyle, Opts, Ownership, TrappableError, TrappableImports,
+};
 use wit_parser::{PackageId, Resolve, UnresolvedPackageGroup, WorldId};
 
 pub struct Config {
@@ -20,7 +21,9 @@ pub struct Config {
 }
 
 pub fn expand(input: &Config) -> Result<TokenStream> {
-    if !cfg!(feature = "async") && input.opts.async_.maybe_async() {
+    if let (CallStyle::Async | CallStyle::Concurrent, false) =
+        (input.opts.async_.call_style(), cfg!(feature = "async"))
+    {
         return Err(Error::new(
             Span::call_site(),
             "cannot enable async bindings unless `async` crate feature is active",
@@ -40,7 +43,10 @@ pub fn expand(input: &Config) -> Result<TokenStream> {
     // place a formatted version of the expanded code into a file. This file
     // will then show up in rustc error messages for any codegen issues and can
     // be inspected manually.
-    if input.include_generated_code_from_file || std::env::var("WASMTIME_DEBUG_BINDGEN").is_ok() {
+    if input.include_generated_code_from_file
+        || input.opts.debug
+        || std::env::var("WASMTIME_DEBUG_BINDGEN").is_ok()
+    {
         static INVOCATION: AtomicUsize = AtomicUsize::new(0);
         let root = Path::new(env!("DEBUG_OUTPUT_DIR"));
         let world_name = &input.resolve.worlds[input.world].name;
@@ -108,6 +114,7 @@ impl Parse for Config {
                     }
                     Opt::Tracing(val) => opts.tracing = val,
                     Opt::VerboseTracing(val) => opts.verbose_tracing = val,
+                    Opt::Debug(val) => opts.debug = val,
                     Opt::Async(val, span) => {
                         if async_configured {
                             return Err(Error::new(span, "cannot specify second async config"));
@@ -287,6 +294,8 @@ mod kw {
     syn::custom_keyword!(require_store_data_send);
     syn::custom_keyword!(wasmtime_crate);
     syn::custom_keyword!(include_generated_code_from_file);
+    syn::custom_keyword!(concurrent);
+    syn::custom_keyword!(debug);
 }
 
 enum Opt {
@@ -308,12 +317,17 @@ enum Opt {
     RequireStoreDataSend(bool),
     WasmtimeCrate(syn::Path),
     IncludeGeneratedCodeFromFile(bool),
+    Debug(bool),
 }
 
 impl Parse for Opt {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let l = input.lookahead1();
-        if l.peek(kw::path) {
+        if l.peek(kw::debug) {
+            input.parse::<kw::debug>()?;
+            input.parse::<Token![:]>()?;
+            Ok(Opt::Debug(input.parse::<syn::LitBool>()?.value))
+        } else if l.peek(kw::path) {
             input.parse::<kw::path>()?;
             input.parse::<Token![:]>()?;
 
@@ -352,9 +366,19 @@ impl Parse for Opt {
         } else if l.peek(Token![async]) {
             let span = input.parse::<Token![async]>()?.span;
             input.parse::<Token![:]>()?;
-            if input.peek(syn::LitBool) {
+
+            let concurrent = if input.peek(kw::concurrent) {
+                input.parse::<kw::concurrent>()?;
+                true
+            } else {
+                false
+            };
+
+            if input.is_empty() || input.peek(Token![,]) {
+                Ok(Opt::Async(AsyncConfig::All { concurrent: true }, span))
+            } else if input.peek(syn::LitBool) && !concurrent {
                 match input.parse::<syn::LitBool>()?.value {
-                    true => Ok(Opt::Async(AsyncConfig::All, span)),
+                    true => Ok(Opt::Async(AsyncConfig::All { concurrent }, span)),
                     false => Ok(Opt::Async(AsyncConfig::None, span)),
                 }
             } else {
@@ -362,14 +386,14 @@ impl Parse for Opt {
                 syn::braced!(contents in input);
 
                 let l = contents.lookahead1();
-                let ctor: fn(HashSet<String>) -> AsyncConfig = if l.peek(kw::except_imports) {
+                let except = if l.peek(kw::except_imports) {
                     contents.parse::<kw::except_imports>()?;
                     contents.parse::<Token![:]>()?;
-                    AsyncConfig::AllExceptImports
+                    true
                 } else if l.peek(kw::only_imports) {
                     contents.parse::<kw::only_imports>()?;
                     contents.parse::<Token![:]>()?;
-                    AsyncConfig::OnlyImports
+                    false
                 } else {
                     return Err(l.error());
                 };
@@ -382,8 +406,13 @@ impl Parse for Opt {
                 if contents.peek(Token![,]) {
                     contents.parse::<Token![,]>()?;
                 }
+                let names = fields.iter().map(|s| s.value()).collect();
                 Ok(Opt::Async(
-                    ctor(fields.iter().map(|s| s.value()).collect()),
+                    if except {
+                        AsyncConfig::AllExceptImports { concurrent, names }
+                    } else {
+                        AsyncConfig::OnlyImports { concurrent, names }
+                    },
                     span,
                 ))
             }

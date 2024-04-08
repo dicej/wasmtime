@@ -8,7 +8,7 @@ interface types {
   @since(version = 0.2.0)
   use wasi:io/streams@0.2.1.{input-stream, output-stream};
   @since(version = 0.2.0)
-  use wasi:io/error@0.2.1.{error as io-error};
+  use wasi:io/%error@0.2.1.{%error as io-error};
   @since(version = 0.2.0)
   use wasi:io/poll@0.2.1.{pollable};
 

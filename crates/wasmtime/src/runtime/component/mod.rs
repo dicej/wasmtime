@@ -101,6 +101,7 @@
 #![allow(rustdoc::redundant_explicit_links)]
 
 mod component;
+pub(crate) mod concurrent;
 mod func;
 mod instance;
 mod linker;

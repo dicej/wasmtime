@@ -1,3 +1,4 @@
+use crate::component::concurrent;
 use crate::component::func::{LiftContext, LowerContext, Options};
 use crate::component::matching::InstanceType;
 use crate::component::storage::slice_to_storage_mut;
@@ -6,12 +7,13 @@ use crate::prelude::*;
 use crate::runtime::vm::component::{
     ComponentInstance, InstanceFlags, VMComponentContext, VMLowering, VMLoweringCallee,
 };
-use crate::runtime::vm::{VMFuncRef, VMMemoryDefinition, VMOpaqueContext};
+use crate::runtime::vm::{SendSyncPtr, VMFuncRef, VMMemoryDefinition, VMOpaqueContext};
 use crate::{AsContextMut, CallHook, StoreContextMut, ValRaw};
 use alloc::sync::Arc;
 use core::any::Any;
 use core::mem::{self, MaybeUninit};
 use core::ptr::NonNull;
+use std::future::Future;
 use wasmtime_environ::component::{
     CanonicalAbiInfo, ComponentTypes, InterfaceType, StringEncoding, TypeFuncIndex,
     MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
@@ -28,9 +30,23 @@ impl HostFunc {
     where
         F: Fn(StoreContextMut<T>, P) -> Result<R> + Send + Sync + 'static,
         P: ComponentNamedList + Lift + 'static,
-        R: ComponentNamedList + Lower + 'static,
+        R: ComponentNamedList + Lower + Send + Sync + 'static,
     {
-        let entrypoint = Self::entrypoint::<T, F, P, R>;
+        Self::from_concurrent(move |store, params| {
+            let result = func(store, params);
+            async move { concurrent::for_any(move |_| result) }
+        })
+    }
+
+    pub(crate) fn from_concurrent<T, F, N, FN, P, R>(func: F) -> Arc<HostFunc>
+    where
+        N: FnOnce(StoreContextMut<T>) -> Result<R> + 'static,
+        FN: Future<Output = N> + Send + Sync + 'static,
+        F: Fn(StoreContextMut<T>, P) -> FN + Send + Sync + 'static,
+        P: ComponentNamedList + Lift + 'static,
+        R: ComponentNamedList + Lower + Send + Sync + 'static,
+    {
+        let entrypoint = Self::entrypoint::<T, F, N, FN, P, R>;
         Arc::new(HostFunc {
             entrypoint,
             typecheck: Box::new(typecheck::<P, R>),
@@ -38,7 +54,7 @@ impl HostFunc {
         })
     }
 
-    extern "C" fn entrypoint<T, F, P, R>(
+    extern "C" fn entrypoint<T, F, N, FN, P, R>(
         cx: *mut VMOpaqueContext,
         data: *mut u8,
         ty: TypeFuncIndex,
@@ -46,17 +62,25 @@ impl HostFunc {
         memory: *mut VMMemoryDefinition,
         realloc: *mut VMFuncRef,
         string_encoding: StringEncoding,
+        async_: bool,
         storage: *mut MaybeUninit<ValRaw>,
         storage_len: usize,
     ) where
-        F: Fn(StoreContextMut<T>, P) -> Result<R>,
+        N: FnOnce(StoreContextMut<T>) -> Result<R> + 'static,
+        FN: Future<Output = N> + Send + Sync + 'static,
+        F: Fn(StoreContextMut<T>, P) -> FN + Send + Sync + 'static,
         P: ComponentNamedList + Lift + 'static,
-        R: ComponentNamedList + Lower + 'static,
+        R: ComponentNamedList + Lower + Send + Sync + 'static,
     {
-        let data = data as *const F;
+        struct Ptr<F>(*const F);
+
+        unsafe impl<F> Sync for Ptr<F> {}
+        unsafe impl<F> Send for Ptr<F> {}
+
+        let data = Ptr(data as *const F);
         unsafe {
             call_host_and_handle_result::<T>(cx, |instance, types, store| {
-                call_host::<_, _, _, _>(
+                call_host(
                     instance,
                     types,
                     store,
@@ -65,8 +89,9 @@ impl HostFunc {
                     memory,
                     realloc,
                     string_encoding,
+                    async_,
                     core::slice::from_raw_parts_mut(storage, storage_len),
-                    |store, args| (*data)(store, args),
+                    move |store, args| (*data.0)(store, args),
                 )
             })
         }
@@ -132,7 +157,7 @@ where
 /// This function is in general `unsafe` as the validity of all the parameters
 /// must be upheld. Generally that's done by ensuring this is only called from
 /// the select few places it's intended to be called from.
-unsafe fn call_host<T, Params, Return, F>(
+unsafe fn call_host<T, Params, Return, F, N, FN>(
     instance: *mut ComponentInstance,
     types: &Arc<ComponentTypes>,
     mut cx: StoreContextMut<'_, T>,
@@ -141,13 +166,16 @@ unsafe fn call_host<T, Params, Return, F>(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     string_encoding: StringEncoding,
+    async_: bool,
     storage: &mut [MaybeUninit<ValRaw>],
     closure: F,
 ) -> Result<()>
 where
+    N: FnOnce(StoreContextMut<T>) -> Result<Return> + 'static,
+    FN: Future<Output = N> + Send + Sync + 'static,
+    F: Fn(StoreContextMut<T>, Params) -> FN + 'static,
     Params: Lift,
-    Return: Lower,
-    F: FnOnce(StoreContextMut<'_, T>, Params) -> Result<Return>,
+    Return: Lower + Send + Sync + 'static,
 {
     /// Representation of arguments to this function when a return pointer is in
     /// use, namely the argument list is followed by a single value which is the
@@ -172,6 +200,8 @@ where
         NonNull::new(memory),
         NonNull::new(realloc),
         string_encoding,
+        async_,
+        None,
     );
 
     // Perform a dynamic check that this instance can indeed be left. Exiting
@@ -185,39 +215,83 @@ where
     let param_tys = InterfaceType::Tuple(ty.params);
     let result_tys = InterfaceType::Tuple(ty.results);
 
-    // There's a 2x2 matrix of whether parameters and results are stored on the
-    // stack or on the heap. Each of the 4 branches here have a different
-    // representation of the storage of arguments/returns.
-    //
-    // Also note that while four branches are listed here only one is taken for
-    // any particular `Params` and `Return` combination. This should be
-    // trivially DCE'd by LLVM. Perhaps one day with enough const programming in
-    // Rust we can make monomorphizations of this function codegen only one
-    // branch, but today is not that day.
-    let mut storage: Storage<'_, Params, Return> = if Params::flatten_count() <= MAX_FLAT_PARAMS {
-        if Return::flatten_count() <= MAX_FLAT_RESULTS {
-            Storage::Direct(slice_to_storage_mut(storage))
+    if async_ {
+        const STATUS_PARAMS_READ: i32 = 1;
+        const STATUS_DONE: i32 = 3;
+
+        let paramptr = storage[0].assume_init();
+        let retptr = storage[1].assume_init();
+        let callptr = storage[2].assume_init();
+
+        let params = {
+            let lift = &mut LiftContext::new(cx.0, &options, types, instance);
+            lift.enter_call();
+            let ptr = validate_inbounds::<Params>(lift.memory(), &paramptr)?;
+            Params::load(lift, param_tys, &lift.memory()[ptr..][..Params::SIZE32])?
+        };
+
+        let future = closure(cx.as_context_mut(), params);
+
+        let task = concurrent::first_poll(cx.as_context_mut(), future, {
+            let types = types.clone();
+            let instance = SendSyncPtr::new(NonNull::new(instance).unwrap());
+            move |cx, ret: Return| {
+                let mut lower = LowerContext::new(cx, &options, &types, instance.as_ptr());
+                let ptr = validate_inbounds::<Return>(lower.as_slice_mut(), &retptr)?;
+                ret.store(&mut lower, result_tys, ptr)
+            }
+        })?;
+
+        let status = if let Some(task) = task {
+            let ptr = validate_inbounds::<u32>(options.memory_mut(cx.0), &callptr)?;
+
+            let mut lower = LowerContext::new(cx, &options, types, instance);
+            task.store(&mut lower, InterfaceType::U32, ptr)?;
+
+            STATUS_PARAMS_READ
         } else {
-            Storage::ResultsIndirect(slice_to_storage_mut(storage).assume_init_ref())
-        }
+            STATUS_DONE
+        };
+
+        storage[0] = MaybeUninit::new(ValRaw::i32(status));
     } else {
-        if Return::flatten_count() <= MAX_FLAT_RESULTS {
-            Storage::ParamsIndirect(slice_to_storage_mut(storage))
+        // There's a 2x2 matrix of whether parameters and results are stored on the
+        // stack or on the heap. Each of the 4 branches here have a different
+        // representation of the storage of arguments/returns.
+        //
+        // Also note that while four branches are listed here only one is taken for
+        // any particular `Params` and `Return` combination. This should be
+        // trivially DCE'd by LLVM. Perhaps one day with enough const programming in
+        // Rust we can make monomorphizations of this function codegen only one
+        // branch, but today is not that day.
+        let mut storage: Storage<'_, Params, Return> = if Params::flatten_count() <= MAX_FLAT_PARAMS
+        {
+            if Return::flatten_count() <= MAX_FLAT_RESULTS {
+                Storage::Direct(slice_to_storage_mut(storage))
+            } else {
+                Storage::ResultsIndirect(slice_to_storage_mut(storage).assume_init_ref())
+            }
         } else {
-            Storage::Indirect(slice_to_storage_mut(storage).assume_init_ref())
-        }
-    };
-    let mut lift = LiftContext::new(cx.0, &options, types, instance);
-    lift.enter_call();
-    let params = storage.lift_params(&mut lift, param_tys)?;
+            if Return::flatten_count() <= MAX_FLAT_RESULTS {
+                Storage::ParamsIndirect(slice_to_storage_mut(storage))
+            } else {
+                Storage::Indirect(slice_to_storage_mut(storage).assume_init_ref())
+            }
+        };
+        let mut lift = LiftContext::new(cx.0, &options, types, instance);
+        lift.enter_call();
+        let params = storage.lift_params(&mut lift, param_tys)?;
 
-    let ret = closure(cx.as_context_mut(), params)?;
-    flags.set_may_leave(false);
-    let mut lower = LowerContext::new(cx, &options, types, instance);
-    storage.lower_results(&mut lower, result_tys, ret)?;
-    flags.set_may_leave(true);
+        let future = closure(cx.as_context_mut(), params);
 
-    lower.exit_call()?;
+        let (ret, cx) = concurrent::poll_and_block(cx, future)?;
+
+        flags.set_may_leave(false);
+        let mut lower = LowerContext::new(cx, &options, types, instance);
+        storage.lower_results(&mut lower, result_tys, ret)?;
+        flags.set_may_leave(true);
+        lower.exit_call()?;
+    }
 
     return Ok(());
 
@@ -272,7 +346,7 @@ where
     }
 }
 
-fn validate_inbounds<T: ComponentType>(memory: &[u8], ptr: &ValRaw) -> Result<usize> {
+pub(crate) fn validate_inbounds<T: ComponentType>(memory: &[u8], ptr: &ValRaw) -> Result<usize> {
     // FIXME: needs memory64 support
     let ptr = usize::try_from(ptr.get_u32()).err2anyhow()?;
     if ptr % usize::try_from(T::ALIGN32).err2anyhow()? != 0 {
@@ -324,17 +398,24 @@ unsafe fn call_host_dynamic<T, F>(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     string_encoding: StringEncoding,
+    async_: bool,
     storage: &mut [MaybeUninit<ValRaw>],
     closure: F,
 ) -> Result<()>
 where
     F: FnOnce(StoreContextMut<'_, T>, &[Val], &mut [Val]) -> Result<()>,
 {
+    if async_ {
+        todo!("support async-lowered imports in `dynamic_entrypoint`");
+    }
+
     let options = Options::new(
         store.0.id(),
         NonNull::new(memory),
         NonNull::new(realloc),
         string_encoding,
+        async_,
+        None,
     );
 
     // Perform a dynamic check that this instance can indeed be left. Exiting
@@ -433,6 +514,7 @@ extern "C" fn dynamic_entrypoint<T, F>(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     string_encoding: StringEncoding,
+    async_: bool,
     storage: *mut MaybeUninit<ValRaw>,
     storage_len: usize,
 ) where
@@ -450,6 +532,7 @@ extern "C" fn dynamic_entrypoint<T, F>(
                 memory,
                 realloc,
                 string_encoding,
+                async_,
                 core::slice::from_raw_parts_mut(storage, storage_len),
                 |store, params, results| (*data)(store, params, results),
             )

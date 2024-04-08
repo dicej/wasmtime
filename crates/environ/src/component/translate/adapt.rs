@@ -157,8 +157,12 @@ pub struct AdapterOptions {
     pub memory64: bool,
     /// An optional definition of `realloc` to used.
     pub realloc: Option<dfg::CoreDef>,
+    /// TODO: docs
+    pub callback: Option<dfg::CoreDef>,
     /// An optional definition of a `post-return` to use.
     pub post_return: Option<dfg::CoreDef>,
+    /// TODO: docs
+    pub async_: bool,
 }
 
 impl<'data> Translator<'_, 'data> {
@@ -227,7 +231,7 @@ impl<'data> Translator<'_, 'data> {
             // in-order here as well. (with an assert to double-check)
             for (adapter, name) in adapter_module.adapters.iter().zip(&names) {
                 let index = translation.module.exports[name];
-                let i = component.adapter_paritionings.push((module_id, index));
+                let i = component.adapter_partitionings.push((module_id, index));
                 assert_eq!(i, *adapter);
             }
 
@@ -300,6 +304,13 @@ fn fact_import_to_core_def(
         }
         fact::Import::ResourceEnterCall => simple_intrinsic(dfg::Trampoline::ResourceEnterCall),
         fact::Import::ResourceExitCall => simple_intrinsic(dfg::Trampoline::ResourceExitCall),
+        fact::Import::AsyncEnterCall => simple_intrinsic(dfg::Trampoline::AsyncEnterCall),
+        fact::Import::AsyncExitCall(callback) => simple_intrinsic(dfg::Trampoline::AsyncExitCall(
+            callback.clone().map(|v| dfg.callbacks.push(v)),
+        )),
+        fact::Import::FutureTransfer => simple_intrinsic(dfg::Trampoline::FutureTransfer),
+        fact::Import::StreamTransfer => simple_intrinsic(dfg::Trampoline::StreamTransfer),
+        fact::Import::ErrorTransfer => simple_intrinsic(dfg::Trampoline::ErrorTransfer),
     }
 }
 
@@ -361,6 +372,9 @@ impl PartitionAdapterModules {
             self.core_export(dfg, memory);
         }
         if let Some(def) = &options.realloc {
+            self.core_def(dfg, def);
+        }
+        if let Some(def) = &options.callback {
             self.core_def(dfg, def);
         }
         if let Some(def) = &options.post_return {

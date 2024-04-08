@@ -26,7 +26,7 @@ package wasi:filesystem@0.2.1;
 @since(version = 0.2.0)
 interface types {
     @since(version = 0.2.0)
-    use wasi:io/streams@0.2.1.{input-stream, output-stream, error};
+    use wasi:io/streams@0.2.1.{input-stream, output-stream, %error};
     @since(version = 0.2.0)
     use wasi:clocks/wall-clock@0.2.1.{datetime};
 
@@ -674,5 +674,5 @@ interface types {
     /// Note that this function is fallible because not all stream-related
     /// errors are filesystem-related errors.
     @since(version = 0.2.0)
-    filesystem-error-code: func(err: borrow<error>) -> option<error-code>;
+    filesystem-error-code: func(err: borrow<%error>) -> option<error-code>;
 }

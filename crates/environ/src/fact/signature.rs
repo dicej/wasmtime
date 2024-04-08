@@ -13,6 +13,14 @@ pub struct Signature {
     pub params: Vec<ValType>,
     /// Core wasm results.
     pub results: Vec<ValType>,
+    /// Indicator to whether parameters are indirect, meaning that the first
+    /// entry of `params` is a pointer type which all parameters are loaded
+    /// through.
+    pub params_indirect: bool,
+    /// Indicator whether results are passed indirectly. This may mean that
+    /// `results` is an `i32` or that `params` ends with an `i32` depending on
+    /// the `Context`.
+    pub results_indirect: bool,
 }
 
 impl ComponentTypesBuilder {
@@ -26,6 +34,24 @@ impl ComponentTypesBuilder {
         let ty = &self[options.ty];
         let ptr_ty = options.options.ptr();
 
+        if options.options.async_ {
+            return match context {
+                Context::Lift => Signature {
+                    params: Vec::new(),
+                    results: vec![ptr_ty],
+                    params_indirect: false,
+                    results_indirect: false,
+                },
+                Context::Lower => Signature {
+                    params: vec![ptr_ty; 3],
+                    results: vec![ValType::I32],
+                    params_indirect: true,
+                    results_indirect: true,
+                },
+            };
+        }
+
+        let mut params_indirect = false;
         let mut params = match self.flatten_types(
             &options.options,
             MAX_FLAT_PARAMS,
@@ -33,10 +59,12 @@ impl ComponentTypesBuilder {
         ) {
             Some(list) => list,
             None => {
+                params_indirect = true;
                 vec![ptr_ty]
             }
         };
 
+        let mut results_indirect = false;
         let results = match self.flatten_types(
             &options.options,
             MAX_FLAT_RESULTS,
@@ -44,6 +72,7 @@ impl ComponentTypesBuilder {
         ) {
             Some(list) => list,
             None => {
+                results_indirect = true;
                 match context {
                     // For a lifted function too-many-results gets translated to a
                     // returned pointer where results are read from. The callee
@@ -59,7 +88,85 @@ impl ComponentTypesBuilder {
                 }
             }
         };
-        Signature { params, results }
+        Signature {
+            params,
+            results,
+            params_indirect,
+            results_indirect,
+        }
+    }
+
+    pub(super) fn async_start_signature(&self, options: &AdapterOptions) -> Signature {
+        let ty = &self[options.ty];
+        let ptr_ty = options.options.ptr();
+
+        let mut params = vec![ptr_ty];
+
+        let mut results_indirect = false;
+        let results = match self.flatten_types(
+            &options.options,
+            if options.options.async_ {
+                MAX_FLAT_RESULTS
+            } else {
+                MAX_FLAT_PARAMS
+            },
+            self[ty.params].types.iter().map(|ty| *ty),
+        ) {
+            Some(list) => list,
+            None => {
+                results_indirect = true;
+                params.push(ptr_ty);
+                Vec::new()
+            }
+        };
+        Signature {
+            params,
+            results,
+            params_indirect: false,
+            results_indirect,
+        }
+    }
+
+    pub(super) fn async_return_signature(&self, options: &AdapterOptions) -> Signature {
+        let ty = &self[options.ty];
+        let ptr_ty = options.options.ptr();
+
+        let mut params_indirect = false;
+        let mut params = match self.flatten_types(
+            &options.options,
+            if options.options.async_ {
+                MAX_FLAT_PARAMS
+            } else {
+                MAX_FLAT_RESULTS
+            },
+            self[ty.results].types.iter().copied(),
+        ) {
+            Some(list) => list,
+            None => {
+                params_indirect = true;
+                vec![ptr_ty]
+            }
+        };
+        // Add return pointer
+        params.push(ptr_ty);
+
+        Signature {
+            params,
+            results: Vec::new(),
+            params_indirect,
+            results_indirect: false,
+        }
+    }
+
+    pub(super) fn async_store_call_signature(&self, options: &AdapterOptions) -> Signature {
+        let ptr_ty = options.options.ptr();
+
+        Signature {
+            params: vec![ptr_ty, ValType::I32],
+            results: Vec::new(),
+            params_indirect: false,
+            results_indirect: false,
+        }
     }
 
     /// Pushes the flat version of a list of component types into a final result

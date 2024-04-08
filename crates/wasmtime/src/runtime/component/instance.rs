@@ -1,3 +1,4 @@
+use crate::component::concurrent;
 use crate::component::func::HostFunc;
 use crate::component::matching::InstanceType;
 use crate::component::{
@@ -512,8 +513,29 @@ impl<'a> Instantiator<'a> {
         }
     }
 
-    fn run<T>(&mut self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
+    fn run<T: 'static>(&mut self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
         let env_component = self.component.env_component();
+
+        self.data.state.set_async_callbacks(
+            concurrent::async_start::<T>,
+            concurrent::async_return::<T>,
+            concurrent::async_enter::<T>,
+            concurrent::async_exit::<T>,
+            concurrent::future_new::<T>,
+            concurrent::future_send::<T>,
+            concurrent::future_receive::<T>,
+            concurrent::future_drop_sender::<T>,
+            concurrent::future_drop_receiver::<T>,
+            concurrent::stream_new::<T>,
+            concurrent::stream_send::<T>,
+            concurrent::stream_receive::<T>,
+            concurrent::stream_drop_sender::<T>,
+            concurrent::stream_drop_receiver::<T>,
+            concurrent::flat_stream_send::<T>,
+            concurrent::flat_stream_receive::<T>,
+            concurrent::error_drop::<T>,
+            concurrent::task_wait::<T>,
+        );
 
         // Before all initializers are processed configure all destructors for
         // host-defined resources. No initializer will correspond to these and
@@ -607,6 +629,10 @@ impl<'a> Instantiator<'a> {
                     self.extract_realloc(store.0, realloc)
                 }
 
+                GlobalInitializer::ExtractCallback(callback) => {
+                    self.extract_callback(store.0, callback)
+                }
+
                 GlobalInitializer::ExtractPostReturn(post_return) => {
                     self.extract_post_return(store.0, post_return)
                 }
@@ -652,6 +678,16 @@ impl<'a> Instantiator<'a> {
             _ => unreachable!(),
         };
         self.data.state.set_runtime_realloc(realloc.index, func_ref);
+    }
+
+    fn extract_callback(&mut self, store: &mut StoreOpaque, callback: &ExtractCallback) {
+        let func_ref = match self.data.lookup_def(store, &callback.def) {
+            crate::runtime::vm::Export::Function(f) => f.func_ref,
+            _ => unreachable!(),
+        };
+        self.data
+            .state
+            .set_runtime_callback(callback.index, func_ref);
     }
 
     fn extract_post_return(&mut self, store: &mut StoreOpaque, post_return: &ExtractPostReturn) {
@@ -796,7 +832,10 @@ impl<T> InstancePre<T> {
     /// Performs the instantiation process into the store specified.
     //
     // TODO: needs more docs
-    pub fn instantiate(&self, store: impl AsContextMut<Data = T>) -> Result<Instance> {
+    pub fn instantiate(&self, store: impl AsContextMut<Data = T>) -> Result<Instance>
+    where
+        T: 'static,
+    {
         assert!(
             !store.as_context().async_support(),
             "must use async instantiation when async support is enabled"
@@ -814,7 +853,7 @@ impl<T> InstancePre<T> {
         mut store: impl AsContextMut<Data = T>,
     ) -> Result<Instance>
     where
-        T: Send,
+        T: Send + 'static,
     {
         let mut store = store.as_context_mut();
         assert!(
@@ -824,7 +863,10 @@ impl<T> InstancePre<T> {
         store.on_fiber(|store| self.instantiate_impl(store)).await?
     }
 
-    fn instantiate_impl(&self, mut store: impl AsContextMut<Data = T>) -> Result<Instance> {
+    fn instantiate_impl(&self, mut store: impl AsContextMut<Data = T>) -> Result<Instance>
+    where
+        T: 'static,
+    {
         let mut store = store.as_context_mut();
         store
             .engine()

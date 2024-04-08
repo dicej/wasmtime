@@ -20,6 +20,7 @@ use core::mem::offset_of;
 use core::ops::Deref;
 use core::ptr::{self, NonNull};
 use sptr::Strict;
+use std::collections::{HashMap, HashSet};
 use wasmtime_environ::component::*;
 use wasmtime_environ::{HostPtr, PrimaryMap, VMSharedTypeIndex};
 
@@ -57,6 +58,10 @@ pub struct ComponentInstance {
     /// This is paired with other information to create a `ResourceTables` which
     /// is how this field is manipulated.
     component_resource_tables: PrimaryMap<TypeResourceTableIndex, ResourceTable>,
+
+    handle_table: HashSet<(TableIndex, u32)>,
+
+    error_table: HashMap<(TypeErrorTableIndex, u32), usize>,
 
     /// Storage for the type information about resources within this component
     /// instance.
@@ -110,6 +115,7 @@ pub type VMLoweringCallee = extern "C" fn(
     opt_memory: *mut VMMemoryDefinition,
     opt_realloc: *mut VMFuncRef,
     string_encoding: StringEncoding,
+    async_: bool,
     args_and_results: *mut mem::MaybeUninit<ValRaw>,
     nargs_and_results: usize,
 );
@@ -125,6 +131,110 @@ pub struct VMLowering {
     /// The host data pointer (think void* pointer) to get passed to `callee`.
     pub data: *mut u8,
 }
+
+/// TODO: docs
+pub type VMAsyncCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    ty: TypeFuncIndex,
+    args_and_results: *mut mem::MaybeUninit<ValRaw>,
+    nargs_and_results: usize,
+);
+
+/// TODO: docs
+pub type VMAsyncEnterCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    start: *mut VMFuncRef,
+    return_: *mut VMFuncRef,
+    store_call: *mut VMFuncRef,
+    params: u32,
+    results: u32,
+    call: u32,
+    flags: u32,
+);
+
+/// TODO: docs
+pub type VMAsyncExitCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    callback: *mut VMFuncRef,
+    guest_context: u32,
+    callee: *mut VMFuncRef,
+    callee_instance: RuntimeComponentInstanceIndex,
+    param_count: u32,
+    result_count: u32,
+    flags: u32,
+) -> u32;
+
+/// TODO: docs
+pub type VMFutureNewCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    ty: TypeFutureTableIndex,
+    results: u32,
+);
+
+/// TODO: docs
+pub type VMFutureTransmitCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    ty: TypeFutureTableIndex,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32;
+
+/// TODO: docs
+pub type VMFutureDropCallback =
+    extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeFutureTableIndex, handle: u32);
+
+/// TODO: docs
+pub type VMStreamNewCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    ty: TypeStreamTableIndex,
+    results: u32,
+);
+
+/// TODO: docs
+pub type VMStreamTransmitCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    ty: TypeStreamTableIndex,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32;
+
+/// TODO: docs
+pub type VMFlatStreamTransmitCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    ty: TypeStreamTableIndex,
+    payload_size: u32,
+    payload_align: u32,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32;
+
+/// TODO: docs
+pub type VMStreamDropCallback =
+    extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeStreamTableIndex, handle: u32);
+
+/// TODO: docs
+pub type VMErrorDropCallback =
+    extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeErrorTableIndex, handle: u32);
+
+/// TODO: docs
+pub type VMTaskWaitCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    payload: u32,
+) -> u32;
 
 /// This is a marker type to represent the underlying allocation of a
 /// `VMComponentContext`.
@@ -142,6 +252,15 @@ pub struct VMLowering {
 pub struct VMComponentContext {
     /// For more information about this see the equivalent field in `VMContext`
     _marker: marker::PhantomPinned,
+}
+
+/// TODO: docs
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum TableIndex {
+    /// TODO: docs
+    Future(TypeFutureTableIndex),
+    /// TODO: docs
+    Stream(TypeStreamTableIndex),
 }
 
 impl ComponentInstance {
@@ -212,6 +331,8 @@ impl ComponentInstance {
                     .unwrap(),
                 ),
                 component_resource_tables,
+                handle_table: HashSet::new(),
+                error_table: HashMap::new(),
                 runtime_info,
                 resource_types,
                 vmctx: VMComponentContext {
@@ -286,6 +407,15 @@ impl ComponentInstance {
         }
     }
 
+    /// TODO: docs
+    pub fn runtime_callback(&self, idx: RuntimeCallbackIndex) -> NonNull<VMFuncRef> {
+        unsafe {
+            let ret = *self.vmctx_plus_offset::<NonNull<_>>(self.offsets.runtime_callback(idx));
+            debug_assert!(ret.as_ptr() as usize != INVALID_PTR);
+            ret
+        }
+    }
+
     /// Returns the post-return pointer corresponding to the index provided.
     ///
     /// This can only be called after `idx` has been initialized at runtime
@@ -354,6 +484,15 @@ impl ComponentInstance {
     pub fn set_runtime_realloc(&mut self, idx: RuntimeReallocIndex, ptr: NonNull<VMFuncRef>) {
         unsafe {
             let storage = self.vmctx_plus_offset_mut(self.offsets.runtime_realloc(idx));
+            debug_assert!(*storage as usize == INVALID_PTR);
+            *storage = ptr.as_ptr();
+        }
+    }
+
+    /// TODO: docs
+    pub fn set_runtime_callback(&mut self, idx: RuntimeCallbackIndex, ptr: NonNull<VMFuncRef>) {
+        unsafe {
+            let storage = self.vmctx_plus_offset_mut(self.offsets.runtime_callback(idx));
             debug_assert!(*storage as usize == INVALID_PTR);
             *storage = ptr.as_ptr();
         }
@@ -435,6 +574,50 @@ impl ComponentInstance {
         }
     }
 
+    /// TODO: docs
+    pub fn set_async_callbacks(
+        &mut self,
+        start: VMAsyncCallback,
+        return_: VMAsyncCallback,
+        enter: VMAsyncEnterCallback,
+        exit: VMAsyncExitCallback,
+        future_new: VMFutureNewCallback,
+        future_send: VMFutureTransmitCallback,
+        future_receive: VMFutureTransmitCallback,
+        future_drop_sender: VMFutureDropCallback,
+        future_drop_receiver: VMFutureDropCallback,
+        stream_new: VMStreamNewCallback,
+        stream_send: VMStreamTransmitCallback,
+        stream_receive: VMStreamTransmitCallback,
+        stream_drop_sender: VMStreamDropCallback,
+        stream_drop_receiver: VMStreamDropCallback,
+        flat_stream_send: VMFlatStreamTransmitCallback,
+        flat_stream_receive: VMFlatStreamTransmitCallback,
+        error_drop: VMErrorDropCallback,
+        task_wait: VMTaskWaitCallback,
+    ) {
+        unsafe {
+            *self.vmctx_plus_offset_mut(self.offsets.async_start()) = start;
+            *self.vmctx_plus_offset_mut(self.offsets.async_return()) = return_;
+            *self.vmctx_plus_offset_mut(self.offsets.async_enter()) = enter;
+            *self.vmctx_plus_offset_mut(self.offsets.async_exit()) = exit;
+            *self.vmctx_plus_offset_mut(self.offsets.future_new()) = future_new;
+            *self.vmctx_plus_offset_mut(self.offsets.future_send()) = future_send;
+            *self.vmctx_plus_offset_mut(self.offsets.future_receive()) = future_receive;
+            *self.vmctx_plus_offset_mut(self.offsets.future_drop_sender()) = future_drop_sender;
+            *self.vmctx_plus_offset_mut(self.offsets.future_drop_receiver()) = future_drop_receiver;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_new()) = stream_new;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_send()) = stream_send;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_receive()) = stream_receive;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_drop_sender()) = stream_drop_sender;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_drop_receiver()) = stream_drop_receiver;
+            *self.vmctx_plus_offset_mut(self.offsets.flat_stream_send()) = flat_stream_send;
+            *self.vmctx_plus_offset_mut(self.offsets.flat_stream_receive()) = flat_stream_receive;
+            *self.vmctx_plus_offset_mut(self.offsets.error_drop()) = error_drop;
+            *self.vmctx_plus_offset_mut(self.offsets.task_wait()) = task_wait;
+        }
+    }
+
     unsafe fn initialize_vmctx(&mut self, store: *mut dyn VMStore) {
         *self.vmctx_plus_offset_mut(self.offsets.magic()) = VMCOMPONENT_MAGIC;
         *self.vmctx_plus_offset_mut(self.offsets.libcalls()) = &libcalls::VMComponentLibcalls::INIT;
@@ -449,7 +632,7 @@ impl ComponentInstance {
         }
 
         // In debug mode set non-null bad values to all "pointer looking" bits
-        // and pices related to lowering and such. This'll help detect any
+        // and pieces related to lowering and such. This'll help detect any
         // erroneous usage and enable debug assertions above as well to prevent
         // loading these before they're configured or setting them twice.
         if cfg!(debug_assertions) {
@@ -473,6 +656,11 @@ impl ComponentInstance {
             for i in 0..self.offsets.num_runtime_reallocs {
                 let i = RuntimeReallocIndex::from_u32(i);
                 let offset = self.offsets.runtime_realloc(i);
+                *self.vmctx_plus_offset_mut(offset) = INVALID_PTR;
+            }
+            for i in 0..self.offsets.num_runtime_callbacks {
+                let i = RuntimeCallbackIndex::from_u32(i);
+                let offset = self.offsets.runtime_callback(i);
                 *self.vmctx_plus_offset_mut(offset) = INVALID_PTR;
             }
             for i in 0..self.offsets.num_runtime_post_returns {
@@ -561,6 +749,16 @@ impl ComponentInstance {
         }
     }
 
+    /// TODO: docs
+    pub fn handle_table(&mut self) -> &mut HashSet<(TableIndex, u32)> {
+        &mut self.handle_table
+    }
+
+    /// TODO: docs
+    pub fn error_table(&mut self) -> &mut HashMap<(TypeErrorTableIndex, u32), usize> {
+        &mut self.error_table
+    }
+
     /// Returns the runtime state of resources associated with this component.
     #[inline]
     pub fn component_resource_tables(
@@ -628,6 +826,49 @@ impl ComponentInstance {
 
     pub(crate) fn resource_exit_call(&mut self) -> Result<()> {
         self.resource_tables().exit_call()
+    }
+
+    pub(crate) fn future_transfer(
+        &mut self,
+        idx: u32,
+        src: TypeFutureTableIndex,
+        dst: TypeFutureTableIndex,
+    ) -> Result<u32> {
+        self.handle_transfer(idx, TableIndex::Future(src), TableIndex::Future(dst))
+    }
+
+    pub(crate) fn stream_transfer(
+        &mut self,
+        idx: u32,
+        src: TypeStreamTableIndex,
+        dst: TypeStreamTableIndex,
+    ) -> Result<u32> {
+        self.handle_transfer(idx, TableIndex::Stream(src), TableIndex::Stream(dst))
+    }
+
+    fn handle_transfer(&mut self, idx: u32, src: TableIndex, dst: TableIndex) -> Result<u32> {
+        if !self.handle_table.remove(&(src, idx)) {
+            bail!("invalid handle");
+        }
+
+        assert!(self.handle_table.insert((dst, idx)));
+
+        Ok(idx)
+    }
+
+    pub(crate) fn error_transfer(
+        &mut self,
+        idx: u32,
+        src: TypeErrorTableIndex,
+        dst: TypeErrorTableIndex,
+    ) -> Result<u32> {
+        if !self.error_table.contains_key(&(src, idx)) {
+            bail!("invalid handle");
+        }
+
+        *self.error_table.entry((dst, idx)).or_default() += 1;
+
+        Ok(idx)
     }
 }
 
@@ -712,6 +953,11 @@ impl OwnedComponentInstance {
         unsafe { self.instance_mut().set_runtime_realloc(idx, ptr) }
     }
 
+    /// See `ComponentInstance::set_runtime_callback`
+    pub fn set_runtime_callback(&mut self, idx: RuntimeCallbackIndex, ptr: NonNull<VMFuncRef>) {
+        unsafe { self.instance_mut().set_runtime_callback(idx, ptr) }
+    }
+
     /// See `ComponentInstance::set_runtime_post_return`
     pub fn set_runtime_post_return(
         &mut self,
@@ -752,6 +998,52 @@ impl OwnedComponentInstance {
     /// See `ComponentInstance::resource_types`
     pub fn resource_types_mut(&mut self) -> &mut Arc<dyn Any + Send + Sync> {
         unsafe { &mut (*self.ptr.as_ptr()).resource_types }
+    }
+
+    /// TODO: docs
+    pub fn set_async_callbacks(
+        &mut self,
+        start: VMAsyncCallback,
+        return_: VMAsyncCallback,
+        enter: VMAsyncEnterCallback,
+        exit: VMAsyncExitCallback,
+        future_new: VMFutureNewCallback,
+        future_send: VMFutureTransmitCallback,
+        future_receive: VMFutureTransmitCallback,
+        future_drop_sender: VMFutureDropCallback,
+        future_drop_receiver: VMFutureDropCallback,
+        stream_new: VMStreamNewCallback,
+        stream_send: VMStreamTransmitCallback,
+        stream_receive: VMStreamTransmitCallback,
+        stream_drop_sender: VMStreamDropCallback,
+        stream_drop_receiver: VMStreamDropCallback,
+        flat_stream_send: VMFlatStreamTransmitCallback,
+        flat_stream_receive: VMFlatStreamTransmitCallback,
+        error_drop: VMErrorDropCallback,
+        task_wait: VMTaskWaitCallback,
+    ) {
+        unsafe {
+            self.instance_mut().set_async_callbacks(
+                start,
+                return_,
+                enter,
+                exit,
+                future_new,
+                future_send,
+                future_receive,
+                future_drop_sender,
+                future_drop_receiver,
+                stream_new,
+                stream_send,
+                stream_receive,
+                stream_drop_sender,
+                stream_drop_receiver,
+                flat_stream_send,
+                flat_stream_receive,
+                error_drop,
+                task_wait,
+            )
+        }
     }
 }
 

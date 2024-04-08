@@ -148,6 +148,9 @@ pub struct Component {
     /// `VMComponentContext`.
     pub num_runtime_reallocs: u32,
 
+    /// TODO: docs
+    pub num_runtime_callbacks: u32,
+
     /// Same as `num_runtime_reallocs`, but for post-return functions.
     pub num_runtime_post_returns: u32,
 
@@ -252,6 +255,9 @@ pub enum GlobalInitializer {
     /// used as a `realloc` function.
     ExtractRealloc(ExtractRealloc),
 
+    /// TODO: docs
+    ExtractCallback(ExtractCallback),
+
     /// Same as `ExtractMemory`, except it's extracting a function pointer to be
     /// used as a `post-return` function.
     ExtractPostReturn(ExtractPostReturn),
@@ -278,6 +284,15 @@ pub struct ExtractRealloc {
     /// The index of the realloc being defined.
     pub index: RuntimeReallocIndex,
     /// Where this realloc is being extracted from.
+    pub def: CoreDef,
+}
+
+/// Same as `ExtractMemory` but for the `callback` canonical option.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExtractCallback {
+    /// The index of the callback being defined.
+    pub index: RuntimeCallbackIndex,
+    /// Where this callback is being extracted from.
     pub def: CoreDef,
 }
 
@@ -447,8 +462,14 @@ pub struct CanonicalOptions {
     /// The realloc function used by these options, if specified.
     pub realloc: Option<RuntimeReallocIndex>,
 
+    /// The callback function used by these options, if specified.
+    pub callback: Option<RuntimeCallbackIndex>,
+
     /// The post-return function used by these options, if specified.
     pub post_return: Option<RuntimePostReturnIndex>,
+
+    /// TODO: docs
+    pub async_: bool,
 }
 
 /// Possible encodings of strings within the component model.
@@ -633,6 +654,85 @@ pub enum Trampoline {
     /// Same as `ResourceNew`, but for the `resource.drop` intrinsic.
     ResourceDrop(TypeResourceTableIndex),
 
+    /// TODO: docs
+    AsyncStart(TypeFuncIndex),
+
+    /// TODO: docs
+    AsyncReturn(TypeFuncIndex),
+
+    /// TODO: docs
+    FutureNew {
+        /// TODO: docs
+        ty: TypeFutureTableIndex,
+        /// TODO: docs
+        memory: RuntimeMemoryIndex,
+    },
+    /// TODO: docs
+    FutureSend {
+        /// TODO: docs
+        ty: TypeFutureTableIndex,
+        /// TODO: docs
+        options: CanonicalOptions,
+    },
+    /// TODO: docs
+    FutureReceive {
+        /// TODO: docs
+        ty: TypeFutureTableIndex,
+        /// TODO: docs
+        options: CanonicalOptions,
+    },
+    /// TODO: docs
+    FutureDropSender {
+        /// TODO: docs
+        ty: TypeFutureTableIndex,
+    },
+    /// TODO: docs
+    FutureDropReceiver {
+        /// TODO: docs
+        ty: TypeFutureTableIndex,
+    },
+    /// TODO: docs
+    StreamNew {
+        /// TODO: docs
+        ty: TypeStreamTableIndex,
+        /// TODO: docs
+        memory: RuntimeMemoryIndex,
+    },
+    /// TODO: docs
+    StreamSend {
+        /// TODO: docs
+        ty: TypeStreamTableIndex,
+        /// TODO: docs
+        options: CanonicalOptions,
+    },
+    /// TODO: docs
+    StreamReceive {
+        /// TODO: docs
+        ty: TypeStreamTableIndex,
+        /// TODO: docs
+        options: CanonicalOptions,
+    },
+    /// TODO: docs
+    StreamDropSender {
+        /// TODO: docs
+        ty: TypeStreamTableIndex,
+    },
+    /// TODO: docs
+    StreamDropReceiver {
+        /// TODO: docs
+        ty: TypeStreamTableIndex,
+    },
+    /// TODO: docs
+    ErrorDrop {
+        /// TODO: docs
+        ty: TypeErrorTableIndex,
+    },
+    /// TODO: docs
+    TaskWait {
+        /// TODO: docs
+        memory: RuntimeMemoryIndex,
+    },
+
     /// An intrinsic used by FACT-generated modules which will transfer an owned
     /// resource from one table to another. Used in component-to-component
     /// adapter trampolines.
@@ -650,6 +750,19 @@ pub enum Trampoline {
 
     /// Same as `ResourceEnterCall` except for when exiting a call.
     ResourceExitCall,
+
+    /// TODO: docs
+    AsyncEnterCall,
+
+    /// TODO: docs
+    AsyncExitCall(Option<RuntimeCallbackIndex>),
+
+    /// TODO: docs
+    FutureTransfer,
+    /// TODO: docs
+    StreamTransfer,
+    /// TODO: docs
+    ErrorTransfer,
 }
 
 impl Trampoline {
@@ -673,10 +786,29 @@ impl Trampoline {
             ResourceNew(i) => format!("component-resource-new[{}]", i.as_u32()),
             ResourceRep(i) => format!("component-resource-rep[{}]", i.as_u32()),
             ResourceDrop(i) => format!("component-resource-drop[{}]", i.as_u32()),
+            AsyncStart(i) => format!("async-start[{}]", i.as_u32()),
+            AsyncReturn(i) => format!("async-return[{}]", i.as_u32()),
+            FutureNew { .. } => format!("future-new"),
+            FutureSend { .. } => format!("future-send"),
+            FutureReceive { .. } => format!("future-receive"),
+            FutureDropSender { .. } => format!("future-drop-sender"),
+            FutureDropReceiver { .. } => format!("future-drop-receiver"),
+            StreamNew { .. } => format!("stream-new"),
+            StreamSend { .. } => format!("stream-send"),
+            StreamReceive { .. } => format!("stream-receive"),
+            StreamDropSender { .. } => format!("stream-drop-sender"),
+            StreamDropReceiver { .. } => format!("stream-drop-receiver"),
+            ErrorDrop { .. } => format!("error-drop"),
+            TaskWait { .. } => format!("task-wait"),
             ResourceTransferOwn => format!("component-resource-transfer-own"),
             ResourceTransferBorrow => format!("component-resource-transfer-borrow"),
             ResourceEnterCall => format!("component-resource-enter-call"),
             ResourceExitCall => format!("component-resource-exit-call"),
+            AsyncEnterCall => format!("component-async-enter-call"),
+            AsyncExitCall(_) => format!("component-async-exit-call"),
+            FutureTransfer => format!("future-transfer"),
+            StreamTransfer => format!("stream-transfer"),
+            ErrorTransfer => format!("error-transfer"),
         }
     }
 }

@@ -8,7 +8,7 @@ package wasi:io@0.2.1;
 @since(version = 0.2.0)
 interface streams {
     @since(version = 0.2.0)
-    use error.{error};
+    use %error.{%error};
     @since(version = 0.2.0)
     use poll.{pollable};
 
@@ -18,7 +18,7 @@ interface streams {
         /// The last operation (a write or flush) failed before completion.
         ///
         /// More information is available in the `error` payload.
-        last-operation-failed(error),
+        last-operation-failed(%error),
         /// The stream is closed: no more input will be accepted by the
         /// stream. A closed output-stream will return this error on all
         /// future operations.
