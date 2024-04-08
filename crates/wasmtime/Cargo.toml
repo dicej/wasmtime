@@ -62,6 +62,7 @@ semver = { workspace = true, optional = true }
 smallvec = { workspace = true, optional = true }
 hashbrown = { workspace = true, features = ["default-hasher"] }
 bitflags = { workspace = true }
+futures = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-sys]
 workspace = true
@@ -366,3 +367,12 @@ custom-virtual-memory = []
 
 # Same as `custom-virtual-memory` above, but for custom signal-handling APIs.
 custom-native-signals = []
+
+# Enables support for the Component Model Async ABI, along with `future`,
+# `stream`, and `error-context` types.
+component-model-async = [
+  "async",
+  "component-model",
+  "std",
+  'wasmtime-component-macro?/component-model-async',
+]
