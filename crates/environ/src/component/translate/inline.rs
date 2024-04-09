@@ -1004,6 +1004,7 @@ impl<'a> Inliner<'a> {
             None => false,
         };
         let realloc = options.realloc.map(|i| frame.funcs[i].clone());
+        let callback = options.callback.map(|i| frame.funcs[i].clone());
         let post_return = options.post_return.map(|i| frame.funcs[i].clone());
         AdapterOptions {
             instance: frame.instance,
@@ -1011,6 +1012,7 @@ impl<'a> Inliner<'a> {
             memory,
             memory64,
             realloc,
+            callback,
             post_return,
             async_: options.async_,
         }
@@ -1025,6 +1027,7 @@ impl<'a> Inliner<'a> {
             .memory
             .map(|export| self.result.memories.push(export));
         let realloc = options.realloc.map(|def| self.result.reallocs.push(def));
+        let callback = options.callback.map(|def| self.result.callbacks.push(def));
         let post_return = options
             .post_return
             .map(|def| self.result.post_returns.push(def));
@@ -1033,6 +1036,7 @@ impl<'a> Inliner<'a> {
             string_encoding: options.string_encoding,
             memory,
             realloc,
+            callback,
             post_return,
             async_: options.async_,
         }

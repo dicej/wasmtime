@@ -206,6 +206,9 @@ indices! {
     /// Same as `RuntimeMemoryIndex` except for the `realloc` function.
     pub struct RuntimeReallocIndex(u32);
 
+    /// Same as `RuntimeMemoryIndex` except for the `callback` function.
+    pub struct RuntimeCallbackIndex(u32);
+
     /// Same as `RuntimeMemoryIndex` except for the `post-return` function.
     pub struct RuntimePostReturnIndex(u32);
 

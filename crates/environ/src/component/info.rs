@@ -143,6 +143,9 @@ pub struct Component {
     /// `VMComponentContext`.
     pub num_runtime_reallocs: u32,
 
+    /// TODO: docs
+    pub num_runtime_callbacks: u32,
+
     /// Same as `num_runtime_reallocs`, but for post-return functions.
     pub num_runtime_post_returns: u32,
 
@@ -247,6 +250,9 @@ pub enum GlobalInitializer {
     /// used as a `realloc` function.
     ExtractRealloc(ExtractRealloc),
 
+    /// TODO: docs
+    ExtractCallback(ExtractCallback),
+
     /// Same as `ExtractMemory`, except it's extracting a function pointer to be
     /// used as a `post-return` function.
     ExtractPostReturn(ExtractPostReturn),
@@ -273,6 +279,15 @@ pub struct ExtractRealloc {
     /// The index of the realloc being defined.
     pub index: RuntimeReallocIndex,
     /// Where this realloc is being extracted from.
+    pub def: CoreDef,
+}
+
+/// Same as `ExtractMemory` but for the `callback` canonical option.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExtractCallback {
+    /// The index of the callback being defined.
+    pub index: RuntimeCallbackIndex,
+    /// Where this callback is being extracted from.
     pub def: CoreDef,
 }
 
@@ -436,6 +451,9 @@ pub struct CanonicalOptions {
 
     /// The realloc function used by these options, if specified.
     pub realloc: Option<RuntimeReallocIndex>,
+
+    /// The callback function used by these options, if specified.
+    pub callback: Option<RuntimeCallbackIndex>,
 
     /// The post-return function used by these options, if specified.
     pub post_return: Option<RuntimePostReturnIndex>,

@@ -55,6 +55,8 @@ pub struct ComponentDfg {
     /// used by the host)
     pub reallocs: Intern<ReallocId, CoreDef>,
 
+    pub callbacks: Intern<CallbackId, CoreDef>,
+
     /// Same as `reallocs`, but for post-return.
     pub post_returns: Intern<PostReturnId, CoreDef>,
 
@@ -161,6 +163,7 @@ id! {
     pub struct InstanceId(u32);
     pub struct MemoryId(u32);
     pub struct ReallocId(u32);
+    pub struct CallbackId(u32);
     pub struct AdapterId(u32);
     pub struct PostReturnId(u32);
     pub struct AdapterModuleId(u32);
@@ -280,6 +283,7 @@ pub struct CanonicalOptions {
     pub string_encoding: StringEncoding,
     pub memory: Option<MemoryId>,
     pub realloc: Option<ReallocId>,
+    pub callback: Option<CallbackId>,
     pub post_return: Option<PostReturnId>,
     pub async_: bool,
 }
@@ -354,6 +358,7 @@ impl ComponentDfg {
             runtime_memories: Default::default(),
             runtime_post_return: Default::default(),
             runtime_reallocs: Default::default(),
+            runtime_callbacks: Default::default(),
             runtime_instances: Default::default(),
             num_lowerings: 0,
             trampolines: Default::default(),
@@ -391,6 +396,7 @@ impl ComponentDfg {
                 num_runtime_memories: linearize.runtime_memories.len() as u32,
                 num_runtime_post_returns: linearize.runtime_post_return.len() as u32,
                 num_runtime_reallocs: linearize.runtime_reallocs.len() as u32,
+                num_runtime_callbacks: linearize.runtime_callbacks.len() as u32,
                 num_runtime_instances: linearize.runtime_instances.len() as u32,
                 imports: self.imports,
                 import_types: self.import_types,
@@ -422,6 +428,7 @@ struct LinearizeDfg<'a> {
     trampoline_map: HashMap<TrampolineIndex, TrampolineIndex>,
     runtime_memories: HashMap<MemoryId, RuntimeMemoryIndex>,
     runtime_reallocs: HashMap<ReallocId, RuntimeReallocIndex>,
+    runtime_callbacks: HashMap<CallbackId, RuntimeCallbackIndex>,
     runtime_post_return: HashMap<PostReturnId, RuntimePostReturnIndex>,
     runtime_instances: HashMap<RuntimeInstance, RuntimeInstanceIndex>,
     num_lowerings: u32,
@@ -515,12 +522,14 @@ impl LinearizeDfg<'_> {
     fn options(&mut self, options: &CanonicalOptions) -> info::CanonicalOptions {
         let memory = options.memory.map(|mem| self.runtime_memory(mem));
         let realloc = options.realloc.map(|mem| self.runtime_realloc(mem));
+        let callback = options.callback.map(|mem| self.runtime_callback(mem));
         let post_return = options.post_return.map(|mem| self.runtime_post_return(mem));
         info::CanonicalOptions {
             instance: options.instance,
             string_encoding: options.string_encoding,
             memory,
             realloc,
+            callback,
             post_return,
             async_: options.async_,
         }
@@ -541,6 +550,15 @@ impl LinearizeDfg<'_> {
             |me| &mut me.runtime_reallocs,
             |me, realloc| me.core_def(&me.dfg.reallocs[realloc]),
             |index, def| GlobalInitializer::ExtractRealloc(ExtractRealloc { index, def }),
+        )
+    }
+
+    fn runtime_callback(&mut self, callback: CallbackId) -> RuntimeCallbackIndex {
+        self.intern(
+            callback,
+            |me| &mut me.runtime_callbacks,
+            |me, callback| me.core_def(&me.dfg.callbacks[callback]),
+            |index, def| GlobalInitializer::ExtractCallback(ExtractCallback { index, def }),
         )
     }
 

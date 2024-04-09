@@ -158,6 +158,8 @@ pub struct AdapterOptions {
     pub memory64: bool,
     /// An optional definition of `realloc` to used.
     pub realloc: Option<dfg::CoreDef>,
+    /// TODO: docs
+    pub callback: Option<dfg::CoreDef>,
     /// An optional definition of a `post-return` to use.
     pub post_return: Option<dfg::CoreDef>,
     /// TODO: docs
@@ -365,6 +367,9 @@ impl PartitionAdapterModules {
             self.core_export(dfg, memory);
         }
         if let Some(def) = &options.realloc {
+            self.core_def(dfg, def);
+        }
+        if let Some(def) = &options.callback {
             self.core_def(dfg, def);
         }
         if let Some(def) = &options.post_return {

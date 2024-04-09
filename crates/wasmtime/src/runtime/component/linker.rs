@@ -374,7 +374,7 @@ impl<T> LinkerInstance<'_, T> {
     where
         F: Fn(StoreContextMut<T>, Params) -> Result<Return> + Send + Sync + 'static,
         Params: ComponentNamedList + Lift + 'static,
-        Return: ComponentNamedList + Lower + Send + 'static,
+        Return: ComponentNamedList + Lower + Send + Sync + 'static,
     {
         self.insert(name, Definition::Func(HostFunc::from_closure(func)))?;
         Ok(())
@@ -396,7 +396,7 @@ impl<T> LinkerInstance<'_, T> {
             + Sync
             + 'static,
         Params: ComponentNamedList + Lift + 'static,
-        Return: ComponentNamedList + Lower + Send + 'static,
+        Return: ComponentNamedList + Lower + Send + Sync + 'static,
     {
         assert!(
             self.engine.config().async_support,
@@ -416,7 +416,7 @@ impl<T> LinkerInstance<'_, T> {
     pub fn func_wrap_concurrent<Params, Return, F, N, FN>(&mut self, name: &str, f: F) -> Result<()>
     where
         N: FnOnce(StoreContextMut<T>) -> Result<Return> + 'static,
-        FN: Future<Output = N> + Send + 'static,
+        FN: Future<Output = N> + Send + Sync + 'static,
         F: Fn(StoreContextMut<T>, Params) -> FN + Send + Sync + 'static,
         Params: ComponentNamedList + Lift + 'static,
         Return: ComponentNamedList + Lower + Send + 'static,

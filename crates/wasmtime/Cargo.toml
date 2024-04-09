@@ -59,6 +59,7 @@ gimli = { workspace = true }
 # debugging information.
 addr2line = { version = "0.21.0", default-features = false, optional = true }
 semver = { version = "1.0.17", optional = true }
+futures = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-sys]
 workspace = true

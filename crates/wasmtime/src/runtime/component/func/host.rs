@@ -1,7 +1,8 @@
+use crate::component::concurrent;
 use crate::component::func::{LiftContext, LowerContext, Options};
 use crate::component::matching::InstanceType;
 use crate::component::storage::slice_to_storage_mut;
-use crate::component::{concurrent, ComponentNamedList, ComponentType, Lift, Lower, Val};
+use crate::component::{ComponentNamedList, ComponentType, Lift, Lower, Val};
 use crate::{AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{bail, Context, Result};
 use std::any::Any;
@@ -15,18 +16,11 @@ use wasmtime_environ::component::{
     CanonicalAbiInfo, InterfaceType, StringEncoding, TypeFuncIndex, MAX_FLAT_PARAMS,
     MAX_FLAT_RESULTS,
 };
-use wasmtime_runtime::component::{
-    InstanceFlags, VMComponentContext, VMLowering, VMLoweringCallee,
+use wasmtime_runtime::{
+    component::{InstanceFlags, VMComponentContext, VMLowering, VMLoweringCallee},
+    SendSyncPtr,
 };
 use wasmtime_runtime::{VMFuncRef, VMMemoryDefinition, VMOpaqueContext};
-
-fn for_any<F, R, T>(fun: F) -> F
-where
-    F: FnOnce(StoreContextMut<T>) -> Result<R> + 'static,
-    R: 'static,
-{
-    fun
-}
 
 pub struct HostFunc {
     entrypoint: VMLoweringCallee,
@@ -39,18 +33,18 @@ impl HostFunc {
     where
         F: Fn(StoreContextMut<T>, P) -> Result<R> + Send + Sync + 'static,
         P: ComponentNamedList + Lift + 'static,
-        R: ComponentNamedList + Lower + Send + 'static,
+        R: ComponentNamedList + Lower + Send + Sync + 'static,
     {
         Self::from_concurrent(move |store, params| {
             let result = func(store, params);
-            async move { for_any(move |_| result) }
+            async move { concurrent::for_any(move |_| result) }
         })
     }
 
     pub(crate) fn from_concurrent<T, F, N, FN, P, R>(func: F) -> Arc<HostFunc>
     where
         N: FnOnce(StoreContextMut<T>) -> Result<R> + 'static,
-        FN: Future<Output = N> + Send + 'static,
+        FN: Future<Output = N> + Send + Sync + 'static,
         F: Fn(StoreContextMut<T>, P) -> FN + Send + Sync + 'static,
         P: ComponentNamedList + Lift + 'static,
         R: ComponentNamedList + Lower + Send + 'static,
@@ -76,7 +70,7 @@ impl HostFunc {
         storage_len: usize,
     ) where
         N: FnOnce(StoreContextMut<T>) -> Result<R> + 'static,
-        FN: Future<Output = N> + Send + 'static,
+        FN: Future<Output = N> + Send + Sync + 'static,
         F: Fn(StoreContextMut<T>, P) -> FN + Send + Sync + 'static,
         P: ComponentNamedList + Lift + 'static,
         R: ComponentNamedList + Lower + Send + 'static,
@@ -177,7 +171,7 @@ unsafe fn call_host<T, Params, Return, F, N, FN>(
 ) -> Result<()>
 where
     N: FnOnce(StoreContextMut<T>) -> Result<Return> + 'static,
-    FN: Future<Output = N> + Send + 'static,
+    FN: Future<Output = N> + Send + Sync + 'static,
     F: Fn(StoreContextMut<T>, Params) -> FN + 'static,
     Params: Lift,
     Return: Lower + Send + 'static,
@@ -210,6 +204,7 @@ where
         NonNull::new(realloc),
         string_encoding,
         async_,
+        None,
     );
 
     // Perform a dynamic check that this instance can indeed be left. Exiting
@@ -228,34 +223,37 @@ where
         const STATUS_PARAMS_READ: i32 = 1;
         const STATUS_DONE: i32 = 3;
 
-        let mut indirect = Storage::Indirect(slice_to_storage_mut(&mut *storage).assume_init_ref());
+        let paramptr = storage[0].assume_init();
+        let retptr = storage[1].assume_init();
+        let callptr = storage[2].assume_init();
 
-        let mut lift = LiftContext::new(cx.0, &options, types, instance);
-        lift.enter_call();
-        let params = indirect.lift_params(&mut lift, param_tys)?;
+        let params = {
+            let lift = &mut LiftContext::new(cx.0, &options, types, instance);
+            lift.enter_call();
+            let ptr = validate_inbounds::<Params>(lift.memory(), &paramptr)?;
+            Params::load(lift, param_tys, &lift.memory()[ptr..][..Params::SIZE32])?
+        };
 
         let future = closure(cx.as_context_mut(), params);
 
-        let status = match concurrent::first_poll(cx.as_context_mut(), future)? {
-            Ok(ret) => {
-                flags.set_may_leave(false);
-                let mut lower = LowerContext::new(cx, &options, types, instance);
-                indirect.lower_results(&mut lower, result_tys, ret)?;
-                flags.set_may_leave(true);
-
-                lower.exit_call()?;
-
-                STATUS_DONE
+        let task = concurrent::first_poll(cx.as_context_mut(), future, {
+            let instance = SendSyncPtr::new(NonNull::new(instance).unwrap());
+            move |cx, ret: Return| {
+                let mut lower = LowerContext::new(cx, &options, types, instance.as_ptr());
+                let ptr = validate_inbounds::<Return>(lower.as_slice_mut(), &retptr)?;
+                ret.store(&mut lower, result_tys, ptr)
             }
-            Err(task) => {
-                let ptr =
-                    validate_inbounds::<u32>(options.memory_mut(cx.0), &storage[2].assume_init())?;
+        })?;
 
-                let mut lower = LowerContext::new(cx, &options, types, instance);
-                task.rep().store(&mut lower, InterfaceType::U32, ptr)?;
+        let status = if let Some(task) = task {
+            let ptr = validate_inbounds::<u32>(options.memory_mut(cx.0), &callptr)?;
 
-                STATUS_PARAMS_READ
-            }
+            let mut lower = LowerContext::new(cx, &options, types, instance);
+            task.rep().store(&mut lower, InterfaceType::U32, ptr)?;
+
+            STATUS_PARAMS_READ
+        } else {
+            STATUS_DONE
         };
 
         storage[0] = MaybeUninit::new(ValRaw::i32(status));
@@ -353,7 +351,7 @@ where
     }
 }
 
-fn validate_inbounds<T: ComponentType>(memory: &[u8], ptr: &ValRaw) -> Result<usize> {
+pub(crate) fn validate_inbounds<T: ComponentType>(memory: &[u8], ptr: &ValRaw) -> Result<usize> {
     // FIXME: needs memory64 support
     let ptr = usize::try_from(ptr.get_u32())?;
     if ptr % usize::try_from(T::ALIGN32)? != 0 {
@@ -405,6 +403,7 @@ where
         NonNull::new(realloc),
         string_encoding,
         async_,
+        None,
     );
 
     // Perform a dynamic check that this instance can indeed be left. Exiting

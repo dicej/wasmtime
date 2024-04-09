@@ -378,6 +378,7 @@ unsafe impl InstanceAllocatorImpl for PoolingInstanceAllocator {
                 LowerImport { .. }
                 | ExtractMemory(_)
                 | ExtractRealloc(_)
+                | ExtractCallback(_)
                 | ExtractPostReturn(_)
                 | Resource(_) => {}
             }

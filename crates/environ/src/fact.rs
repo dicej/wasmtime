@@ -250,8 +250,14 @@ impl<'a> Module<'a> {
             memory64,
             realloc,
             post_return: _, // handled above
+            callback,
             async_,
         } = options;
+
+        if callback.is_some() {
+            todo!();
+        }
+
         let flags = self.import_global(
             "flags",
             &format!("instance{}", instance.as_u32()),

@@ -45,6 +45,8 @@ pub struct Options {
     string_encoding: StringEncoding,
 
     async_: bool,
+
+    pub(crate) callback: Option<NonNull<VMFuncRef>>,
 }
 
 // The `Options` structure stores raw pointers but they're never used unless a
@@ -69,6 +71,7 @@ impl Options {
         realloc: Option<NonNull<VMFuncRef>>,
         string_encoding: StringEncoding,
         async_: bool,
+        callback: Option<NonNull<VMFuncRef>>,
     ) -> Options {
         Options {
             store_id,
@@ -76,6 +79,7 @@ impl Options {
             realloc,
             string_encoding,
             async_,
+            callback,
         }
     }
 

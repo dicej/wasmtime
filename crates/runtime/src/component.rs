@@ -293,6 +293,15 @@ impl ComponentInstance {
         }
     }
 
+    /// TODO: docs
+    pub fn runtime_callback(&self, idx: RuntimeCallbackIndex) -> NonNull<VMFuncRef> {
+        unsafe {
+            let ret = *self.vmctx_plus_offset::<NonNull<_>>(self.offsets.runtime_callback(idx));
+            debug_assert!(ret.as_ptr() as usize != INVALID_PTR);
+            ret
+        }
+    }
+
     /// Returns the post-return pointer corresponding to the index provided.
     ///
     /// This can only be called after `idx` has been initialized at runtime
@@ -361,6 +370,15 @@ impl ComponentInstance {
     pub fn set_runtime_realloc(&mut self, idx: RuntimeReallocIndex, ptr: NonNull<VMFuncRef>) {
         unsafe {
             let storage = self.vmctx_plus_offset_mut(self.offsets.runtime_realloc(idx));
+            debug_assert!(*storage as usize == INVALID_PTR);
+            *storage = ptr.as_ptr();
+        }
+    }
+
+    /// TODO: docs
+    pub fn set_runtime_callback(&mut self, idx: RuntimeCallbackIndex, ptr: NonNull<VMFuncRef>) {
+        unsafe {
+            let storage = self.vmctx_plus_offset_mut(self.offsets.runtime_callback(idx));
             debug_assert!(*storage as usize == INVALID_PTR);
             *storage = ptr.as_ptr();
         }
@@ -466,7 +484,7 @@ impl ComponentInstance {
         }
 
         // In debug mode set non-null bad values to all "pointer looking" bits
-        // and pices related to lowering and such. This'll help detect any
+        // and pieces related to lowering and such. This'll help detect any
         // erroneous usage and enable debug assertions above as well to prevent
         // loading these before they're configured or setting them twice.
         if cfg!(debug_assertions) {
@@ -490,6 +508,11 @@ impl ComponentInstance {
             for i in 0..self.offsets.num_runtime_reallocs {
                 let i = RuntimeReallocIndex::from_u32(i);
                 let offset = self.offsets.runtime_realloc(i);
+                *self.vmctx_plus_offset_mut(offset) = INVALID_PTR;
+            }
+            for i in 0..self.offsets.num_runtime_callbacks {
+                let i = RuntimeCallbackIndex::from_u32(i);
+                let offset = self.offsets.runtime_callback(i);
                 *self.vmctx_plus_offset_mut(offset) = INVALID_PTR;
             }
             for i in 0..self.offsets.num_runtime_post_returns {
@@ -727,6 +750,11 @@ impl OwnedComponentInstance {
     /// See `ComponentInstance::set_runtime_realloc`
     pub fn set_runtime_realloc(&mut self, idx: RuntimeReallocIndex, ptr: NonNull<VMFuncRef>) {
         unsafe { self.instance_mut().set_runtime_realloc(idx, ptr) }
+    }
+
+    /// See `ComponentInstance::set_runtime_callback`
+    pub fn set_runtime_callback(&mut self, idx: RuntimeCallbackIndex, ptr: NonNull<VMFuncRef>) {
+        unsafe { self.instance_mut().set_runtime_callback(idx, ptr) }
     }
 
     /// See `ComponentInstance::set_runtime_post_return`

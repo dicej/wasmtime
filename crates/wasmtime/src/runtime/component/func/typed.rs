@@ -1,4 +1,4 @@
-use crate::component::func::{Func, LiftContext, LowerContext, Options};
+use crate::component::func::{self, Func, LiftContext, LowerContext, Options};
 use crate::component::matching::InstanceType;
 use crate::component::storage::{storage_as_slice, storage_as_slice_mut};
 use crate::{AsContextMut, StoreContext, StoreContextMut, ValRaw};
@@ -223,7 +223,7 @@ where
                         store,
                         params,
                         Self::lower_stack_args,
-                        Self::lift_heap_result,
+                        Self::lift_heap_result_guest,
                     )
                 }
             } else {
@@ -231,15 +231,15 @@ where
                     self.func.call_raw_async(
                         store,
                         params,
-                        Self::lower_heap_args,
+                        Self::lower_heap_args_guest,
                         Self::lift_stack_result,
                     )
                 } else {
                     self.func.call_raw_async(
                         store,
                         params,
-                        Self::lower_heap_args,
-                        Self::lift_heap_result,
+                        Self::lower_heap_args_guest,
+                        Self::lift_heap_result_guest,
                     )
                 }
             };
@@ -319,8 +319,6 @@ where
         ty: InterfaceType,
         dst: &mut MaybeUninit<ValRaw>,
     ) -> Result<()> {
-        assert!(Params::flatten_count() > MAX_FLAT_PARAMS);
-
         // Memory must exist via validation if the arguments are stored on the
         // heap, so we can create a `MemoryMut` at this point. Afterwards
         // `realloc` is used to allocate space for all the arguments and then
@@ -355,7 +353,6 @@ where
         ty: InterfaceType,
         dst: &Return::Lower,
     ) -> Result<Return> {
-        assert!(Return::flatten_count() <= MAX_FLAT_RESULTS);
         Return::lift(cx, ty, dst)
     }
 
@@ -379,6 +376,26 @@ where
             .and_then(|b| b.get(..Return::SIZE32))
             .ok_or_else(|| anyhow::anyhow!("pointer out of bounds of memory"))?;
         Return::load(cx, ty, bytes)
+    }
+
+    fn lower_heap_args_guest<T>(
+        cx: &mut LowerContext<'_, T>,
+        params: &Params,
+        ty: InterfaceType,
+        dst: &mut MaybeUninit<ValRaw>,
+    ) -> Result<()> {
+        let ptr =
+            func::validate_inbounds::<Params>(cx.as_slice_mut(), &unsafe { dst.assume_init() })?;
+        params.store(cx, ty, ptr)
+    }
+
+    fn lift_heap_result_guest(
+        cx: &mut LiftContext<'_>,
+        ty: InterfaceType,
+        dst: &ValRaw,
+    ) -> Result<Return> {
+        _ = (cx, ty, dst);
+        todo!()
     }
 
     /// See [`Func::post_return`]

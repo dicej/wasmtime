@@ -103,7 +103,7 @@ pub struct FuncData {
     export: ExportFunction,
     ty: TypeFuncIndex,
     types: Arc<ComponentTypes>,
-    options: Options,
+    pub(crate) options: Options,
     instance: Instance,
     component_instance: RuntimeComponentInstanceIndex,
     post_return: Option<ExportFunction>,
@@ -132,6 +132,9 @@ impl Func {
             ExportFunction { func_ref }
         });
         let component_instance = options.instance;
+        let callback = options
+            .callback
+            .map(|i| data.instance().runtime_callback(i));
         let options = unsafe {
             Options::new(
                 store.id(),
@@ -139,6 +142,7 @@ impl Func {
                 realloc,
                 options.string_encoding,
                 options.async_,
+                callback,
             )
         };
         Func(store.store_data_mut().insert(FuncData {
@@ -475,7 +479,7 @@ impl Func {
         LowerReturn: Copy,
     {
         let me = self.0;
-        let FuncData { export, .. } = store.0[me];
+        let export = store.0[me].export;
 
         store.concurrent_state().lift_result = Some(Box::new(move |store, lowered| {
             let FuncData {
@@ -542,7 +546,7 @@ impl Func {
                 bail!(crate::Trap::NoAsyncResult);
             }
         } else {
-            store.concurrent_state().context = context;
+            store.concurrent_state().context = Some((me, context));
             {
                 let async_cx = store.0.async_cx().expect("async cx");
                 let mut future = pin!(concurrent::poll_loop(store));

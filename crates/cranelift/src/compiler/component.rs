@@ -242,10 +242,13 @@ impl<'a> TrampolineCompiler<'a> {
             instance,
             memory,
             realloc,
+            callback,
             post_return,
             string_encoding,
             async_,
         } = *options;
+
+        assert!(callback.is_none());
 
         // vmctx: *mut VMComponentContext
         host_sig.params.push(ir::AbiParam::new(pointer_type));
