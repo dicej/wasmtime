@@ -121,6 +121,14 @@ impl<'a> TrampolineCompiler<'a> {
             Trampoline::ResourceExitCall => {
                 self.translate_resource_libcall(host::resource_exit_call)
             }
+            Trampoline::AsyncEnterCall => self.translate_async_enter_or_exit(
+                self.offsets.async_enter(),
+                vec![ir::AbiParam::new(self.isa.pointer_type()); 3],
+            ),
+            Trampoline::AsyncExitCall => self.translate_async_enter_or_exit(
+                self.offsets.async_exit(),
+                vec![ir::AbiParam::new(ir::types::I32)],
+            ),
         }
     }
 
@@ -216,6 +224,54 @@ impl<'a> TrampolineCompiler<'a> {
             .call_indirect(host_sig, host_fn, &callee_args);
 
         self.load_wasm_results(values_vec_ptr, values_vec_len);
+    }
+
+    fn translate_async_enter_or_exit(&mut self, offset: u32, params: Vec<ir::AbiParam>) {
+        match self.abi {
+            Abi::Wasm => {}
+
+            // These trampolines can only actually be called by Wasm, so
+            // let's assert that here.
+            Abi::Native | Abi::Array => {
+                self.builder
+                    .ins()
+                    .trap(ir::TrapCode::User(crate::DEBUG_ASSERT_TRAP_CODE));
+                return;
+            }
+        }
+
+        let pointer_type = self.isa.pointer_type();
+        let args = self.builder.func.dfg.block_params(self.block0).to_vec();
+        let vmctx = args[0];
+
+        let mut callee_args = Vec::new();
+        let mut host_sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
+
+        // vmctx: *mut VMComponentContext
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        callee_args.push(vmctx);
+
+        host_sig.params.extend(params);
+        callee_args.extend(args[2..].iter().copied());
+
+        host_sig.returns.push(ir::AbiParam::new(ir::types::I32));
+
+        // Load host function pointer from the vmcontext and then call that
+        // indirect function pointer with the list of arguments.
+        let host_fn = self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(offset).unwrap(),
+        );
+        let host_sig = self.builder.import_signature(host_sig);
+        let call = self
+            .builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &callee_args);
+
+        let result = self.builder.func.dfg.inst_results(call)[0];
+        self.builder.ins().return_(&[result]);
     }
 
     fn translate_lower_import(

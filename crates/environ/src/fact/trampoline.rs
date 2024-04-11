@@ -98,7 +98,7 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
         module.types.contains_borrow_resource(&adapter.lift)
     );
 
-    Compiler {
+    let compiler = Compiler {
         types: module.types,
         module,
         code: Vec::new(),
@@ -108,8 +108,60 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
         result,
         fuel: INITIAL_FUEL,
         emit_resource_call,
+    };
+
+    match (adapter.lower.options.async_, adapter.lift.options.async_) {
+        (false, false) => compiler.compile_sync_to_sync_adapter(adapter, &lower_sig, &lift_sig),
+        (true, true) => {
+            compiler.compile_async_to_async_adapter(adapter);
+
+            {
+                let sig = module.types.async_start_signature(&adapter.lift);
+                let ty = module.core_types.function(&sig.params, &sig.results);
+                let result = module.funcs.push(Function::new(
+                    Some(format!("[async-start]{}", adapter.name)),
+                    ty,
+                ));
+
+                Compiler {
+                    types: module.types,
+                    module,
+                    code: Vec::new(),
+                    nlocals: sig.params.len() as u32,
+                    free_locals: HashMap::new(),
+                    traps: Vec::new(),
+                    result,
+                    fuel: INITIAL_FUEL,
+                    emit_resource_call,
+                }
+                .compile_async_start_adapter(adapter, &sig);
+            }
+
+            {
+                let sig = module.types.async_return_signature(&adapter.lift);
+                let ty = module.core_types.function(&sig.params, &sig.results);
+                let result = module.funcs.push(Function::new(
+                    Some(format!("[async-return]{}", adapter.name)),
+                    ty,
+                ));
+
+                Compiler {
+                    types: module.types,
+                    module,
+                    code: Vec::new(),
+                    nlocals: sig.params.len() as u32,
+                    free_locals: HashMap::new(),
+                    traps: Vec::new(),
+                    result,
+                    fuel: INITIAL_FUEL,
+                    emit_resource_call,
+                }
+                .compile_async_return_adapter(adapter, &sig);
+            }
+        }
+        (false, true) => todo!("sync to async adapter"),
+        (true, false) => todo!("async to sync adapter"),
     }
-    .compile_adapter(adapter, &lower_sig, &lift_sig)
 }
 
 /// Compiles a helper function as specified by the `Helper` configuration.
@@ -163,7 +215,7 @@ pub(super) fn compile_helper(module: &mut Module<'_>, result: FunctionId, helper
                 .unwrap();
             Destination::Stack(&dst_flat, &helper.dst.opts)
         }
-        // This is the same as a memroy-based source but note that the address
+        // This is the same as a memory-based source but note that the address
         // of the destination is passed as the final parameter to the function.
         HelperLocation::Memory => {
             nlocals += 1;
@@ -243,7 +295,56 @@ struct Memory<'a> {
 }
 
 impl Compiler<'_, '_> {
-    fn compile_adapter(
+    fn compile_async_to_async_adapter(mut self, adapter: &AdapterData) {
+        let enter = self
+            .module
+            .import_async_enter_call(adapter.lower.options.ptr());
+        self.instruction(LocalGet(0));
+        self.instruction(LocalGet(1));
+        self.instruction(LocalGet(2));
+        self.instruction(Call(enter.as_u32()));
+
+        self.instruction(Call(adapter.callee.as_u32()));
+
+        let exit = self
+            .module
+            .import_async_exit_call(adapter.lift.options.ptr());
+        self.instruction(Call(exit.as_u32()));
+
+        self.finish()
+    }
+
+    fn compile_async_start_adapter(mut self, adapter: &AdapterData, sig: &Signature) {
+        let param_locals = sig
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| (i as u32, *ty))
+            .collect::<Vec<_>>();
+
+        self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, false);
+        self.translate_params(adapter, &param_locals);
+        self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, true);
+
+        self.finish()
+    }
+
+    fn compile_async_return_adapter(mut self, adapter: &AdapterData, sig: &Signature) {
+        let param_locals = sig
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| (i as u32, *ty))
+            .collect::<Vec<_>>();
+
+        self.set_flag(adapter.lower.flags, FLAG_MAY_LEAVE, false);
+        self.translate_results(adapter, &param_locals, &param_locals);
+        self.set_flag(adapter.lower.flags, FLAG_MAY_LEAVE, true);
+
+        self.finish()
+    }
+
+    fn compile_sync_to_sync_adapter(
         mut self,
         adapter: &AdapterData,
         lower_sig: &Signature,
@@ -361,12 +462,21 @@ impl Compiler<'_, '_> {
         // TODO: handle subtyping
         assert_eq!(src_tys.len(), dst_tys.len());
 
-        let src_flat =
+        let src_flat = if adapter.lower.options.async_ {
+            None
+        } else {
             self.types
-                .flatten_types(lower_opts, MAX_FLAT_PARAMS, src_tys.iter().copied());
-        let dst_flat =
-            self.types
-                .flatten_types(lift_opts, MAX_FLAT_PARAMS, dst_tys.iter().copied());
+                .flatten_types(lower_opts, MAX_FLAT_PARAMS, src_tys.iter().copied())
+        };
+        let dst_flat = self.types.flatten_types(
+            lift_opts,
+            if adapter.lift.options.async_ {
+                MAX_FLAT_RESULTS
+            } else {
+                MAX_FLAT_PARAMS
+            },
+            dst_tys.iter().copied(),
+        );
 
         let src = if let Some(flat) = &src_flat {
             Source::Stack(Stack {
@@ -442,12 +552,21 @@ impl Compiler<'_, '_> {
         let lift_opts = &adapter.lift.options;
         let lower_opts = &adapter.lower.options;
 
-        let src_flat =
+        let src_flat = self.types.flatten_types(
+            lift_opts,
+            if adapter.lift.options.async_ {
+                MAX_FLAT_PARAMS
+            } else {
+                MAX_FLAT_RESULTS
+            },
+            src_tys.iter().copied(),
+        );
+        let dst_flat = if adapter.lower.options.async_ {
+            None
+        } else {
             self.types
-                .flatten_types(lift_opts, MAX_FLAT_RESULTS, src_tys.iter().copied());
-        let dst_flat =
-            self.types
-                .flatten_types(lower_opts, MAX_FLAT_RESULTS, dst_tys.iter().copied());
+                .flatten_types(lower_opts, MAX_FLAT_RESULTS, dst_tys.iter().copied())
+        };
 
         let src = if src_flat.is_some() {
             Source::Stack(Stack {

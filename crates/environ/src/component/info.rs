@@ -589,6 +589,12 @@ pub enum Trampoline {
 
     /// Same as `ResourceEnterCall` except for when exiting a call.
     ResourceExitCall,
+
+    /// TODO: docs
+    AsyncEnterCall,
+
+    /// TODO: docs
+    AsyncExitCall,
 }
 
 impl Trampoline {
@@ -618,6 +624,8 @@ impl Trampoline {
             ResourceTransferBorrow => format!("component-resource-transfer-borrow"),
             ResourceEnterCall => format!("component-resource-enter-call"),
             ResourceExitCall => format!("component-resource-exit-call"),
+            AsyncEnterCall => format!("component-async-enter-call"),
+            AsyncExitCall => format!("component-async-exit-call"),
         }
     }
 }

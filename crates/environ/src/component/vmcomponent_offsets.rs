@@ -6,6 +6,8 @@
 //      store: *mut dyn Store,
 //      async_start: VMAsyncCallback,
 //      async_return: VMAsyncCallback,
+//      async_enter: VMAsyncEnterCallback,
+//      async_exit: VMAsyncExitCallback,
 //      limits: *const VMRuntimeLimits,
 //      flags: [VMGlobalDefinition; component.num_runtime_component_instances],
 //      trampoline_func_refs: [VMFuncRef; component.num_trampolines],
@@ -67,6 +69,8 @@ pub struct VMComponentOffsets<P> {
     store: u32,
     async_start: u32,
     async_return: u32,
+    async_enter: u32,
+    async_exit: u32,
     limits: u32,
     flags: u32,
     trampoline_func_refs: u32,
@@ -117,6 +121,8 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             size: 0,
             async_start: 0,
             async_return: 0,
+            async_enter: 0,
+            async_exit: 0,
         };
 
         // Convenience functions for checked addition and multiplication.
@@ -151,6 +157,8 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             size(limits) = ret.ptr.size(),
             size(async_start) = ret.ptr.size(),
             size(async_return) = ret.ptr.size(),
+            size(async_enter) = ret.ptr.size(),
+            size(async_exit) = ret.ptr.size(),
             align(16),
             size(flags) = cmul(ret.num_runtime_component_instances, ret.ptr.size_of_vmglobal_definition()),
             align(u32::from(ret.ptr.size())),
@@ -237,6 +245,16 @@ impl<P: PtrSize> VMComponentOffsets<P> {
     /// TODO: docs
     pub fn async_return(&self) -> u32 {
         self.async_return
+    }
+
+    /// TODO: docs
+    pub fn async_enter(&self) -> u32 {
+        self.async_enter
+    }
+
+    /// TODO: docs
+    pub fn async_exit(&self) -> u32 {
+        self.async_exit
     }
 
     /// The offset of the `VMLowering` for the `index` specified.

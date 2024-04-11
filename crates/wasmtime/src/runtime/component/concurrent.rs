@@ -212,10 +212,25 @@ pub extern "C" fn async_return<T>(
     }
 }
 
-unsafe fn handle_result(func: impl FnOnce() -> Result<()>) {
+unsafe fn handle_result<T>(func: impl FnOnce() -> Result<T>) -> T {
     match panic::catch_unwind(AssertUnwindSafe(func)) {
-        Ok(Ok(())) => {}
+        Ok(Ok(value)) => value,
         Ok(Err(e)) => crate::trap::raise(e),
         Err(e) => wasmtime_runtime::resume_panic(e),
     }
+}
+
+pub extern "C" fn async_enter<T>(
+    cx: *mut VMOpaqueContext,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32 {
+    _ = (cx, params, results, call);
+    unsafe { handle_result(|| todo!()) }
+}
+
+pub extern "C" fn async_exit<T>(cx: *mut VMOpaqueContext, guest_context: u32) -> u32 {
+    _ = (cx, guest_context);
+    unsafe { handle_result(|| todo!()) }
 }

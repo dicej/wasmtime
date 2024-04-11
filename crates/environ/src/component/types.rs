@@ -358,7 +358,7 @@ where
     }
 }
 
-/// Structured used to build a [`ComponentTypes`] during translation.
+/// Structure used to build a [`ComponentTypes`] during translation.
 ///
 /// This contains tables to intern any component types found as well as
 /// managing building up core wasm [`ModuleTypes`] as well.

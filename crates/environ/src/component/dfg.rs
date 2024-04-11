@@ -273,6 +273,8 @@ pub enum Trampoline {
     ResourceTransferBorrow,
     ResourceEnterCall,
     ResourceExitCall,
+    AsyncEnterCall,
+    AsyncExitCall,
 }
 
 /// Same as `info::CanonicalOptions`
@@ -626,6 +628,8 @@ impl LinearizeDfg<'_> {
             Trampoline::ResourceTransferBorrow => info::Trampoline::ResourceTransferBorrow,
             Trampoline::ResourceEnterCall => info::Trampoline::ResourceEnterCall,
             Trampoline::ResourceExitCall => info::Trampoline::ResourceExitCall,
+            Trampoline::AsyncEnterCall => info::Trampoline::AsyncEnterCall,
+            Trampoline::AsyncExitCall => info::Trampoline::AsyncExitCall,
         };
         let i1 = self.trampolines.push(*signature);
         let i2 = self.trampoline_defs.push(trampoline);

@@ -133,6 +133,14 @@ pub type VMAsyncCallback = extern "C" fn(
     nargs_and_results: usize,
 );
 
+/// TODO: docs
+pub type VMAsyncEnterCallback =
+    extern "C" fn(vmctx: *mut VMOpaqueContext, params: u32, results: u32, call: u32) -> u32;
+
+/// TODO: docs
+pub type VMAsyncExitCallback =
+    extern "C" fn(vmctx: *mut VMOpaqueContext, guest_context: u32) -> u32;
+
 /// This is a marker type to represent the underlying allocation of a
 /// `VMComponentContext`.
 ///
@@ -463,10 +471,18 @@ impl ComponentInstance {
     }
 
     /// TODO: docs
-    pub fn set_async_callbacks(&mut self, start: VMAsyncCallback, return_: VMAsyncCallback) {
+    pub fn set_async_callbacks(
+        &mut self,
+        start: VMAsyncCallback,
+        return_: VMAsyncCallback,
+        enter: VMAsyncEnterCallback,
+        exit: VMAsyncExitCallback,
+    ) {
         unsafe {
             *self.vmctx_plus_offset_mut(self.offsets.async_start()) = start;
             *self.vmctx_plus_offset_mut(self.offsets.async_return()) = return_;
+            *self.vmctx_plus_offset_mut(self.offsets.async_enter()) = enter;
+            *self.vmctx_plus_offset_mut(self.offsets.async_exit()) = exit;
         }
     }
 
@@ -801,8 +817,17 @@ impl OwnedComponentInstance {
     }
 
     /// TODO: docs
-    pub fn set_async_callbacks(&mut self, start: VMAsyncCallback, return_: VMAsyncCallback) {
-        unsafe { self.instance_mut().set_async_callbacks(start, return_) }
+    pub fn set_async_callbacks(
+        &mut self,
+        start: VMAsyncCallback,
+        return_: VMAsyncCallback,
+        enter: VMAsyncEnterCallback,
+        exit: VMAsyncExitCallback,
+    ) {
+        unsafe {
+            self.instance_mut()
+                .set_async_callbacks(start, return_, enter, exit)
+        }
     }
 }
 

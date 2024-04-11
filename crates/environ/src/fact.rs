@@ -65,6 +65,8 @@ pub struct Module<'a> {
     imported_resource_transfer_borrow: Option<FuncIndex>,
     imported_resource_enter_call: Option<FuncIndex>,
     imported_resource_exit_call: Option<FuncIndex>,
+    imported_async_enter_call: Option<FuncIndex>,
+    imported_async_exit_call: Option<FuncIndex>,
 
     // Current status of index spaces from the imports generated so far.
     imported_funcs: PrimaryMap<FuncIndex, Option<CoreDef>>,
@@ -123,6 +125,7 @@ struct Options {
     /// An optionally-specified function to be used to allocate space for
     /// types such as strings as they go into a module.
     realloc: Option<FuncIndex>,
+    callback: Option<FuncIndex>,
     async_: bool,
 }
 
@@ -189,6 +192,8 @@ impl<'a> Module<'a> {
             imported_resource_transfer_borrow: None,
             imported_resource_enter_call: None,
             imported_resource_exit_call: None,
+            imported_async_enter_call: None,
+            imported_async_exit_call: None,
         }
     }
 
@@ -254,10 +259,6 @@ impl<'a> Module<'a> {
             async_,
         } = options;
 
-        if callback.is_some() {
-            todo!();
-        }
-
         let flags = self.import_global(
             "flags",
             &format!("instance{}", instance.as_u32()),
@@ -294,6 +295,23 @@ impl<'a> Module<'a> {
                 func.clone(),
             )
         });
+        let callback = callback.as_ref().map(|func| {
+            let ptr = if *memory64 {
+                ValType::I64
+            } else {
+                ValType::I32
+            };
+            let ty = self.core_types.function(
+                &[ptr, ValType::I32, ValType::I32, ValType::I32],
+                &[ValType::I32],
+            );
+            self.import_func(
+                "callback",
+                &format!("f{}", self.imported_funcs.len()),
+                ty,
+                func.clone(),
+            )
+        });
 
         AdapterOptions {
             ty,
@@ -304,6 +322,7 @@ impl<'a> Module<'a> {
                 memory64: *memory64,
                 memory,
                 realloc,
+                callback,
                 async_: *async_,
             },
         }
@@ -403,6 +422,28 @@ impl<'a> Module<'a> {
         let idx = self.imported_funcs.push(None);
         *get(self) = Some(idx);
         idx
+    }
+
+    fn import_async_enter_call(&mut self, ptr_ty: ValType) -> FuncIndex {
+        self.import_simple(
+            "async",
+            "enter-call",
+            &[ptr_ty; 3],
+            &[],
+            Import::AsyncEnterCall,
+            |me| &mut me.imported_async_enter_call,
+        )
+    }
+
+    fn import_async_exit_call(&mut self, ptr_ty: ValType) -> FuncIndex {
+        self.import_simple(
+            "async",
+            "exit-call",
+            &[ptr_ty],
+            &[ValType::I32],
+            Import::AsyncExitCall,
+            |me| &mut me.imported_async_exit_call,
+        )
     }
 
     fn import_resource_transfer_own(&mut self) -> FuncIndex {
@@ -569,6 +610,10 @@ pub enum Import {
     /// Tears down a previous entry and handles checking borrow-related
     /// metadata.
     ResourceExitCall,
+    /// TODO: docs
+    AsyncEnterCall,
+    /// TODO: docs
+    AsyncExitCall,
 }
 
 impl Options {

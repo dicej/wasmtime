@@ -298,9 +298,12 @@ impl<'a> Instantiator<'a> {
     fn run<T>(&mut self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
         let env_component = self.component.env_component();
 
-        self.data
-            .state
-            .set_async_callbacks(concurrent::async_start::<T>, concurrent::async_return::<T>);
+        self.data.state.set_async_callbacks(
+            concurrent::async_start::<T>,
+            concurrent::async_return::<T>,
+            concurrent::async_enter::<T>,
+            concurrent::async_exit::<T>,
+        );
 
         // Before all initializers are processed configure all destructors for
         // host-defined resources. No initializer will correspond to these and
