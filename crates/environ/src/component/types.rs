@@ -217,7 +217,7 @@ indices! {
     ///
     /// This is used to point to various bits of metadata within a compiled
     /// component and is stored in the final compilation artifact. This does not
-    /// have a direct corresponance to any wasm definition.
+    /// have a direct correspondence to any wasm definition.
     pub struct TrampolineIndex(u32);
 }
 

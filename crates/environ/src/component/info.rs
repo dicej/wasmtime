@@ -594,7 +594,7 @@ pub enum Trampoline {
     AsyncEnterCall,
 
     /// TODO: docs
-    AsyncExitCall,
+    AsyncExitCall(RuntimeCallbackIndex),
 }
 
 impl Trampoline {
@@ -625,7 +625,7 @@ impl Trampoline {
             ResourceEnterCall => format!("component-resource-enter-call"),
             ResourceExitCall => format!("component-resource-exit-call"),
             AsyncEnterCall => format!("component-async-enter-call"),
-            AsyncExitCall => format!("component-async-exit-call"),
+            AsyncExitCall(_) => format!("component-async-exit-call"),
         }
     }
 }

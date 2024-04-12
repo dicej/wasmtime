@@ -103,7 +103,7 @@ pub struct ComponentDfg {
     /// The values here are the module that the adapter is present within along
     /// as the core wasm index of the export corresponding to the lowered
     /// version of the adapter.
-    pub adapter_paritionings: PrimaryMap<AdapterId, (AdapterModuleId, EntityIndex)>,
+    pub adapter_partitionings: PrimaryMap<AdapterId, (AdapterModuleId, EntityIndex)>,
 
     /// Defined resources in this component sorted by index with metadata about
     /// each resource.
@@ -209,7 +209,7 @@ pub enum CoreDef {
     /// This is a special variant not present in `info::CoreDef` which
     /// represents that this definition refers to a fused adapter function. This
     /// adapter is fully processed after the initial translation and
-    /// identificatino of adapters.
+    /// identification of adapters.
     ///
     /// During translation into `info::CoreDef` this variant is erased and
     /// replaced by `info::CoreDef::Export` since adapters are always
@@ -274,7 +274,7 @@ pub enum Trampoline {
     ResourceEnterCall,
     ResourceExitCall,
     AsyncEnterCall,
-    AsyncExitCall,
+    AsyncExitCall(CallbackId),
 }
 
 /// Same as `info::CanonicalOptions`
@@ -352,7 +352,7 @@ impl<K: EntityRef, V> Default for Intern<K, V> {
 
 impl ComponentDfg {
     /// Consumes the intermediate `ComponentDfg` to produce a final `Component`
-    /// with a linear innitializer list.
+    /// with a linear initializer list.
     pub fn finish(self) -> ComponentTranslation {
         let mut linearize = LinearizeDfg {
             dfg: &self,
@@ -629,7 +629,9 @@ impl LinearizeDfg<'_> {
             Trampoline::ResourceEnterCall => info::Trampoline::ResourceEnterCall,
             Trampoline::ResourceExitCall => info::Trampoline::ResourceExitCall,
             Trampoline::AsyncEnterCall => info::Trampoline::AsyncEnterCall,
-            Trampoline::AsyncExitCall => info::Trampoline::AsyncExitCall,
+            Trampoline::AsyncExitCall(callback) => {
+                info::Trampoline::AsyncExitCall(self.runtime_callback(*callback))
+            }
         };
         let i1 = self.trampolines.push(*signature);
         let i2 = self.trampoline_defs.push(trampoline);
@@ -651,7 +653,7 @@ impl LinearizeDfg<'_> {
     }
 
     fn adapter(&mut self, adapter: AdapterId) -> info::CoreExport<EntityIndex> {
-        let (adapter_module, entity_index) = self.dfg.adapter_paritionings[adapter];
+        let (adapter_module, entity_index) = self.dfg.adapter_partitionings[adapter];
 
         // Instantiates the adapter module if it hasn't already been
         // instantiated or otherwise returns the index that the module was

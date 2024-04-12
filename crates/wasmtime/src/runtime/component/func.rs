@@ -8,7 +8,6 @@ use crate::{AsContext, AsContextMut, StoreContextMut, ValRaw};
 use anyhow::{bail, Context, Result};
 use std::any::Any;
 use std::mem::{self, MaybeUninit};
-use std::pin::pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use wasmtime_environ::component::{
@@ -481,87 +480,67 @@ impl Func {
         let me = self.0;
         let export = store.0[me].export;
 
-        store.concurrent_state().lift_result = Some(Box::new(move |store, lowered| {
-            let FuncData {
-                options,
-                instance,
-                ty,
-                ..
-            } = store.0[me];
+        concurrent::enter(
+            store.as_context_mut(),
+            Box::new(move |store, lowered| {
+                let FuncData {
+                    options,
+                    instance,
+                    component_instance,
+                    ty,
+                    ..
+                } = store.0[me];
 
-            let instance = store.0[instance.0].as_ref().unwrap();
-            let types = instance.component_types().clone();
-            let instance_ptr = instance.instance_ptr();
+                let instance = store.0[instance.0].as_ref().unwrap();
+                let types = instance.component_types().clone();
+                let instance_ptr = instance.instance_ptr();
+                let mut flags = instance.instance().instance_flags(component_instance);
 
-            unsafe {
-                Ok(Box::new(lift(
-                    &mut LiftContext::new(store.0, &options, &types, instance_ptr),
-                    InterfaceType::Tuple(types[ty].results),
-                    slice_to_storage(lowered),
-                )?) as Box<dyn Any + Send + Sync>)
-            }
-        }));
+                unsafe {
+                    flags.set_may_leave(false);
+                    let mut cx =
+                        LowerContext::new(store.as_context_mut(), &options, &types, instance_ptr);
+                    cx.enter_call();
+                    let result = lower(
+                        &mut cx,
+                        &params,
+                        InterfaceType::Tuple(types[ty].params),
+                        slice_to_storage_mut(lowered),
+                    );
+                    flags.set_may_leave(true);
+                    result
+                }
+            }),
+            Box::new(move |store, lowered| {
+                let FuncData {
+                    options,
+                    instance,
+                    ty,
+                    ..
+                } = store.0[me];
 
-        store.concurrent_state().lower_params = Some(Box::new(move |store, lowered| {
-            let FuncData {
-                options,
-                instance,
-                component_instance,
-                ty,
-                ..
-            } = store.0[me];
+                let instance = store.0[instance.0].as_ref().unwrap();
+                let types = instance.component_types().clone();
+                let instance_ptr = instance.instance_ptr();
 
-            let instance = store.0[instance.0].as_ref().unwrap();
-            let types = instance.component_types().clone();
-            let instance_ptr = instance.instance_ptr();
-            let mut flags = instance.instance().instance_flags(component_instance);
-
-            unsafe {
-                flags.set_may_leave(false);
-                let mut cx =
-                    LowerContext::new(store.as_context_mut(), &options, &types, instance_ptr);
-                cx.enter_call();
-                let result = lower(
-                    &mut cx,
-                    &params,
-                    InterfaceType::Tuple(types[ty].params),
-                    slice_to_storage_mut(lowered),
-                );
-                flags.set_may_leave(true);
-                result
-            }
-        }));
+                unsafe {
+                    Ok(Some(Box::new(lift(
+                        &mut LiftContext::new(store.0, &options, &types, instance_ptr),
+                        InterfaceType::Tuple(types[ty].results),
+                        slice_to_storage(lowered),
+                    )?) as Box<dyn Any + Send + Sync>))
+                }
+            }),
+        )?;
 
         let context = unsafe {
             let mut space = MaybeUninit::<ValRaw>::uninit();
             crate::Func::call_unchecked_raw(store, export.func_ref, space.as_mut_ptr(), 1)?;
-            space.assume_init().get_i32()
+            space.assume_init().get_u32()
         };
 
-        if context == 0 {
-            if let Some(result) = store.concurrent_state().result.take() {
-                return Ok(*result.downcast().unwrap());
-            } else {
-                // TODO: add a specific variant to `Trap` for this case
-                bail!(crate::Trap::NoAsyncResult);
-            }
-        } else {
-            store.concurrent_state().context = Some((me, context));
-            {
-                let async_cx = store.0.async_cx().expect("async cx");
-                let mut future = pin!(concurrent::poll_loop(store));
-                unsafe {
-                    async_cx.block_on(future.as_mut())??;
-                }
-            }
-            return Ok(*store
-                .concurrent_state()
-                .result
-                .take()
-                .unwrap()
-                .downcast()
-                .unwrap());
-        }
+        let callback = store.0[me].options.callback.unwrap();
+        concurrent::exit(store.as_context_mut(), callback, context)
     }
 
     /// Invokes the underlying wasm function, lowering arguments and lifting the

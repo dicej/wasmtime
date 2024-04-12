@@ -235,7 +235,7 @@ impl<'data> Translator<'_, 'data> {
             // in-order here as well. (with an assert to double-check)
             for (adapter, name) in adapter_module.adapters.iter().zip(&names) {
                 let index = translation.module.exports[name];
-                let i = component.adapter_paritionings.push((module_id, index));
+                let i = component.adapter_partitionings.push((module_id, index));
                 assert_eq!(i, *adapter);
             }
 
@@ -307,7 +307,9 @@ fn fact_import_to_core_def(
         fact::Import::ResourceEnterCall => simple_intrinsic(dfg::Trampoline::ResourceEnterCall),
         fact::Import::ResourceExitCall => simple_intrinsic(dfg::Trampoline::ResourceExitCall),
         fact::Import::AsyncEnterCall => simple_intrinsic(dfg::Trampoline::AsyncEnterCall),
-        fact::Import::AsyncExitCall => simple_intrinsic(dfg::Trampoline::AsyncExitCall),
+        fact::Import::AsyncExitCall(callback) => simple_intrinsic(dfg::Trampoline::AsyncExitCall(
+            dfg.callbacks.push(callback.clone()),
+        )),
     }
 }
 

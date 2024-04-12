@@ -424,24 +424,32 @@ impl<'a> Module<'a> {
         idx
     }
 
-    fn import_async_enter_call(&mut self, ptr_ty: ValType) -> FuncIndex {
+    fn import_async_enter_call(&mut self) -> FuncIndex {
         self.import_simple(
             "async",
             "enter-call",
-            &[ptr_ty; 3],
+            &[
+                ValType::FUNCREF,
+                ValType::FUNCREF,
+                ValType::FUNCREF,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
             &[],
             Import::AsyncEnterCall,
             |me| &mut me.imported_async_enter_call,
         )
     }
 
-    fn import_async_exit_call(&mut self, ptr_ty: ValType) -> FuncIndex {
+    fn import_async_exit_call(&mut self, callback: FuncIndex) -> FuncIndex {
         self.import_simple(
             "async",
             "exit-call",
-            &[ptr_ty],
             &[ValType::I32],
-            Import::AsyncExitCall,
+            &[ValType::I32],
+            Import::AsyncExitCall(self.imported_funcs.get(callback).unwrap().clone().unwrap()),
             |me| &mut me.imported_async_exit_call,
         )
     }
@@ -553,6 +561,9 @@ impl<'a> Module<'a> {
                     Body::Call(id) => {
                         Instruction::Call(id_to_index[*id].as_u32()).encode(&mut body);
                     }
+                    Body::RefFunc(id) => {
+                        Instruction::RefFunc(id_to_index[*id].as_u32()).encode(&mut body);
+                    }
                 }
             }
             code.raw(&body);
@@ -613,7 +624,7 @@ pub enum Import {
     /// TODO: docs
     AsyncEnterCall,
     /// TODO: docs
-    AsyncExitCall,
+    AsyncExitCall(CoreDef),
 }
 
 impl Options {
@@ -712,6 +723,7 @@ struct Function {
 enum Body {
     Raw(Vec<u8>, Vec<(usize, traps::Trap)>),
     Call(FunctionId),
+    RefFunc(FunctionId),
 }
 
 impl Function {

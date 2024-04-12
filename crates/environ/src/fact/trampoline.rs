@@ -79,43 +79,53 @@ struct Compiler<'a, 'b> {
 }
 
 pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
-    let lower_sig = module.types.signature(&adapter.lower, Context::Lower);
-    let lift_sig = module.types.signature(&adapter.lift, Context::Lift);
-    let ty = module
-        .core_types
-        .function(&lower_sig.params, &lower_sig.results);
-    let result = module
-        .funcs
-        .push(Function::new(Some(adapter.name.clone()), ty));
+    fn compiler<'a, 'b>(
+        module: &'b mut Module<'a>,
+        adapter: &AdapterData,
+    ) -> (Compiler<'a, 'b>, Signature, Signature) {
+        let lower_sig = module.types.signature(&adapter.lower, Context::Lower);
+        let lift_sig = module.types.signature(&adapter.lift, Context::Lift);
+        let ty = module
+            .core_types
+            .function(&lower_sig.params, &lower_sig.results);
+        let result = module
+            .funcs
+            .push(Function::new(Some(adapter.name.clone()), ty));
 
-    // If this type signature contains any borrowed resources then invocations
-    // of enter/exit call for resource-related metadata tracking must be used.
-    // It shouldn't matter whether the lower/lift signature is used here as both
-    // should return the same answer.
-    let emit_resource_call = module.types.contains_borrow_resource(&adapter.lower);
-    assert_eq!(
-        emit_resource_call,
-        module.types.contains_borrow_resource(&adapter.lift)
-    );
+        // If this type signature contains any borrowed resources then invocations
+        // of enter/exit call for resource-related metadata tracking must be used.
+        // It shouldn't matter whether the lower/lift signature is used here as both
+        // should return the same answer.
+        let emit_resource_call = module.types.contains_borrow_resource(&adapter.lower);
+        assert_eq!(
+            emit_resource_call,
+            module.types.contains_borrow_resource(&adapter.lift)
+        );
 
-    let compiler = Compiler {
-        types: module.types,
-        module,
-        code: Vec::new(),
-        nlocals: lower_sig.params.len() as u32,
-        free_locals: HashMap::new(),
-        traps: Vec::new(),
-        result,
-        fuel: INITIAL_FUEL,
-        emit_resource_call,
-    };
+        (
+            Compiler {
+                types: module.types,
+                module,
+                code: Vec::new(),
+                nlocals: lower_sig.params.len() as u32,
+                free_locals: HashMap::new(),
+                traps: Vec::new(),
+                result,
+                fuel: INITIAL_FUEL,
+                emit_resource_call,
+            },
+            lower_sig,
+            lift_sig,
+        )
+    }
 
     match (adapter.lower.options.async_, adapter.lift.options.async_) {
-        (false, false) => compiler.compile_sync_to_sync_adapter(adapter, &lower_sig, &lift_sig),
+        (false, false) => {
+            let (compiler, lower_sig, lift_sig) = compiler(module, adapter);
+            compiler.compile_sync_to_sync_adapter(adapter, &lower_sig, &lift_sig)
+        }
         (true, true) => {
-            compiler.compile_async_to_async_adapter(adapter);
-
-            {
+            let (start, expect_retptr) = {
                 let sig = module.types.async_start_signature(&adapter.lift);
                 let ty = module.core_types.function(&sig.params, &sig.results);
                 let result = module.funcs.push(Function::new(
@@ -123,21 +133,24 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
                     ty,
                 ));
 
-                Compiler {
-                    types: module.types,
-                    module,
-                    code: Vec::new(),
-                    nlocals: sig.params.len() as u32,
-                    free_locals: HashMap::new(),
-                    traps: Vec::new(),
+                (
                     result,
-                    fuel: INITIAL_FUEL,
-                    emit_resource_call,
-                }
-                .compile_async_start_adapter(adapter, &sig);
-            }
+                    Compiler {
+                        types: module.types,
+                        module,
+                        code: Vec::new(),
+                        nlocals: sig.params.len() as u32,
+                        free_locals: HashMap::new(),
+                        traps: Vec::new(),
+                        result,
+                        fuel: INITIAL_FUEL,
+                        emit_resource_call: false,
+                    }
+                    .compile_async_start_adapter(adapter, &sig),
+                )
+            };
 
-            {
+            let return_ = {
                 let sig = module.types.async_return_signature(&adapter.lift);
                 let ty = module.core_types.function(&sig.params, &sig.results);
                 let result = module.funcs.push(Function::new(
@@ -154,10 +167,45 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
                     traps: Vec::new(),
                     result,
                     fuel: INITIAL_FUEL,
-                    emit_resource_call,
+                    emit_resource_call: false,
                 }
                 .compile_async_return_adapter(adapter, &sig);
-            }
+
+                result
+            };
+
+            let store_call = {
+                let sig = module.types.async_store_call_signature(&adapter.lower);
+                let ty = module.core_types.function(&sig.params, &sig.results);
+                let result = module.funcs.push(Function::new(
+                    Some(format!("[async-store-call]{}", adapter.name)),
+                    ty,
+                ));
+
+                Compiler {
+                    types: module.types,
+                    module,
+                    code: Vec::new(),
+                    nlocals: sig.params.len() as u32,
+                    free_locals: HashMap::new(),
+                    traps: Vec::new(),
+                    result,
+                    fuel: INITIAL_FUEL,
+                    emit_resource_call: false,
+                }
+                .compile_async_store_call_adapter(adapter);
+
+                result
+            };
+
+            let (compiler, ..) = compiler(module, adapter);
+            compiler.compile_async_to_async_adapter(
+                adapter,
+                start,
+                return_,
+                store_call,
+                expect_retptr,
+            );
         }
         (false, true) => todo!("sync to async adapter"),
         (true, false) => todo!("async to sync adapter"),
@@ -295,26 +343,41 @@ struct Memory<'a> {
 }
 
 impl Compiler<'_, '_> {
-    fn compile_async_to_async_adapter(mut self, adapter: &AdapterData) {
-        let enter = self
+    fn compile_async_to_async_adapter(
+        mut self,
+        adapter: &AdapterData,
+        start: FunctionId,
+        return_: FunctionId,
+        store_call: FunctionId,
+        expect_retptr: bool,
+    ) {
+        let enter = self.module.import_async_enter_call();
+        let exit = self
             .module
-            .import_async_enter_call(adapter.lower.options.ptr());
+            .import_async_exit_call(adapter.lift.options.callback.unwrap());
+
+        self.flush_code();
+        self.module.funcs[self.result]
+            .body
+            .push(Body::RefFunc(start));
+        self.module.funcs[self.result]
+            .body
+            .push(Body::RefFunc(return_));
+        self.module.funcs[self.result]
+            .body
+            .push(Body::RefFunc(store_call));
         self.instruction(LocalGet(0));
         self.instruction(LocalGet(1));
         self.instruction(LocalGet(2));
+        self.instruction(I32Const(if expect_retptr { 1 } else { 0 }));
         self.instruction(Call(enter.as_u32()));
-
         self.instruction(Call(adapter.callee.as_u32()));
-
-        let exit = self
-            .module
-            .import_async_exit_call(adapter.lift.options.ptr());
         self.instruction(Call(exit.as_u32()));
 
         self.finish()
     }
 
-    fn compile_async_start_adapter(mut self, adapter: &AdapterData, sig: &Signature) {
+    fn compile_async_start_adapter(mut self, adapter: &AdapterData, sig: &Signature) -> bool {
         let param_locals = sig
             .params
             .iter()
@@ -323,10 +386,12 @@ impl Compiler<'_, '_> {
             .collect::<Vec<_>>();
 
         self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, false);
-        self.translate_params(adapter, &param_locals);
+        let result = self.translate_params(adapter, &param_locals);
         self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, true);
 
-        self.finish()
+        self.finish();
+
+        result
     }
 
     fn compile_async_return_adapter(mut self, adapter: &AdapterData, sig: &Signature) {
@@ -340,6 +405,18 @@ impl Compiler<'_, '_> {
         self.set_flag(adapter.lower.flags, FLAG_MAY_LEAVE, false);
         self.translate_results(adapter, &param_locals, &param_locals);
         self.set_flag(adapter.lower.flags, FLAG_MAY_LEAVE, true);
+
+        self.finish()
+    }
+
+    fn compile_async_store_call_adapter(mut self, adapter: &AdapterData) {
+        self.instruction(LocalGet(0));
+        self.instruction(LocalGet(1));
+        self.instruction(I32Store(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: adapter.lower.options.memory.unwrap().as_u32(),
+        }));
 
         self.finish()
     }
@@ -443,7 +520,7 @@ impl Compiler<'_, '_> {
         self.finish()
     }
 
-    fn translate_params(&mut self, adapter: &AdapterData, param_locals: &[(u32, ValType)]) {
+    fn translate_params(&mut self, adapter: &AdapterData, param_locals: &[(u32, ValType)]) -> bool {
         let src_tys = self.types[adapter.lower.ty].params;
         let src_tys = self.types[src_tys]
             .types
@@ -470,7 +547,7 @@ impl Compiler<'_, '_> {
         };
         let dst_flat = self.types.flatten_types(
             lift_opts,
-            if adapter.lift.options.async_ {
+            if lift_opts.async_ {
                 MAX_FLAT_RESULTS
             } else {
                 MAX_FLAT_PARAMS
@@ -500,16 +577,28 @@ impl Compiler<'_, '_> {
         let dst = if let Some(flat) = &dst_flat {
             Destination::Stack(flat, lift_opts)
         } else {
-            // If there are too many parameters then space is allocated in the
-            // destination module for the parameters via its `realloc` function.
-            let abi = CanonicalAbiInfo::record(dst_tys.iter().map(|t| self.types.canonical_abi(t)));
-            let (size, align) = if lift_opts.memory64 {
-                (abi.size64, abi.align64)
+            if lift_opts.async_ {
+                let align = dst_tys
+                    .iter()
+                    .map(|t| self.types.align(lift_opts, t))
+                    .max()
+                    .unwrap_or(1);
+                let (addr, ty) = *param_locals.last().expect("no retptr");
+                assert_eq!(ty, lift_opts.ptr());
+                Destination::Memory(self.memory_operand(lift_opts, TempLocal::new(addr, ty), align))
             } else {
-                (abi.size32, abi.align32)
-            };
-            let size = MallocSize::Const(size);
-            Destination::Memory(self.malloc(lift_opts, size, align))
+                // If there are too many parameters then space is allocated in the
+                // destination module for the parameters via its `realloc` function.
+                let abi =
+                    CanonicalAbiInfo::record(dst_tys.iter().map(|t| self.types.canonical_abi(t)));
+                let (size, align) = if lift_opts.memory64 {
+                    (abi.size64, abi.align64)
+                } else {
+                    (abi.size32, abi.align32)
+                };
+                let size = MallocSize::Const(size);
+                Destination::Memory(self.malloc(lift_opts, size, align))
+            }
         };
 
         let srcs = src
@@ -525,10 +614,12 @@ impl Compiler<'_, '_> {
         // If the destination was linear memory instead of the stack then the
         // actual parameter that we're passing is the address of the values
         // stored, so ensure that's happening in the wasm body here.
-        if let Destination::Memory(mem) = dst {
+        if let (Destination::Memory(mem), false) = (dst, lift_opts.async_) {
             self.instruction(LocalGet(mem.addr.idx));
             self.free_temp_local(mem.addr);
         }
+
+        dst_flat.is_none() && lift_opts.async_
     }
 
     fn translate_results(

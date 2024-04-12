@@ -99,6 +99,8 @@ impl ComponentTypesBuilder {
         let ty = &self[options.ty];
         let ptr_ty = options.options.ptr();
 
+        let mut params = vec![ptr_ty];
+
         let mut results_indirect = false;
         let results = match self.flatten_types(
             &options.options,
@@ -108,11 +110,12 @@ impl ComponentTypesBuilder {
             Some(list) => list,
             None => {
                 results_indirect = true;
-                vec![ptr_ty]
+                params.push(ptr_ty);
+                Vec::new()
             }
         };
         Signature {
-            params: vec![ptr_ty],
+            params,
             results,
             params_indirect: false,
             results_indirect,
@@ -142,6 +145,17 @@ impl ComponentTypesBuilder {
             params,
             results: Vec::new(),
             params_indirect,
+            results_indirect: false,
+        }
+    }
+
+    pub(super) fn async_store_call_signature(&self, options: &AdapterOptions) -> Signature {
+        let ptr_ty = options.options.ptr();
+
+        Signature {
+            params: vec![ptr_ty, ValType::I32],
+            results: Vec::new(),
+            params_indirect: false,
             results_indirect: false,
         }
     }

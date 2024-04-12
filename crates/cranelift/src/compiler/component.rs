@@ -121,12 +121,27 @@ impl<'a> TrampolineCompiler<'a> {
             Trampoline::ResourceExitCall => {
                 self.translate_resource_libcall(host::resource_exit_call)
             }
-            Trampoline::AsyncEnterCall => self.translate_async_enter_or_exit(
-                self.offsets.async_enter(),
-                vec![ir::AbiParam::new(self.isa.pointer_type()); 3],
-            ),
-            Trampoline::AsyncExitCall => self.translate_async_enter_or_exit(
+            Trampoline::AsyncEnterCall => {
+                let pointer_type = self.isa.pointer_type();
+                self.translate_async_enter_or_exit(
+                    self.offsets.async_enter(),
+                    None,
+                    vec![
+                        ir::AbiParam::new(pointer_type),
+                        ir::AbiParam::new(pointer_type),
+                        ir::AbiParam::new(pointer_type),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                    ],
+                    Vec::new(),
+                )
+            }
+            Trampoline::AsyncExitCall(callback) => self.translate_async_enter_or_exit(
                 self.offsets.async_exit(),
+                Some(*callback),
+                vec![ir::AbiParam::new(ir::types::I32)],
                 vec![ir::AbiParam::new(ir::types::I32)],
             ),
         }
@@ -226,7 +241,13 @@ impl<'a> TrampolineCompiler<'a> {
         self.load_wasm_results(values_vec_ptr, values_vec_len);
     }
 
-    fn translate_async_enter_or_exit(&mut self, offset: u32, params: Vec<ir::AbiParam>) {
+    fn translate_async_enter_or_exit(
+        &mut self,
+        offset: u32,
+        callback: Option<RuntimeCallbackIndex>,
+        params: Vec<ir::AbiParam>,
+        results: Vec<ir::AbiParam>,
+    ) {
         match self.abi {
             Abi::Wasm => {}
 
@@ -251,10 +272,22 @@ impl<'a> TrampolineCompiler<'a> {
         host_sig.params.push(ir::AbiParam::new(pointer_type));
         callee_args.push(vmctx);
 
+        if let Some(callback) = callback {
+            // callback: *mut VMFuncRef
+            host_sig.params.push(ir::AbiParam::new(pointer_type));
+            callee_args.push(self.builder.ins().load(
+                pointer_type,
+                MemFlags::trusted(),
+                vmctx,
+                i32::try_from(self.offsets.runtime_callback(callback)).unwrap(),
+            ));
+        }
+
+        // remaining parameters
         host_sig.params.extend(params);
         callee_args.extend(args[2..].iter().copied());
 
-        host_sig.returns.push(ir::AbiParam::new(ir::types::I32));
+        host_sig.returns.extend(results);
 
         // Load host function pointer from the vmcontext and then call that
         // indirect function pointer with the list of arguments.
@@ -270,8 +303,8 @@ impl<'a> TrampolineCompiler<'a> {
             .ins()
             .call_indirect(host_sig, host_fn, &callee_args);
 
-        let result = self.builder.func.dfg.inst_results(call)[0];
-        self.builder.ins().return_(&[result]);
+        let results = self.builder.func.dfg.inst_results(call).to_vec();
+        self.builder.ins().return_(&results);
     }
 
     fn translate_lower_import(
