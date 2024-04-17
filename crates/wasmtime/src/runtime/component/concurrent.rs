@@ -1,5 +1,5 @@
 use crate::{AsContextMut, StoreContextMut, ValRaw};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Error, Result};
 use futures::{
     future::FutureExt,
     stream::{FuturesUnordered, ReadyChunks, StreamExt},
@@ -234,17 +234,27 @@ fn maybe_send_event<T>(
     Ok(())
 }
 
-async fn poll_loop<T>(store: &mut StoreContextMut<'_, T>) -> Result<()> {
-    let task = store.concurrent_state().guest_task.unwrap();
-    while store
-        .concurrent_state()
-        .table
-        .get(task)?
-        .unwrap_guest_ref()
-        .result
-        .is_none()
+fn poll_loop<T>(store: &mut StoreContextMut<'_, T>) -> Result<()> {
+    let task = store.concurrent_state().guest_task;
+    while task
+        .map(|task| {
+            Ok::<_, Error>(
+                store
+                    .concurrent_state()
+                    .table
+                    .get(task)?
+                    .unwrap_guest_ref()
+                    .result
+                    .is_none(),
+            )
+        })
+        .unwrap_or(Ok(true))?
     {
-        if let Some(ready) = store.concurrent_state().futures.next().await {
+        let async_cx = store.0.async_cx().expect("async cx");
+        let mut future = pin!(store.concurrent_state().futures.next());
+        let ready = unsafe { async_cx.block_on(future.as_mut())? };
+
+        if let Some(ready) = ready {
             for (task, fun) in ready {
                 let task = TaskId::new(task);
                 fun(store.as_context_mut())?;
@@ -254,6 +264,8 @@ async fn poll_loop<T>(store: &mut StoreContextMut<'_, T>) -> Result<()> {
                     .delete(task)?
                     .unwrap_host()
                     .caller;
+                // TODO: use store.on_fiber here so we don't block (especially if guest does blocking call to host)
+                // _or_ return ready tasks to caller to iterate over
                 maybe_send_event(store, caller, EVENT_CALL_DONE, task)?;
             }
         } else {
@@ -379,61 +391,66 @@ pub(crate) extern "C" fn async_enter<T>(
     params: u32,
     results: u32,
     call: u32,
-    expect_retptr: u32,
+    expect_retptr: bool,
 ) {
     unsafe {
         handle_result(|| {
-            let expect_retptr = expect_retptr != 0;
             let cx = VMComponentContext::from_opaque(cx);
             let instance = (*cx).instance();
             let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
             let start = SendSyncPtr::new(NonNull::new(start).unwrap());
             let return_ = SendSyncPtr::new(NonNull::new(return_).unwrap());
-            let old_task = cx.concurrent_state().guest_task.take().unwrap();
-            let old_task_rep = old_task.rep;
-            let guest_task = cx.concurrent_state().table.push_child(
-                Task::Guest(GuestTask {
-                    lower_params: Some(Box::new(move |cx, dst| {
-                        let mut src = [ValRaw::u32(params), ValRaw::u32(0)];
-                        if expect_retptr {
-                            src[1] = dst[0].assume_init();
-                        }
-                        crate::Func::call_unchecked_raw(
-                            cx,
-                            start.as_non_null(),
-                            src.as_mut_ptr(),
-                            if expect_retptr { 2 } else { 1 },
-                        )?;
-                        if !expect_retptr {
-                            dst[0] = MaybeUninit::new(src[0]);
-                        }
-                        let task = cx.concurrent_state().guest_task.unwrap();
-                        maybe_send_event(cx, TaskId::new(old_task_rep), EVENT_CALL_STARTED, task)?;
-                        Ok(())
-                    })),
-                    lift_result: Some(Box::new(move |cx, src| {
-                        let mut my_src = src.to_owned();
-                        my_src.push(ValRaw::u32(results));
-                        crate::Func::call_unchecked_raw(
-                            cx,
-                            return_.as_non_null(),
-                            my_src.as_mut_ptr(),
-                            my_src.len(),
-                        )?;
-                        let task = cx.concurrent_state().guest_task.unwrap();
-                        maybe_send_event(cx, TaskId::new(old_task_rep), EVENT_CALL_RETURNED, task)?;
-                        Ok(None)
-                    })),
-                    result: None,
-                    callback: None,
-                    caller: Some(Caller {
-                        task: old_task,
-                        store_call: SendSyncPtr::new(NonNull::new(store_call).unwrap()),
-                        call,
-                    }),
+            let old_task = cx.concurrent_state().guest_task.take();
+            let old_task_rep = old_task.map(|v| v.rep);
+            let new_task = Task::Guest(GuestTask {
+                lower_params: Some(Box::new(move |cx, dst| {
+                    let mut src = [ValRaw::u32(params), ValRaw::u32(0)];
+                    if expect_retptr {
+                        src[1] = dst[0].assume_init();
+                    }
+                    crate::Func::call_unchecked_raw(
+                        cx,
+                        start.as_non_null(),
+                        src.as_mut_ptr(),
+                        if expect_retptr { 2 } else { 1 },
+                    )?;
+                    if !expect_retptr {
+                        dst[0] = MaybeUninit::new(src[0]);
+                    }
+                    let task = cx.concurrent_state().guest_task.unwrap();
+                    if let Some(rep) = old_task_rep {
+                        maybe_send_event(cx, TaskId::new(rep), EVENT_CALL_STARTED, task)?;
+                    }
+                    Ok(())
+                })),
+                lift_result: Some(Box::new(move |cx, src| {
+                    let mut my_src = src.to_owned();
+                    my_src.push(ValRaw::u32(results));
+                    crate::Func::call_unchecked_raw(
+                        cx,
+                        return_.as_non_null(),
+                        my_src.as_mut_ptr(),
+                        my_src.len(),
+                    )?;
+                    let task = cx.concurrent_state().guest_task.unwrap();
+                    if let Some(rep) = old_task_rep {
+                        maybe_send_event(cx, TaskId::new(rep), EVENT_CALL_RETURNED, task)?;
+                    }
+                    Ok(None)
+                })),
+                result: None,
+                callback: None,
+                caller: old_task.map(|task| Caller {
+                    task,
+                    store_call: SendSyncPtr::new(NonNull::new(store_call).unwrap()),
+                    call,
                 }),
-                old_task,
-            )?;
+            });
+            let guest_task = if let Some(old_task) = old_task {
+                cx.concurrent_state().table.push_child(new_task, old_task)
+            } else {
+                cx.concurrent_state().table.push(new_task)
+            }?;
             cx.concurrent_state().guest_task = Some(guest_task);
 
             Ok(())
@@ -445,6 +462,7 @@ pub(crate) extern "C" fn async_exit<T>(
     cx: *mut VMOpaqueContext,
     callback: *mut VMFuncRef,
     guest_context: u32,
+    async_caller: bool,
 ) -> u32 {
     unsafe {
         handle_result(|| {
@@ -453,18 +471,15 @@ pub(crate) extern "C" fn async_exit<T>(
             let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
 
             let guest_task = cx.concurrent_state().guest_task.take().unwrap();
-            let (store_call, call, next) = {
-                let caller = cx
-                    .concurrent_state()
-                    .table
-                    .get(guest_task)?
-                    .unwrap_guest_ref()
-                    .caller
-                    .as_ref()
-                    .unwrap();
-                (caller.store_call.as_non_null(), caller.call, caller.task)
-            };
-            cx.concurrent_state().guest_task = Some(next);
+            let caller = cx
+                .concurrent_state()
+                .table
+                .get(guest_task)?
+                .unwrap_guest_ref()
+                .caller
+                .as_ref()
+                .map(|caller| (caller.task, caller.store_call.as_non_null(), caller.call));
+            cx.concurrent_state().guest_task = caller.map(|(next, ..)| next);
 
             let task = cx
                 .concurrent_state()
@@ -488,8 +503,18 @@ pub(crate) extern "C" fn async_exit<T>(
                     guest_context,
                 ));
 
-                let mut src = [ValRaw::u32(call), ValRaw::u32(guest_task.rep)];
-                crate::Func::call_unchecked_raw(&mut cx, store_call, src.as_mut_ptr(), src.len())?;
+                if async_caller {
+                    let (_, store_call, call) = caller.unwrap();
+                    let mut src = [ValRaw::u32(call), ValRaw::u32(guest_task.rep)];
+                    crate::Func::call_unchecked_raw(
+                        &mut cx,
+                        store_call,
+                        src.as_mut_ptr(),
+                        src.len(),
+                    )?;
+                } else {
+                    poll_loop(&mut cx)?;
+                }
             } else {
                 cx.concurrent_state().table.delete(guest_task)?;
             }
@@ -533,11 +558,7 @@ pub(crate) fn exit<T: Send, R: 'static>(
             .callback = Some((SendSyncPtr::new(callback), guest_context));
 
         {
-            let async_cx = store.0.async_cx().expect("async cx");
-            let mut future = pin!(poll_loop(&mut store));
-            unsafe {
-                async_cx.block_on(future.as_mut())??;
-            }
+            poll_loop(&mut store)?;
         }
     }
 

@@ -141,7 +141,10 @@ impl<'a> TrampolineCompiler<'a> {
             Trampoline::AsyncExitCall(callback) => self.translate_async_enter_or_exit(
                 self.offsets.async_exit(),
                 Some(*callback),
-                vec![ir::AbiParam::new(ir::types::I32)],
+                vec![
+                    ir::AbiParam::new(ir::types::I32),
+                    ir::AbiParam::new(ir::types::I32),
+                ],
                 vec![ir::AbiParam::new(ir::types::I32)],
             ),
         }

@@ -142,12 +142,16 @@ pub type VMAsyncEnterCallback = extern "C" fn(
     params: u32,
     results: u32,
     call: u32,
-    expect_retptr: u32,
+    expect_retptr: bool,
 );
 
 /// TODO: docs
-pub type VMAsyncExitCallback =
-    extern "C" fn(vmctx: *mut VMOpaqueContext, callback: *mut VMFuncRef, guest_context: u32) -> u32;
+pub type VMAsyncExitCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    callback: *mut VMFuncRef,
+    guest_context: u32,
+    async_caller: bool,
+) -> u32;
 
 /// This is a marker type to represent the underlying allocation of a
 /// `VMComponentContext`.

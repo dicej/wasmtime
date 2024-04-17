@@ -1,3 +1,5 @@
+// TODO: This duplicates a lot of resource_table.rs; consider reducing that duplication.
+
 use super::{Task, TaskId};
 use std::collections::BTreeSet;
 

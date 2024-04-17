@@ -119,85 +119,88 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
         )
     }
 
+    let start_adapter = |module: &mut Module, param_globals| {
+        let sig = module.types.async_start_signature(&adapter.lift);
+        let ty = module.core_types.function(&sig.params, &sig.results);
+        let result = module.funcs.push(Function::new(
+            Some(format!("[async-start]{}", adapter.name)),
+            ty,
+        ));
+
+        (
+            result,
+            Compiler {
+                types: module.types,
+                module,
+                code: Vec::new(),
+                nlocals: sig.params.len() as u32,
+                free_locals: HashMap::new(),
+                traps: Vec::new(),
+                result,
+                fuel: INITIAL_FUEL,
+                emit_resource_call: false,
+            }
+            .compile_async_start_adapter(adapter, &sig, param_globals),
+        )
+    };
+
+    let return_adapter = |module: &mut Module, result_globals| {
+        let sig = module.types.async_return_signature(&adapter.lift);
+        let ty = module.core_types.function(&sig.params, &sig.results);
+        let result = module.funcs.push(Function::new(
+            Some(format!("[async-return]{}", adapter.name)),
+            ty,
+        ));
+
+        Compiler {
+            types: module.types,
+            module,
+            code: Vec::new(),
+            nlocals: sig.params.len() as u32,
+            free_locals: HashMap::new(),
+            traps: Vec::new(),
+            result,
+            fuel: INITIAL_FUEL,
+            emit_resource_call: false,
+        }
+        .compile_async_return_adapter(adapter, &sig, result_globals);
+
+        result
+    };
+
+    let store_call_adapter = |module: &mut Module, unreachable| {
+        let sig = module.types.async_store_call_signature(&adapter.lower);
+        let ty = module.core_types.function(&sig.params, &sig.results);
+        let result = module.funcs.push(Function::new(
+            Some(format!("[async-store-call]{}", adapter.name)),
+            ty,
+        ));
+
+        Compiler {
+            types: module.types,
+            module,
+            code: Vec::new(),
+            nlocals: sig.params.len() as u32,
+            free_locals: HashMap::new(),
+            traps: Vec::new(),
+            result,
+            fuel: INITIAL_FUEL,
+            emit_resource_call: false,
+        }
+        .compile_async_store_call_adapter(adapter, unreachable);
+
+        result
+    };
+
     match (adapter.lower.options.async_, adapter.lift.options.async_) {
         (false, false) => {
             let (compiler, lower_sig, lift_sig) = compiler(module, adapter);
             compiler.compile_sync_to_sync_adapter(adapter, &lower_sig, &lift_sig)
         }
         (true, true) => {
-            let (start, expect_retptr) = {
-                let sig = module.types.async_start_signature(&adapter.lift);
-                let ty = module.core_types.function(&sig.params, &sig.results);
-                let result = module.funcs.push(Function::new(
-                    Some(format!("[async-start]{}", adapter.name)),
-                    ty,
-                ));
-
-                (
-                    result,
-                    Compiler {
-                        types: module.types,
-                        module,
-                        code: Vec::new(),
-                        nlocals: sig.params.len() as u32,
-                        free_locals: HashMap::new(),
-                        traps: Vec::new(),
-                        result,
-                        fuel: INITIAL_FUEL,
-                        emit_resource_call: false,
-                    }
-                    .compile_async_start_adapter(adapter, &sig),
-                )
-            };
-
-            let return_ = {
-                let sig = module.types.async_return_signature(&adapter.lift);
-                let ty = module.core_types.function(&sig.params, &sig.results);
-                let result = module.funcs.push(Function::new(
-                    Some(format!("[async-return]{}", adapter.name)),
-                    ty,
-                ));
-
-                Compiler {
-                    types: module.types,
-                    module,
-                    code: Vec::new(),
-                    nlocals: sig.params.len() as u32,
-                    free_locals: HashMap::new(),
-                    traps: Vec::new(),
-                    result,
-                    fuel: INITIAL_FUEL,
-                    emit_resource_call: false,
-                }
-                .compile_async_return_adapter(adapter, &sig);
-
-                result
-            };
-
-            let store_call = {
-                let sig = module.types.async_store_call_signature(&adapter.lower);
-                let ty = module.core_types.function(&sig.params, &sig.results);
-                let result = module.funcs.push(Function::new(
-                    Some(format!("[async-store-call]{}", adapter.name)),
-                    ty,
-                ));
-
-                Compiler {
-                    types: module.types,
-                    module,
-                    code: Vec::new(),
-                    nlocals: sig.params.len() as u32,
-                    free_locals: HashMap::new(),
-                    traps: Vec::new(),
-                    result,
-                    fuel: INITIAL_FUEL,
-                    emit_resource_call: false,
-                }
-                .compile_async_store_call_adapter(adapter);
-
-                result
-            };
-
+            let (start, expect_retptr) = start_adapter(module, None);
+            let return_ = return_adapter(module, None);
+            let store_call = store_call_adapter(module, false);
             let (compiler, ..) = compiler(module, adapter);
             compiler.compile_async_to_async_adapter(
                 adapter,
@@ -207,7 +210,52 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
                 expect_retptr,
             );
         }
-        (false, true) => todo!("sync to async adapter"),
+        (false, true) => {
+            let lower_sig = module.types.signature(&adapter.lower, Context::Lower);
+            let param_globals = if lower_sig.params_indirect {
+                None
+            } else {
+                let mut counts = [0; 4];
+                Some(
+                    lower_sig
+                        .params
+                        .iter()
+                        .take(if lower_sig.results_indirect {
+                            lower_sig.params.len() - 1
+                        } else {
+                            lower_sig.params.len()
+                        })
+                        .map(|ty| module.allocate(&mut counts, *ty))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let result_globals = if lower_sig.results_indirect {
+                None
+            } else {
+                let mut counts = [0; 4];
+                Some(
+                    lower_sig
+                        .results
+                        .iter()
+                        .map(|ty| module.allocate(&mut counts, *ty))
+                        .collect::<Vec<_>>(),
+                )
+            };
+
+            let (start, expect_retptr) = start_adapter(module, param_globals.as_deref());
+            let return_ = return_adapter(module, result_globals.as_deref());
+            let store_call = store_call_adapter(module, true);
+            let (compiler, ..) = compiler(module, adapter);
+            compiler.compile_sync_to_async_adapter(
+                adapter,
+                start,
+                return_,
+                store_call,
+                expect_retptr,
+                param_globals.as_deref(),
+                result_globals.as_deref(),
+            );
+        }
         (true, false) => todo!("async to sync adapter"),
     }
 }
@@ -372,29 +420,136 @@ impl Compiler<'_, '_> {
         self.instruction(I32Const(if expect_retptr { 1 } else { 0 }));
         self.instruction(Call(enter.as_u32()));
         self.instruction(Call(adapter.callee.as_u32()));
+        self.instruction(I32Const(1)); // means caller is async
         self.instruction(Call(exit.as_u32()));
 
         self.finish()
     }
 
-    fn compile_async_start_adapter(mut self, adapter: &AdapterData, sig: &Signature) -> bool {
-        let param_locals = sig
-            .params
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| (i as u32, *ty))
-            .collect::<Vec<_>>();
+    fn compile_sync_to_async_adapter(
+        mut self,
+        adapter: &AdapterData,
+        start: FunctionId,
+        return_: FunctionId,
+        store_call: FunctionId,
+        expect_retptr: bool,
+        param_globals: Option<&[u32]>,
+        result_globals: Option<&[u32]>,
+    ) {
+        let enter = self.module.import_async_enter_call();
+        let exit = self
+            .module
+            .import_async_exit_call(adapter.lift.options.callback.unwrap());
+
+        self.flush_code();
+        self.module.funcs[self.result]
+            .body
+            .push(Body::RefFunc(start));
+        self.module.funcs[self.result]
+            .body
+            .push(Body::RefFunc(return_));
+        self.module.funcs[self.result]
+            .body
+            .push(Body::RefFunc(store_call));
+
+        let results_local = if let Some(globals) = param_globals {
+            for (local, global) in globals.iter().enumerate() {
+                self.instruction(LocalGet(u32::try_from(local).unwrap()));
+                self.flush_code();
+                self.module.funcs[self.result]
+                    .body
+                    .push(Body::GlobalSet(*global));
+            }
+            self.instruction(I32Const(0)); // dummy params pointer
+            u32::try_from(globals.len()).unwrap()
+        } else {
+            self.instruction(LocalGet(0));
+            1
+        };
+
+        if result_globals.is_some() {
+            self.instruction(I32Const(0)); // dummy results pointer
+        } else {
+            self.instruction(LocalGet(results_local));
+        }
+
+        self.instruction(I32Const(0)); // dummy call pointer
+        self.instruction(I32Const(if expect_retptr { 1 } else { 0 }));
+        self.instruction(Call(enter.as_u32()));
+        self.instruction(Call(adapter.callee.as_u32()));
+        self.instruction(I32Const(0)); // means caller is sync
+        self.instruction(Call(exit.as_u32()));
+        self.instruction(Drop);
+
+        if let Some(globals) = result_globals {
+            self.flush_code();
+            for global in globals {
+                self.module.funcs[self.result]
+                    .body
+                    .push(Body::GlobalGet(*global));
+            }
+        }
+
+        self.finish()
+    }
+
+    fn compile_async_start_adapter(
+        mut self,
+        adapter: &AdapterData,
+        sig: &Signature,
+        param_globals: Option<&[u32]>,
+    ) -> bool {
+        let mut temps = Vec::new();
+        let param_locals = if let Some(globals) = param_globals {
+            for global in globals {
+                let ty = self.module.globals[usize::try_from(*global).unwrap()];
+
+                self.flush_code();
+                self.module.funcs[self.result]
+                    .body
+                    .push(Body::GlobalGet(*global));
+                temps.push(self.local_set_new_tmp(ty));
+            }
+            temps
+                .iter()
+                .map(|t| (t.idx, t.ty))
+                .chain(if sig.results_indirect {
+                    sig.params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ty)| (i as u32, *ty))
+                        .last()
+                } else {
+                    None
+                })
+                .collect::<Vec<_>>()
+        } else {
+            sig.params
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| (i as u32, *ty))
+                .collect::<Vec<_>>()
+        };
 
         self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, false);
         let result = self.translate_params(adapter, &param_locals);
         self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, true);
+
+        for tmp in temps {
+            self.free_temp_local(tmp);
+        }
 
         self.finish();
 
         result
     }
 
-    fn compile_async_return_adapter(mut self, adapter: &AdapterData, sig: &Signature) {
+    fn compile_async_return_adapter(
+        mut self,
+        adapter: &AdapterData,
+        sig: &Signature,
+        result_globals: Option<&[u32]>,
+    ) {
         let param_locals = sig
             .params
             .iter()
@@ -406,17 +561,30 @@ impl Compiler<'_, '_> {
         self.translate_results(adapter, &param_locals, &param_locals);
         self.set_flag(adapter.lower.flags, FLAG_MAY_LEAVE, true);
 
+        if let Some(globals) = result_globals {
+            self.flush_code();
+            for global in globals {
+                self.module.funcs[self.result]
+                    .body
+                    .push(Body::GlobalSet(*global));
+            }
+        }
+
         self.finish()
     }
 
-    fn compile_async_store_call_adapter(mut self, adapter: &AdapterData) {
-        self.instruction(LocalGet(0));
-        self.instruction(LocalGet(1));
-        self.instruction(I32Store(MemArg {
-            offset: 0,
-            align: 2,
-            memory_index: adapter.lower.options.memory.unwrap().as_u32(),
-        }));
+    fn compile_async_store_call_adapter(mut self, adapter: &AdapterData, unreachable: bool) {
+        if unreachable {
+            self.instruction(Unreachable);
+        } else {
+            self.instruction(LocalGet(0));
+            self.instruction(LocalGet(1));
+            self.instruction(I32Store(MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: adapter.lower.options.memory.unwrap().as_u32(),
+            }));
+        }
 
         self.finish()
     }

@@ -76,6 +76,9 @@ pub struct Module<'a> {
     funcs: PrimaryMap<FunctionId, Function>,
     helper_funcs: HashMap<Helper, FunctionId>,
     helper_worklist: Vec<(FunctionId, Helper)>,
+
+    globals_by_type: [Vec<u32>; 4],
+    globals: Vec<ValType>,
 }
 
 struct AdapterData {
@@ -194,6 +197,8 @@ impl<'a> Module<'a> {
             imported_resource_exit_call: None,
             imported_async_enter_call: None,
             imported_async_exit_call: None,
+            globals_by_type: Default::default(),
+            globals: Default::default(),
         }
     }
 
@@ -244,6 +249,28 @@ impl<'a> Module<'a> {
 
         while let Some((result, helper)) = self.helper_worklist.pop() {
             trampoline::compile_helper(self, result, helper);
+        }
+    }
+
+    fn allocate(&mut self, counts: &mut [usize; 4], ty: ValType) -> u32 {
+        let which = match ty {
+            ValType::I32 => 0,
+            ValType::I64 => 1,
+            ValType::F32 => 2,
+            ValType::F64 => 3,
+            _ => unreachable!(),
+        };
+
+        let index = counts[which];
+        counts[which] += 1;
+
+        if let Some(offset) = self.globals_by_type[which].get(index) {
+            *offset
+        } else {
+            let offset = u32::try_from(self.globals.len()).unwrap();
+            self.globals_by_type[which].push(offset);
+            self.globals.push(ty);
+            offset
         }
     }
 
@@ -447,7 +474,7 @@ impl<'a> Module<'a> {
         self.import_simple(
             "async",
             "exit-call",
-            &[ValType::I32],
+            &[ValType::I32, ValType::I32],
             &[ValType::I32],
             Import::AsyncExitCall(self.imported_funcs.get(callback).unwrap().clone().unwrap()),
             |me| &mut me.imported_async_exit_call,
@@ -530,6 +557,8 @@ impl<'a> Module<'a> {
             }
         }
 
+        let imported_global_count = u32::try_from(self.imported_globals.len()).unwrap();
+
         // With all functions numbered the fragments of the body of each
         // function can be assigned into one final adapter function.
         let mut code = CodeSection::new();
@@ -564,6 +593,12 @@ impl<'a> Module<'a> {
                     Body::RefFunc(id) => {
                         Instruction::RefFunc(id_to_index[*id].as_u32()).encode(&mut body);
                     }
+                    Body::GlobalGet(offset) => {
+                        Instruction::GlobalGet(offset + imported_global_count).encode(&mut body);
+                    }
+                    Body::GlobalSet(offset) => {
+                        Instruction::GlobalSet(offset + imported_global_count).encode(&mut body);
+                    }
                 }
             }
             code.raw(&body);
@@ -572,10 +607,28 @@ impl<'a> Module<'a> {
 
         let traps = traps.finish();
 
+        let mut globals = GlobalSection::new();
+        for ty in &self.globals {
+            globals.global(
+                GlobalType {
+                    val_type: *ty,
+                    mutable: true,
+                },
+                &match ty {
+                    ValType::I32 => ConstExpr::i32_const(0),
+                    ValType::I64 => ConstExpr::i64_const(0),
+                    ValType::F32 => ConstExpr::f32_const(0_f32),
+                    ValType::F64 => ConstExpr::f64_const(0_f64),
+                    _ => unreachable!(),
+                },
+            );
+        }
+
         let mut result = wasm_encoder::Module::new();
         result.section(&self.core_types.section);
         result.section(&self.core_imports);
         result.section(&funcs);
+        result.section(&globals);
         result.section(&exports);
         result.section(&code);
         if self.debug {
@@ -584,7 +637,10 @@ impl<'a> Module<'a> {
                 data: Cow::Borrowed(&traps),
             });
         }
-        result.finish()
+        let v = result.finish();
+        // TODO dicej: remove this:
+        std::fs::write("/tmp/fact2.wasm", &v).unwrap();
+        v
     }
 
     /// Returns the imports that were used, in order, to create this adapter
@@ -724,6 +780,8 @@ enum Body {
     Raw(Vec<u8>, Vec<(usize, traps::Trap)>),
     Call(FunctionId),
     RefFunc(FunctionId),
+    GlobalGet(u32),
+    GlobalSet(u32),
 }
 
 impl Function {
