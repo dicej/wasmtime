@@ -17,7 +17,7 @@ use std::{
     task::{Context, Poll, Wake, Waker},
 };
 use task_table::TaskTable;
-use wasmtime_environ::component::TypeFuncIndex;
+use wasmtime_environ::component::{TypeFuncIndex, MAX_FLAT_PARAMS};
 use wasmtime_runtime::{component::VMComponentContext, SendSyncPtr, VMFuncRef, VMOpaqueContext};
 
 mod task_table;
@@ -30,6 +30,10 @@ const STATUS_DONE: u32 = 3;
 const EVENT_CALL_STARTED: u32 = 0;
 const EVENT_CALL_RETURNED: u32 = 1;
 const EVENT_CALL_DONE: u32 = 2;
+
+const ENTER_FLAG_EXPECT_RETPTR: u32 = 1 << 0;
+const EXIT_FLAG_ASYNC_CALLER: u32 = 1 << 0;
+const EXIT_FLAG_ASYNC_CALLEE: u32 = 1 << 1;
 
 pub(crate) struct TaskId<T> {
     rep: u32,
@@ -391,10 +395,11 @@ pub(crate) extern "C" fn async_enter<T>(
     params: u32,
     results: u32,
     call: u32,
-    expect_retptr: bool,
+    flags: u32,
 ) {
     unsafe {
         handle_result(|| {
+            let expect_retptr = (flags & ENTER_FLAG_EXPECT_RETPTR) != 0;
             let cx = VMComponentContext::from_opaque(cx);
             let instance = (*cx).instance();
             let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
@@ -404,18 +409,24 @@ pub(crate) extern "C" fn async_enter<T>(
             let old_task_rep = old_task.map(|v| v.rep);
             let new_task = Task::Guest(GuestTask {
                 lower_params: Some(Box::new(move |cx, dst| {
-                    let mut src = [ValRaw::u32(params), ValRaw::u32(0)];
-                    if expect_retptr {
-                        src[1] = dst[0].assume_init();
+                    assert!(dst.len() <= MAX_FLAT_PARAMS);
+                    let mut src = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
+                    src[0] = MaybeUninit::new(ValRaw::u32(params));
+                    let len = if expect_retptr {
+                        src[1] = dst[0];
+                        2
+                    } else {
+                        1
                     }
+                    .max(dst.len());
                     crate::Func::call_unchecked_raw(
                         cx,
                         start.as_non_null(),
-                        src.as_mut_ptr(),
-                        if expect_retptr { 2 } else { 1 },
+                        src.as_mut_ptr() as _,
+                        len,
                     )?;
                     if !expect_retptr {
-                        dst[0] = MaybeUninit::new(src[0]);
+                        dst.copy_from_slice(&src[..dst.len()]);
                     }
                     let task = cx.concurrent_state().guest_task.unwrap();
                     if let Some(rep) = old_task_rep {
@@ -424,7 +435,7 @@ pub(crate) extern "C" fn async_enter<T>(
                     Ok(())
                 })),
                 lift_result: Some(Box::new(move |cx, src| {
-                    let mut my_src = src.to_owned();
+                    let mut my_src = src.to_owned(); // TODO: use stack to avoid allocation?
                     my_src.push(ValRaw::u32(results));
                     crate::Func::call_unchecked_raw(
                         cx,
@@ -462,7 +473,10 @@ pub(crate) extern "C" fn async_exit<T>(
     cx: *mut VMOpaqueContext,
     callback: *mut VMFuncRef,
     guest_context: u32,
-    async_caller: bool,
+    callee: *mut VMFuncRef,
+    param_count: u32,
+    result_count: u32,
+    flags: u32,
 ) -> u32 {
     unsafe {
         handle_result(|| {
@@ -471,6 +485,98 @@ pub(crate) extern "C" fn async_exit<T>(
             let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
 
             let guest_task = cx.concurrent_state().guest_task.take().unwrap();
+
+            let cx = if (flags & EXIT_FLAG_ASYNC_CALLEE) == 0 {
+                let callee = SendSyncPtr::new(NonNull::new(callee).unwrap());
+                let param_count = usize::try_from(param_count).unwrap();
+                let result_count = usize::try_from(result_count).unwrap();
+                assert!(param_count <= MAX_FLAT_PARAMS);
+                assert!(result_count <= MAX_FLAT_PARAMS);
+
+                // TODO: check if callee instance has already been entered and, if so, stash the callee in the task
+                // so we can call it later.  Otherwise, mark it as entered, run the following code, and finally
+                // mark it as unentered.
+
+                let my_fiber = cx.take_current_fiber().unwrap();
+
+                let mut result = cx.start_fiber(move |cx| {
+                    let mut storage = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
+                    let lower = cx
+                        .concurrent_state()
+                        .table
+                        .get_mut(guest_task)?
+                        .unwrap_guest_mut()
+                        .lower_params
+                        .take()
+                        .unwrap();
+                    lower(&mut cx, &mut storage[..param_count])?;
+
+                    crate::Func::call_unchecked_raw(
+                        &mut cx,
+                        callee.as_non_null(),
+                        storage.as_mut_ptr() as _,
+                        param_count.max(result_count),
+                    )?;
+
+                    let lift = cx
+                        .concurrent_state()
+                        .table
+                        .get_mut(guest_task)?
+                        .unwrap_guest_mut()
+                        .lift_results
+                        .take()
+                        .unwrap();
+
+                    assert!(cx
+                        .concurrent_state()
+                        .table
+                        .get(guest_task)?
+                        .unwrap_guest_ref()
+                        .result
+                        .is_none());
+
+                    let result = lift(
+                        &mut cx,
+                        mem::transmute::<&[MaybeUninit<ValRaw>], &[ValRaw]>(
+                            &storage[..result_count],
+                        ),
+                    )?;
+                    cx.concurrent_state()
+                        .table
+                        .get_mut(guest_task)?
+                        .unwrap_guest_mut()
+                        .result = result;
+
+                    Ok(())
+                })?;
+
+                loop {
+                    match result {
+                        Ok((result, cx)) => {
+                            cx.set_current_fiber(Some(my_fiber));
+                            result?;
+                            break cx;
+                        }
+                        Err((fiber, cx)) => {
+                            if let Some(cx) = cx {
+                                cx.set_current_fiber(Some(my_fiber));
+                                cx.concurrent_state()
+                                    .table
+                                    .get_mut(guest_task)?
+                                    .unwrap_guest_mut()
+                                    .fiber = Some(fiber);
+                                break cx;
+                            } else {
+                                my_fiber.suspend(None);
+                                result = fiber.resume(None);
+                            }
+                        }
+                    }
+                }
+            } else {
+                cx
+            };
+
             let caller = cx
                 .concurrent_state()
                 .table
@@ -503,7 +609,7 @@ pub(crate) extern "C" fn async_exit<T>(
                     guest_context,
                 ));
 
-                if async_caller {
+                if (flags & EXIT_FLAG_ASYNC_CALLER) != 0 {
                     let (_, store_call, call) = caller.unwrap();
                     let mut src = [ValRaw::u32(call), ValRaw::u32(guest_task.rep)];
                     crate::Func::call_unchecked_raw(
@@ -515,7 +621,7 @@ pub(crate) extern "C" fn async_exit<T>(
                 } else {
                     poll_loop(&mut cx)?;
                 }
-            } else {
+            } else if status == STATUS_DONE {
                 cx.concurrent_state().table.delete(guest_task)?;
             }
 

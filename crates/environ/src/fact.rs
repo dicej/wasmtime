@@ -470,13 +470,22 @@ impl<'a> Module<'a> {
         )
     }
 
-    fn import_async_exit_call(&mut self, callback: FuncIndex) -> FuncIndex {
+    fn import_async_exit_call(&mut self, callback: Option<FuncIndex>) -> FuncIndex {
         self.import_simple(
             "async",
             "exit-call",
-            &[ValType::I32, ValType::I32],
+            &[
+                ValType::I32,
+                ValType::FUNCREF,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
             &[ValType::I32],
-            Import::AsyncExitCall(self.imported_funcs.get(callback).unwrap().clone().unwrap()),
+            Import::AsyncExitCall(
+                callback
+                    .map(|callback| self.imported_funcs.get(callback).unwrap().clone().unwrap()),
+            ),
             |me| &mut me.imported_async_exit_call,
         )
     }
@@ -680,7 +689,7 @@ pub enum Import {
     /// TODO: docs
     AsyncEnterCall,
     /// TODO: docs
-    AsyncExitCall(CoreDef),
+    AsyncExitCall(Option<CoreDef>),
 }
 
 impl Options {

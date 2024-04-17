@@ -142,7 +142,7 @@ pub type VMAsyncEnterCallback = extern "C" fn(
     params: u32,
     results: u32,
     call: u32,
-    expect_retptr: bool,
+    flags: u32,
 );
 
 /// TODO: docs
@@ -150,7 +150,10 @@ pub type VMAsyncExitCallback = extern "C" fn(
     vmctx: *mut VMOpaqueContext,
     callback: *mut VMFuncRef,
     guest_context: u32,
-    async_caller: bool,
+    callee: *mut VMFuncRef,
+    param_count: u32,
+    result_count: u32,
+    flags: u32,
 ) -> u32;
 
 /// This is a marker type to represent the underlying allocation of a

@@ -274,7 +274,7 @@ pub enum Trampoline {
     ResourceEnterCall,
     ResourceExitCall,
     AsyncEnterCall,
-    AsyncExitCall(CallbackId),
+    AsyncExitCall(Option<CallbackId>),
 }
 
 /// Same as `info::CanonicalOptions`
@@ -630,7 +630,7 @@ impl LinearizeDfg<'_> {
             Trampoline::ResourceExitCall => info::Trampoline::ResourceExitCall,
             Trampoline::AsyncEnterCall => info::Trampoline::AsyncEnterCall,
             Trampoline::AsyncExitCall(callback) => {
-                info::Trampoline::AsyncExitCall(self.runtime_callback(*callback))
+                info::Trampoline::AsyncExitCall(callback.map(|v| self.runtime_callback(v)))
             }
         };
         let i1 = self.trampolines.push(*signature);

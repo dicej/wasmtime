@@ -308,7 +308,7 @@ fn fact_import_to_core_def(
         fact::Import::ResourceExitCall => simple_intrinsic(dfg::Trampoline::ResourceExitCall),
         fact::Import::AsyncEnterCall => simple_intrinsic(dfg::Trampoline::AsyncEnterCall),
         fact::Import::AsyncExitCall(callback) => simple_intrinsic(dfg::Trampoline::AsyncExitCall(
-            dfg.callbacks.push(callback.clone()),
+            callback.clone().map(|v| dfg.callbacks.push(v)),
         )),
     }
 }

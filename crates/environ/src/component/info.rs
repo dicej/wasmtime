@@ -594,7 +594,7 @@ pub enum Trampoline {
     AsyncEnterCall,
 
     /// TODO: docs
-    AsyncExitCall(RuntimeCallbackIndex),
+    AsyncExitCall(Option<RuntimeCallbackIndex>),
 }
 
 impl Trampoline {
