@@ -1,3 +1,4 @@
+use crate::component::concurrent;
 use crate::component::func::{self, Func, LiftContext, LowerContext, Options};
 use crate::component::matching::InstanceType;
 use crate::component::storage::{storage_as_slice, storage_as_slice_mut};
@@ -180,7 +181,7 @@ where
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub async fn call_async<T: Send + 'static>(
-        &self,
+        self,
         mut store: impl AsContextMut<Data = T>,
         params: Params,
     ) -> Result<Return>
@@ -188,14 +189,12 @@ where
         Params: Send + Sync + 'static,
         Return: Send + Sync + 'static,
     {
-        let mut store = store.as_context_mut();
+        let store = store.as_context_mut();
         assert!(
             store.0.async_support(),
             "cannot use `call_async` when async support is not enabled on the config"
         );
-        store
-            .on_fiber(|store| self.call_impl(store, params))
-            .await?
+        concurrent::on_fiber(store, move |store| self.call_impl(store, params)).await?
     }
 
     fn call_impl<T: Send + 'static>(
@@ -207,10 +206,10 @@ where
         Params: Send + Sync + 'static,
         Return: Send + Sync + 'static,
     {
-        let store = &mut store.as_context_mut();
+        let mut store = store.as_context_mut();
 
         if store.0[self.func.0].options.async_() {
-            return if Params::flatten_count() <= MAX_FLAT_RESULTS {
+            return Ok(if Params::flatten_count() <= MAX_FLAT_RESULTS {
                 if Return::flatten_count() <= MAX_FLAT_PARAMS {
                     self.func.call_raw_async(
                         store,
@@ -242,7 +241,8 @@ where
                         Self::lift_heap_result_guest,
                     )
                 }
-            };
+            }?
+            .0);
         }
 
         // Note that this is in theory simpler than it might read at this time.
@@ -258,14 +258,14 @@ where
         if Params::flatten_count() <= MAX_FLAT_PARAMS {
             if Return::flatten_count() <= MAX_FLAT_RESULTS {
                 self.func.call_raw(
-                    store,
+                    &mut store,
                     &params,
                     Self::lower_stack_args,
                     Self::lift_stack_result,
                 )
             } else {
                 self.func.call_raw(
-                    store,
+                    &mut store,
                     &params,
                     Self::lower_stack_args,
                     Self::lift_heap_result,
@@ -274,14 +274,14 @@ where
         } else {
             if Return::flatten_count() <= MAX_FLAT_RESULTS {
                 self.func.call_raw(
-                    store,
+                    &mut store,
                     &params,
                     Self::lower_heap_args,
                     Self::lift_stack_result,
                 )
             } else {
                 self.func.call_raw(
-                    store,
+                    &mut store,
                     &params,
                     Self::lower_heap_args,
                     Self::lift_heap_result,

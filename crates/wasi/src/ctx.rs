@@ -332,7 +332,7 @@ impl WasiCtxBuilder {
     }
 }
 
-pub trait WasiView: Send {
+pub trait WasiView: Send + 'static {
     fn table(&mut self) -> &mut ResourceTable;
     fn ctx(&mut self) -> &mut WasiCtx;
 }

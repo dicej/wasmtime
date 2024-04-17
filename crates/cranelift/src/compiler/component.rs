@@ -138,15 +138,21 @@ impl<'a> TrampolineCompiler<'a> {
                     Vec::new(),
                 )
             }
-            Trampoline::AsyncExitCall(callback) => self.translate_async_enter_or_exit(
-                self.offsets.async_exit(),
-                Some(*callback),
-                vec![
-                    ir::AbiParam::new(ir::types::I32),
-                    ir::AbiParam::new(ir::types::I32),
-                ],
-                vec![ir::AbiParam::new(ir::types::I32)],
-            ),
+            Trampoline::AsyncExitCall(callback) => {
+                let pointer_type = self.isa.pointer_type();
+                self.translate_async_enter_or_exit(
+                    self.offsets.async_exit(),
+                    Some(*callback),
+                    vec![
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(pointer_type),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                    ],
+                    vec![ir::AbiParam::new(ir::types::I32)],
+                )
+            }
         }
     }
 
@@ -247,7 +253,7 @@ impl<'a> TrampolineCompiler<'a> {
     fn translate_async_enter_or_exit(
         &mut self,
         offset: u32,
-        callback: Option<RuntimeCallbackIndex>,
+        callback: Option<Option<RuntimeCallbackIndex>>,
         params: Vec<ir::AbiParam>,
         results: Vec<ir::AbiParam>,
     ) {
@@ -278,12 +284,16 @@ impl<'a> TrampolineCompiler<'a> {
         if let Some(callback) = callback {
             // callback: *mut VMFuncRef
             host_sig.params.push(ir::AbiParam::new(pointer_type));
-            callee_args.push(self.builder.ins().load(
-                pointer_type,
-                MemFlags::trusted(),
-                vmctx,
-                i32::try_from(self.offsets.runtime_callback(callback)).unwrap(),
-            ));
+            if let Some(callback) = callback {
+                callee_args.push(self.builder.ins().load(
+                    pointer_type,
+                    MemFlags::trusted(),
+                    vmctx,
+                    i32::try_from(self.offsets.runtime_callback(callback)).unwrap(),
+                ));
+            } else {
+                callee_args.push(self.builder.ins().iconst(pointer_type, 0));
+            }
         }
 
         // remaining parameters

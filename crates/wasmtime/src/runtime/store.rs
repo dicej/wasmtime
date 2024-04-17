@@ -1026,8 +1026,12 @@ impl<'a, T> StoreContextMut<'a, T> {
     }
 
     /// TODO: docs
-    pub fn concurrent_state(&mut self) -> &mut ConcurrentState<T> {
+    pub(crate) fn concurrent_state(&mut self) -> &mut ConcurrentState<T> {
         self.0.concurrent_state()
+    }
+
+    pub(crate) fn has_pkey(&self) -> bool {
+        self.0.pkey.is_some()
     }
 
     /// Returns the underlying [`Engine`] this store is connected to.

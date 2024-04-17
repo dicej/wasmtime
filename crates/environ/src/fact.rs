@@ -79,6 +79,8 @@ pub struct Module<'a> {
 
     globals_by_type: [Vec<u32>; 4],
     globals: Vec<ValType>,
+
+    exports: Vec<(u32, String)>,
 }
 
 struct AdapterData {
@@ -199,6 +201,7 @@ impl<'a> Module<'a> {
             imported_async_exit_call: None,
             globals_by_type: Default::default(),
             globals: Default::default(),
+            exports: Vec::new(),
         }
     }
 
@@ -470,13 +473,22 @@ impl<'a> Module<'a> {
         )
     }
 
-    fn import_async_exit_call(&mut self, callback: FuncIndex) -> FuncIndex {
+    fn import_async_exit_call(&mut self, callback: Option<FuncIndex>) -> FuncIndex {
         self.import_simple(
             "async",
             "exit-call",
-            &[ValType::I32, ValType::I32],
+            &[
+                ValType::I32,
+                ValType::FUNCREF,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
             &[ValType::I32],
-            Import::AsyncExitCall(self.imported_funcs.get(callback).unwrap().clone().unwrap()),
+            Import::AsyncExitCall(
+                callback
+                    .map(|callback| self.imported_funcs.get(callback).unwrap().clone().unwrap()),
+            ),
             |me| &mut me.imported_async_exit_call,
         )
     }
@@ -555,6 +567,9 @@ impl<'a> Module<'a> {
             if let Some(name) = &func.export {
                 exports.export(name, ExportKind::Func, idx.as_u32());
             }
+        }
+        for (idx, name) in &self.exports {
+            exports.export(name, ExportKind::Func, *idx);
         }
 
         let imported_global_count = u32::try_from(self.imported_globals.len()).unwrap();
@@ -637,10 +652,7 @@ impl<'a> Module<'a> {
                 data: Cow::Borrowed(&traps),
             });
         }
-        let v = result.finish();
-        // TODO dicej: remove this:
-        std::fs::write("/tmp/fact2.wasm", &v).unwrap();
-        v
+        result.finish()
     }
 
     /// Returns the imports that were used, in order, to create this adapter
@@ -680,7 +692,7 @@ pub enum Import {
     /// TODO: docs
     AsyncEnterCall,
     /// TODO: docs
-    AsyncExitCall(CoreDef),
+    AsyncExitCall(Option<CoreDef>),
 }
 
 impl Options {

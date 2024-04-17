@@ -380,7 +380,15 @@ impl Func {
         );
         store
             .on_fiber(|store| self.call_impl(store, params, results))
-            .await?
+            .await
+            .map_err(|v| {
+                eprintln!("call_async trouble: {v:?}");
+                v
+            })?
+            .map_err(|v| {
+                eprintln!("call_async trouble 2: {v:?}");
+                v
+            })
     }
 
     fn call_impl(
@@ -450,14 +458,15 @@ impl Func {
     }
 
     fn call_raw_async<
-        T: Send,
+        'a,
+        T: Send + 'static,
         Params: Send + Sync + 'static,
         Return: Send + Sync + 'static,
         LowerParams,
         LowerReturn,
     >(
         &self,
-        store: &mut StoreContextMut<T>,
+        mut store: StoreContextMut<'a, T>,
         params: Params,
         lower: impl FnOnce(
                 &mut LowerContext<T>,
@@ -472,7 +481,7 @@ impl Func {
             + Send
             + Sync
             + 'static,
-    ) -> Result<Return>
+    ) -> Result<(Return, StoreContextMut<'a, T>)>
     where
         LowerParams: Copy,
         LowerReturn: Copy,
@@ -482,7 +491,7 @@ impl Func {
 
         concurrent::enter(
             store.as_context_mut(),
-            Box::new(move |store, lowered| {
+            Box::new(move |mut store, lowered| {
                 let FuncData {
                     options,
                     instance,
@@ -508,7 +517,8 @@ impl Func {
                         slice_to_storage_mut(lowered),
                     );
                     flags.set_may_leave(true);
-                    result
+                    result?;
+                    Ok(store)
                 }
             }),
             Box::new(move |store, lowered| {
@@ -524,23 +534,26 @@ impl Func {
                 let instance_ptr = instance.instance_ptr();
 
                 unsafe {
-                    Ok(Some(Box::new(lift(
-                        &mut LiftContext::new(store.0, &options, &types, instance_ptr),
-                        InterfaceType::Tuple(types[ty].results),
-                        slice_to_storage(lowered),
-                    )?) as Box<dyn Any + Send + Sync>))
+                    Ok((
+                        Some(Box::new(lift(
+                            &mut LiftContext::new(store.0, &options, &types, instance_ptr),
+                            InterfaceType::Tuple(types[ty].results),
+                            slice_to_storage(lowered),
+                        )?) as Box<dyn Any + Send + Sync>),
+                        store,
+                    ))
                 }
             }),
         )?;
 
         let context = unsafe {
             let mut space = MaybeUninit::<ValRaw>::uninit();
-            crate::Func::call_unchecked_raw(store, export.func_ref, space.as_mut_ptr(), 1)?;
+            crate::Func::call_unchecked_raw(&mut store, export.func_ref, space.as_mut_ptr(), 1)?;
             space.assume_init().get_u32()
         };
 
         let callback = store.0[me].options.callback.unwrap();
-        concurrent::exit(store.as_context_mut(), callback, context)
+        concurrent::exit(store, callback, context)
     }
 
     /// Invokes the underlying wasm function, lowering arguments and lifting the

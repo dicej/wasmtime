@@ -9,7 +9,6 @@ use std::any::Any;
 use std::future::Future;
 use std::mem::{self, MaybeUninit};
 use std::panic::{self, AssertUnwindSafe};
-use std::pin::pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use wasmtime_environ::component::{
@@ -29,7 +28,7 @@ pub struct HostFunc {
 }
 
 impl HostFunc {
-    pub(crate) fn from_closure<T, F, P, R>(func: F) -> Arc<HostFunc>
+    pub(crate) fn from_closure<T: 'static, F, P, R>(func: F) -> Arc<HostFunc>
     where
         F: Fn(StoreContextMut<T>, P) -> Result<R> + Send + Sync + 'static,
         P: ComponentNamedList + Lift + 'static,
@@ -41,13 +40,13 @@ impl HostFunc {
         })
     }
 
-    pub(crate) fn from_concurrent<T, F, N, FN, P, R>(func: F) -> Arc<HostFunc>
+    pub(crate) fn from_concurrent<T: 'static, F, N, FN, P, R>(func: F) -> Arc<HostFunc>
     where
         N: FnOnce(StoreContextMut<T>) -> Result<R> + 'static,
         FN: Future<Output = N> + Send + Sync + 'static,
         F: Fn(StoreContextMut<T>, P) -> FN + Send + Sync + 'static,
         P: ComponentNamedList + Lift + 'static,
-        R: ComponentNamedList + Lower + Send + 'static,
+        R: ComponentNamedList + Lower + Send + Sync + 'static,
     {
         let entrypoint = Self::entrypoint::<T, F, N, FN, P, R>;
         Arc::new(HostFunc {
@@ -57,7 +56,7 @@ impl HostFunc {
         })
     }
 
-    extern "C" fn entrypoint<T, F, N, FN, P, R>(
+    extern "C" fn entrypoint<T: 'static, F, N, FN, P, R>(
         cx: *mut VMOpaqueContext,
         data: *mut u8,
         ty: TypeFuncIndex,
@@ -73,7 +72,7 @@ impl HostFunc {
         FN: Future<Output = N> + Send + Sync + 'static,
         F: Fn(StoreContextMut<T>, P) -> FN + Send + Sync + 'static,
         P: ComponentNamedList + Lift + 'static,
-        R: ComponentNamedList + Lower + Send + 'static,
+        R: ComponentNamedList + Lower + Send + Sync + 'static,
     {
         struct Ptr<F>(*const F);
 
@@ -158,7 +157,7 @@ where
 /// This function is in general `unsafe` as the validity of all the parameters
 /// must be upheld. Generally that's done by ensuring this is only called from
 /// the select few places it's intended to be called from.
-unsafe fn call_host<T, Params, Return, F, N, FN>(
+unsafe fn call_host<T: 'static, Params, Return, F, N, FN>(
     cx: *mut VMOpaqueContext,
     ty: TypeFuncIndex,
     mut flags: InstanceFlags,
@@ -174,7 +173,7 @@ where
     FN: Future<Output = N> + Send + Sync + 'static,
     F: Fn(StoreContextMut<T>, Params) -> FN + 'static,
     Params: Lift,
-    Return: Lower + Send + 'static,
+    Return: Lower + Send + Sync + 'static,
 {
     /// Representation of arguments to this function when a return pointer is in
     /// use, namely the argument list is followed by a single value which is the
@@ -285,16 +284,14 @@ where
         lift.enter_call();
         let params = storage.lift_params(&mut lift, param_tys)?;
 
-        let async_cx = cx.as_context_mut().0.async_cx().expect("async cx");
-        let mut future = pin!(closure(cx.as_context_mut(), params));
-        let next = async_cx.block_on(future.as_mut())?;
-        let ret = next(cx.as_context_mut())?;
+        let future = closure(cx.as_context_mut(), params);
+
+        let (ret, cx) = concurrent::poll_and_block(cx, future)?;
 
         flags.set_may_leave(false);
         let mut lower = LowerContext::new(cx, &options, types, instance);
         storage.lower_results(&mut lower, result_tys, ret)?;
         flags.set_may_leave(true);
-
         lower.exit_call()?;
     }
 
