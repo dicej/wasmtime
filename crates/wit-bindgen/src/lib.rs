@@ -520,9 +520,9 @@ impl Wasmtime {
         self.src.push_str("}\n");
 
         let (async_, async__, send, await_) = if self.opts.async_.maybe_async() {
-            ("async", "_async", ":Send", ".await")
+            ("async", "_async", ":Send + 'static", ".await")
         } else {
-            ("", "", "", "")
+            ("", "", ":'static", "")
         };
 
         self.toplevel_import_trait(resolve, world);
@@ -864,7 +864,7 @@ impl Wasmtime {
         uwrite!(
             self.src,
             "
-                pub fn add_to_linker<T, U>(
+                pub fn add_to_linker<T: 'static, U>(
                     linker: &mut wasmtime::component::Linker<T>,
                     get: impl Fn(&mut T) -> &mut U + Send + Sync + Copy + 'static,
                 ) -> wasmtime::Result<()>
@@ -1700,7 +1700,7 @@ impl<'a> InterfaceGenerator<'a> {
         uwriteln!(
             self.src,
             "
-                pub fn add_to_linker<T, U>(
+                pub fn add_to_linker<T: 'static, U>(
                     linker: &mut wasmtime::component::Linker<T>,
                     get: impl Fn(&mut T) -> &mut U + Send + Sync + Copy + 'static,
                 ) -> wasmtime::Result<()>

@@ -18,7 +18,11 @@ use std::{
 };
 use task_table::TaskTable;
 use wasmtime_environ::component::{TypeFuncIndex, MAX_FLAT_PARAMS};
-use wasmtime_runtime::{component::VMComponentContext, SendSyncPtr, VMFuncRef, VMOpaqueContext};
+use wasmtime_fiber::{Fiber, Suspend};
+use wasmtime_runtime::{
+    component::VMComponentContext, AsyncWasmCallState, SendSyncPtr, Store, VMFuncRef,
+    VMOpaqueContext,
+};
 
 mod task_table;
 
@@ -88,6 +92,7 @@ struct GuestTask<T> {
     result: Option<LiftedResult>,
     callback: Option<(SendSyncPtr<VMFuncRef>, u32)>,
     caller: Option<Caller<T>>,
+    fiber: Option<StoreFiber>,
 }
 
 enum Task<T> {
@@ -125,6 +130,53 @@ impl<T> Task<T> {
             task
         } else {
             unreachable!()
+        }
+    }
+}
+
+type Lower<T> = Box<
+    dyn FnOnce(&mut StoreContextMut<T>, &mut [MaybeUninit<ValRaw>]) -> Result<()> + Send + Sync,
+>;
+
+type Lift<T> = Box<
+    dyn FnOnce(&mut StoreContextMut<T>, &[ValRaw]) -> Result<Option<Box<dyn Any + Send + Sync>>>
+        + Send
+        + Sync,
+>;
+
+type LiftedResult = Box<dyn Any + Send + Sync>;
+
+struct SendSyncConstPtr<T>(*const T);
+
+impl<T> Clone for SendSyncConstPtr<T> {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+impl<T> Copy for SendSyncConstPtr<T> {}
+
+unsafe impl<T> Send for SendSyncConstPtr<T> {}
+unsafe impl<T> Sync for SendSyncConstPtr<T> {}
+
+pub struct ConcurrentState<T> {
+    guest_task: Option<TaskId<T>>,
+    futures: ReadyChunks<FuturesUnordered<HostTaskFuture<T>>>,
+    table: TaskTable<T>,
+    suspend: Option<
+        SendSyncConstPtr<
+            Suspend<Option<*mut dyn Store>, Option<*mut dyn Store>, (*mut dyn Store, Result<()>)>,
+        >,
+    >,
+}
+
+impl<T> Default for ConcurrentState<T> {
+    fn default() -> Self {
+        Self {
+            guest_task: None,
+            table: TaskTable::new(),
+            futures: FuturesUnordered::new().ready_chunks(1024),
+            suspend: None,
         }
     }
 }
@@ -191,7 +243,7 @@ pub(crate) fn first_poll<T, R: Send + 'static>(
 }
 
 fn maybe_send_event<T>(
-    store: &mut StoreContextMut<'_, T>,
+    store: &mut StoreContextMut<T>,
     guest_task: TaskId<T>,
     event: u32,
     call: TaskId<T>,
@@ -238,7 +290,7 @@ fn maybe_send_event<T>(
     Ok(())
 }
 
-fn poll_loop<T>(store: &mut StoreContextMut<'_, T>) -> Result<()> {
+fn poll_loop<T>(store: &mut StoreContextMut<T>) -> Result<()> {
     let task = store.concurrent_state().guest_task;
     while task
         .map(|task| {
@@ -268,8 +320,6 @@ fn poll_loop<T>(store: &mut StoreContextMut<'_, T>) -> Result<()> {
                     .delete(task)?
                     .unwrap_host()
                     .caller;
-                // TODO: use store.on_fiber here so we don't block (especially if guest does blocking call to host)
-                // _or_ return ready tasks to caller to iterate over
                 maybe_send_event(store, caller, EVENT_CALL_DONE, task)?;
             }
         } else {
@@ -280,31 +330,59 @@ fn poll_loop<T>(store: &mut StoreContextMut<'_, T>) -> Result<()> {
     Ok(())
 }
 
-type Lower<T> = Box<
-    dyn FnOnce(&mut StoreContextMut<T>, &mut [MaybeUninit<ValRaw>]) -> Result<()> + Send + Sync,
->;
-
-type Lift<T> = Box<
-    dyn FnOnce(&mut StoreContextMut<T>, &[ValRaw]) -> Result<Option<Box<dyn Any + Send + Sync>>>
-        + Send
-        + Sync,
->;
-
-type LiftedResult = Box<dyn Any + Send + Sync>;
-
-pub struct ConcurrentState<T> {
-    guest_task: Option<TaskId<T>>,
-    futures: ReadyChunks<FuturesUnordered<HostTaskFuture<T>>>,
-    table: TaskTable<T>,
+struct StoreFiber {
+    fiber: Fiber<
+        'static,
+        Option<*mut dyn Store>,
+        Option<*mut dyn Store>,
+        (*mut dyn Store, Result<()>),
+    >,
+    state: Option<AsyncWasmCallState>,
 }
 
-impl<T> Default for ConcurrentState<T> {
-    fn default() -> Self {
-        Self {
-            guest_task: None,
-            table: TaskTable::new(),
-            futures: FuturesUnordered::new().ready_chunks(1024),
-        }
+unsafe impl Send for StoreFiber {}
+unsafe impl Sync for StoreFiber {}
+
+fn make_fiber<T>(
+    store: &mut StoreContextMut<T>,
+    fun: impl FnOnce(StoreContextMut<T>) -> Result<()> + 'static,
+) -> Result<StoreFiber> {
+    let stack = store.engine().allocator().allocate_fiber_stack()?;
+    Ok(StoreFiber {
+        fiber: Fiber::new(stack, move |store_ptr: Option<*mut dyn Store>, suspend| {
+            let store_ptr = store_ptr.unwrap();
+            let mut store = unsafe { StoreContextMut::from_raw(store_ptr) };
+            let old_suspend = store
+                .concurrent_state()
+                .suspend
+                .replace(SendSyncConstPtr(suspend));
+            let result = fun(store.as_context_mut());
+            store.concurrent_state().suspend = old_suspend;
+            (store_ptr, result)
+        })?,
+        state: Some(AsyncWasmCallState::new()),
+    })
+}
+
+fn resume_fiber<'a, T: 'static>(
+    fiber: &mut StoreFiber,
+    store: Option<StoreContextMut<'a, T>>,
+) -> Result<(StoreContextMut<'a, T>, Result<()>), Option<StoreContextMut<'a, T>>> {
+    unsafe {
+        let state = fiber.state.take().unwrap().push();
+        let result = fiber.fiber.resume(store.map(|s| s.0 as _));
+        fiber.state = Some(state.restore());
+        result
+            .map(|(store, result)| (StoreContextMut::from_raw(store), result))
+            .map_err(|v| v.map(|v| StoreContextMut::from_raw(v)))
+    }
+}
+
+unsafe fn handle_result<T>(func: impl FnOnce() -> Result<T>) -> T {
+    match panic::catch_unwind(AssertUnwindSafe(func)) {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => crate::trap::raise(e),
+        Err(e) => wasmtime_runtime::resume_panic(e),
     }
 }
 
@@ -379,14 +457,6 @@ pub(crate) extern "C" fn async_return<T>(
     }
 }
 
-unsafe fn handle_result<T>(func: impl FnOnce() -> Result<T>) -> T {
-    match panic::catch_unwind(AssertUnwindSafe(func)) {
-        Ok(Ok(value)) => value,
-        Ok(Err(e)) => crate::trap::raise(e),
-        Err(e) => wasmtime_runtime::resume_panic(e),
-    }
-}
-
 pub(crate) extern "C" fn async_enter<T>(
     cx: *mut VMOpaqueContext,
     start: *mut VMFuncRef,
@@ -456,6 +526,7 @@ pub(crate) extern "C" fn async_enter<T>(
                     store_call: SendSyncPtr::new(NonNull::new(store_call).unwrap()),
                     call,
                 }),
+                fiber: None,
             });
             let guest_task = if let Some(old_task) = old_task {
                 cx.concurrent_state().table.push_child(new_task, old_task)
@@ -469,7 +540,7 @@ pub(crate) extern "C" fn async_enter<T>(
     }
 }
 
-pub(crate) extern "C" fn async_exit<T>(
+pub(crate) extern "C" fn async_exit<T: 'static>(
     cx: *mut VMOpaqueContext,
     callback: *mut VMFuncRef,
     guest_context: u32,
@@ -486,7 +557,7 @@ pub(crate) extern "C" fn async_exit<T>(
 
             let guest_task = cx.concurrent_state().guest_task.take().unwrap();
 
-            let cx = if (flags & EXIT_FLAG_ASYNC_CALLEE) == 0 {
+            let mut cx = if (flags & EXIT_FLAG_ASYNC_CALLEE) == 0 {
                 let callee = SendSyncPtr::new(NonNull::new(callee).unwrap());
                 let param_count = usize::try_from(param_count).unwrap();
                 let result_count = usize::try_from(result_count).unwrap();
@@ -497,9 +568,9 @@ pub(crate) extern "C" fn async_exit<T>(
                 // so we can call it later.  Otherwise, mark it as entered, run the following code, and finally
                 // mark it as unentered.
 
-                let my_fiber = cx.take_current_fiber().unwrap();
+                let suspend = cx.concurrent_state().suspend.unwrap();
 
-                let mut result = cx.start_fiber(move |cx| {
+                let mut fiber = make_fiber(&mut cx, move |mut cx| {
                     let mut storage = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
                     let lower = cx
                         .concurrent_state()
@@ -523,7 +594,7 @@ pub(crate) extern "C" fn async_exit<T>(
                         .table
                         .get_mut(guest_task)?
                         .unwrap_guest_mut()
-                        .lift_results
+                        .lift_result
                         .take()
                         .unwrap();
 
@@ -550,16 +621,15 @@ pub(crate) extern "C" fn async_exit<T>(
                     Ok(())
                 })?;
 
+                let mut cx = Some(cx);
                 loop {
-                    match result {
-                        Ok((result, cx)) => {
-                            cx.set_current_fiber(Some(my_fiber));
+                    match resume_fiber(&mut fiber, cx.take()) {
+                        Ok((cx, result)) => {
                             result?;
                             break cx;
                         }
-                        Err((fiber, cx)) => {
-                            if let Some(cx) = cx {
-                                cx.set_current_fiber(Some(my_fiber));
+                        Err(cx) => {
+                            if let Some(mut cx) = cx {
                                 cx.concurrent_state()
                                     .table
                                     .get_mut(guest_task)?
@@ -567,8 +637,7 @@ pub(crate) extern "C" fn async_exit<T>(
                                     .fiber = Some(fiber);
                                 break cx;
                             } else {
-                                my_fiber.suspend(None);
-                                result = fiber.resume(None);
+                                (*suspend.0).suspend(None);
                             }
                         }
                     }
@@ -643,6 +712,7 @@ pub(crate) fn enter<T: Send>(
         result: None,
         callback: None,
         caller: None,
+        fiber: None,
     }))?;
     store.concurrent_state().guest_task = Some(guest_task);
 

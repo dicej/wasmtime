@@ -142,7 +142,7 @@ pub(crate) enum Definition {
     Resource(ResourceType, Arc<crate::func::HostFunc>),
 }
 
-impl<T> Linker<T> {
+impl<T: 'static> Linker<T> {
     /// Creates a new linker for the [`Engine`] specified with no items defined
     /// within it.
     pub fn new(engine: &Engine) -> Linker<T> {
@@ -327,7 +327,7 @@ impl<T> Linker<T> {
         component: &Component,
     ) -> Result<Instance>
     where
-        T: Send,
+        T: Send + 'static,
     {
         assert!(
             store.as_context().async_support(),

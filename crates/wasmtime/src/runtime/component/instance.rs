@@ -295,7 +295,7 @@ impl<'a> Instantiator<'a> {
         }
     }
 
-    fn run<T>(&mut self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
+    fn run<T: 'static>(&mut self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
         let env_component = self.component.env_component();
 
         self.data.state.set_async_callbacks(
@@ -559,7 +559,7 @@ impl<T> Clone for InstancePre<T> {
     }
 }
 
-impl<T> InstancePre<T> {
+impl<T: 'static> InstancePre<T> {
     /// This function is `unsafe` since there's no guarantee that the
     /// `RuntimeImport` items provided are guaranteed to work with the `T` of
     /// the store.
