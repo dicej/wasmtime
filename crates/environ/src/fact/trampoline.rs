@@ -595,6 +595,10 @@ impl Compiler<'_, '_> {
         }));
         self.instruction(Call(enter.as_u32()));
         self.instruction(I32Const(0)); // dummy guest context
+        self.module.exports.push((
+            adapter.callee.as_u32(),
+            format!("[adapter-callee]{}", adapter.name),
+        ));
         self.instruction(RefFunc(adapter.callee.as_u32()));
         self.instruction(I32Const(param_count));
         self.instruction(I32Const(result_count));
@@ -929,14 +933,14 @@ impl Compiler<'_, '_> {
 
         let src_flat = self.types.flatten_types(
             lift_opts,
-            if adapter.lift.options.async_ {
+            if lift_opts.async_ {
                 MAX_FLAT_PARAMS
             } else {
                 MAX_FLAT_RESULTS
             },
             src_tys.iter().copied(),
         );
-        let dst_flat = if adapter.lower.options.async_ {
+        let dst_flat = if lower_opts.async_ {
             None
         } else {
             self.types
@@ -958,7 +962,7 @@ impl Compiler<'_, '_> {
                 .map(|t| self.types.align(lift_opts, t))
                 .max()
                 .unwrap_or(1);
-            assert_eq!(result_locals.len(), 1);
+            assert_eq!(result_locals.len(), if lower_opts.async_ { 2 } else { 1 });
             let (addr, ty) = result_locals[0];
             assert_eq!(ty, lift_opts.ptr());
             Source::Memory(self.memory_operand(lift_opts, TempLocal::new(addr, ty), align))

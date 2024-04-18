@@ -1,4 +1,4 @@
-use crate::component::concurrent;
+use crate::component::concurrent::{self, AsyncCx};
 use crate::component::func::{LiftContext, LowerContext, Options};
 use crate::component::matching::InstanceType;
 use crate::component::storage::slice_to_storage_mut;
@@ -29,7 +29,7 @@ pub struct HostFunc {
 }
 
 impl HostFunc {
-    pub(crate) fn from_closure<T, F, P, R>(func: F) -> Arc<HostFunc>
+    pub(crate) fn from_closure<T: 'static, F, P, R>(func: F) -> Arc<HostFunc>
     where
         F: Fn(StoreContextMut<T>, P) -> Result<R> + Send + Sync + 'static,
         P: ComponentNamedList + Lift + 'static,
@@ -41,7 +41,7 @@ impl HostFunc {
         })
     }
 
-    pub(crate) fn from_concurrent<T, F, N, FN, P, R>(func: F) -> Arc<HostFunc>
+    pub(crate) fn from_concurrent<T: 'static, F, N, FN, P, R>(func: F) -> Arc<HostFunc>
     where
         N: FnOnce(StoreContextMut<T>) -> Result<R> + 'static,
         FN: Future<Output = N> + Send + Sync + 'static,
@@ -57,7 +57,7 @@ impl HostFunc {
         })
     }
 
-    extern "C" fn entrypoint<T, F, N, FN, P, R>(
+    extern "C" fn entrypoint<T: 'static, F, N, FN, P, R>(
         cx: *mut VMOpaqueContext,
         data: *mut u8,
         ty: TypeFuncIndex,
@@ -158,7 +158,7 @@ where
 /// This function is in general `unsafe` as the validity of all the parameters
 /// must be upheld. Generally that's done by ensuring this is only called from
 /// the select few places it's intended to be called from.
-unsafe fn call_host<T, Params, Return, F, N, FN>(
+unsafe fn call_host<T: 'static, Params, Return, F, N, FN>(
     cx: *mut VMOpaqueContext,
     ty: TypeFuncIndex,
     mut flags: InstanceFlags,
@@ -285,9 +285,11 @@ where
         lift.enter_call();
         let params = storage.lift_params(&mut lift, param_tys)?;
 
-        let async_cx = cx.as_context_mut().0.async_cx().expect("async cx");
+        let async_cx = AsyncCx::new(&mut cx);
         let mut future = pin!(closure(cx.as_context_mut(), params));
-        let next = async_cx.block_on(future.as_mut())?;
+        let (next, Some(mut cx)) = async_cx.block_on(future.as_mut(), Some(cx))? else {
+            unreachable!()
+        };
         let ret = next(cx.as_context_mut())?;
 
         flags.set_may_leave(false);

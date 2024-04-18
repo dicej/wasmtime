@@ -79,6 +79,8 @@ pub struct Module<'a> {
 
     globals_by_type: [Vec<u32>; 4],
     globals: Vec<ValType>,
+
+    exports: Vec<(u32, String)>,
 }
 
 struct AdapterData {
@@ -199,6 +201,7 @@ impl<'a> Module<'a> {
             imported_async_exit_call: None,
             globals_by_type: Default::default(),
             globals: Default::default(),
+            exports: Vec::new(),
         }
     }
 
@@ -564,6 +567,9 @@ impl<'a> Module<'a> {
             if let Some(name) = &func.export {
                 exports.export(name, ExportKind::Func, idx.as_u32());
             }
+        }
+        for (idx, name) in &self.exports {
+            exports.export(name, ExportKind::Func, *idx);
         }
 
         let imported_global_count = u32::try_from(self.imported_globals.len()).unwrap();

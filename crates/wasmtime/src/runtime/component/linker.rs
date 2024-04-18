@@ -1,3 +1,4 @@
+use crate::component::concurrent::AsyncCx;
 use crate::component::func::HostFunc;
 use crate::component::instance::RuntimeImport;
 use crate::component::matching::{InstanceType, TypeChecker};
@@ -372,6 +373,7 @@ impl<T> LinkerInstance<'_, T> {
     // TODO: needs more words and examples
     pub fn func_wrap<F, Params, Return>(&mut self, name: &str, func: F) -> Result<()>
     where
+        T: 'static,
         F: Fn(StoreContextMut<T>, Params) -> Result<Return> + Send + Sync + 'static,
         Params: ComponentNamedList + Lift + 'static,
         Return: ComponentNamedList + Lower + Send + Sync + 'static,
@@ -388,6 +390,7 @@ impl<T> LinkerInstance<'_, T> {
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn func_wrap_async<Params, Return, F>(&mut self, name: &str, f: F) -> Result<()>
     where
+        T: 'static,
         F: for<'a> Fn(
                 StoreContextMut<'a, T>,
                 Params,
@@ -403,9 +406,9 @@ impl<T> LinkerInstance<'_, T> {
             "cannot use `func_wrap_async` without enabling async support in the config"
         );
         let ff = move |mut store: StoreContextMut<'_, T>, params: Params| -> Result<Return> {
-            let async_cx = store.as_context_mut().0.async_cx().expect("async cx");
+            let async_cx = AsyncCx::new(&mut store);
             let mut future = Pin::from(f(store.as_context_mut(), params));
-            unsafe { async_cx.block_on(future.as_mut()) }?
+            unsafe { async_cx.block_on::<T, _>(future.as_mut(), None) }?.0
         };
         self.func_wrap(name, ff)
     }
@@ -415,6 +418,7 @@ impl<T> LinkerInstance<'_, T> {
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn func_wrap_concurrent<Params, Return, F, N, FN>(&mut self, name: &str, f: F) -> Result<()>
     where
+        T: 'static,
         N: FnOnce(StoreContextMut<T>) -> Result<Return> + 'static,
         FN: Future<Output = N> + Send + Sync + 'static,
         F: Fn(StoreContextMut<T>, Params) -> FN + Send + Sync + 'static,

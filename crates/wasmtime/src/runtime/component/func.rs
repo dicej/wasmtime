@@ -450,7 +450,7 @@ impl Func {
     }
 
     fn call_raw_async<
-        T: Send,
+        T: Send + 'static,
         Params: Send + Sync + 'static,
         Return: Send + Sync + 'static,
         LowerParams,

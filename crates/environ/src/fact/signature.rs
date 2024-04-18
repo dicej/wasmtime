@@ -133,7 +133,11 @@ impl ComponentTypesBuilder {
         let mut params_indirect = false;
         let mut params = match self.flatten_types(
             &options.options,
-            MAX_FLAT_PARAMS,
+            if options.options.async_ {
+                MAX_FLAT_PARAMS
+            } else {
+                MAX_FLAT_RESULTS
+            },
             self[ty.results].types.iter().copied(),
         ) {
             Some(list) => list,

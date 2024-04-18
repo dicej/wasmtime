@@ -1,3 +1,4 @@
+use crate::component::concurrent;
 use crate::component::func::{self, Func, LiftContext, LowerContext, Options};
 use crate::component::matching::InstanceType;
 use crate::component::storage::{storage_as_slice, storage_as_slice_mut};
@@ -180,7 +181,7 @@ where
     #[cfg(feature = "async")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub async fn call_async<T: Send + 'static>(
-        &self,
+        self,
         mut store: impl AsContextMut<Data = T>,
         params: Params,
     ) -> Result<Return>
@@ -188,14 +189,12 @@ where
         Params: Send + Sync + 'static,
         Return: Send + Sync + 'static,
     {
-        let mut store = store.as_context_mut();
+        let store = store.as_context_mut();
         assert!(
             store.0.async_support(),
             "cannot use `call_async` when async support is not enabled on the config"
         );
-        store
-            .on_fiber(|store| self.call_impl(store, params))
-            .await?
+        concurrent::on_fiber(store, move |store| self.call_impl(store, params)).await?
     }
 
     fn call_impl<T: Send + 'static>(
