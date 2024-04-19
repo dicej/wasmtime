@@ -1,7 +1,6 @@
 use crate::{AsContextMut, Engine, StoreContextMut, ValRaw};
 use anyhow::{anyhow, Error, Result};
 use futures::{
-    channel::oneshot,
     future::{self, FutureExt},
     stream::{FuturesUnordered, ReadyChunks, StreamExt},
 };
@@ -249,6 +248,7 @@ pub struct ConcurrentState<T> {
     futures: ReadyChunks<FuturesUnordered<HostTaskFuture<T>>>,
     table: TaskTable<T>,
     async_state: AsyncState,
+    result: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl<T> Default for ConcurrentState<T> {
@@ -261,6 +261,7 @@ impl<T> Default for ConcurrentState<T> {
                 current_suspend: UnsafeCell::new(ptr::null()),
                 current_poll_cx: UnsafeCell::new(ptr::null_mut()),
             },
+            result: None,
         }
     }
 }
@@ -403,35 +404,45 @@ pub(crate) fn poll_and_block<'a, T: 'static, R: Send + Sync + 'static>(
     }
 }
 
-pub(crate) async fn on_fiber<'a, R: 'static, T: 'static>(
+pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: 'static>(
     mut store: StoreContextMut<'a, T>,
     func: impl FnOnce(&mut StoreContextMut<T>) -> R + Send + 'static,
 ) -> Result<R> {
-    let (tx, rx) = oneshot::channel();
     let mut fiber = make_fiber(&mut store, move |mut store| {
-        _ = tx.send(func(&mut store));
+        let result = func(&mut store);
+        assert!(store.concurrent_state().result.is_none());
+        store.concurrent_state().result = Some(Box::new(result) as _);
         Ok(())
     })?;
 
     let poll_cx = store.concurrent_state().async_state.current_poll_cx.get();
-    let mut store = Some(store);
-    future::poll_fn(move |cx| unsafe {
-        let _reset = Reset(poll_cx, *poll_cx);
-        *poll_cx = mem::transmute::<&mut Context<'_>, *mut Context<'static>>(cx);
-        match resume_fiber(&mut fiber, store.take(), Ok(())) {
-            Ok((_, result)) => Poll::Ready(result),
-            Err(s) => {
-                if let Some(range) = fiber.fiber.stack().range() {
-                    AsyncWasmCallState::assert_current_state_not_in_range(range);
+    future::poll_fn({
+        let mut store = Some(store.as_context_mut());
+
+        move |cx| unsafe {
+            let _reset = Reset(poll_cx, *poll_cx);
+            *poll_cx = mem::transmute::<&mut Context<'_>, *mut Context<'static>>(cx);
+            match resume_fiber(&mut fiber, store.take(), Ok(())) {
+                Ok((_, result)) => Poll::Ready(result),
+                Err(s) => {
+                    if let Some(range) = fiber.fiber.stack().range() {
+                        AsyncWasmCallState::assert_current_state_not_in_range(range);
+                    }
+                    store = s;
+                    Poll::Pending
                 }
-                store = s;
-                Poll::Pending
             }
         }
     })
     .await?;
 
-    Ok(rx.await.map_err(|_| anyhow!("oneshot sender cancelled"))?)
+    Ok(*store
+        .concurrent_state()
+        .result
+        .take()
+        .unwrap()
+        .downcast()
+        .unwrap())
 }
 
 fn maybe_send_event<'a, T: 'static>(
