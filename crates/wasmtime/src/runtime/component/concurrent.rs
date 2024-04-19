@@ -8,6 +8,7 @@ use once_cell::sync::Lazy;
 use std::{
     any::Any,
     cell::UnsafeCell,
+    collections::{HashMap, VecDeque},
     future::Future,
     marker::PhantomData,
     mem::{self, MaybeUninit},
@@ -94,7 +95,7 @@ struct GuestTask<T> {
     result: Option<LiftedResult>,
     callback: Option<(SendSyncPtr<VMFuncRef>, u32)>,
     caller: Option<Caller<T>>,
-    fiber: Option<StoreFiber>,
+    fiber: Option<(StoreFiber, usize)>,
 }
 
 enum Task<T> {
@@ -249,6 +250,7 @@ pub struct ConcurrentState<T> {
     table: TaskTable<T>,
     async_state: AsyncState,
     result: Option<Box<dyn Any + Send + Sync>>,
+    waiters: HashMap<usize, VecDeque<TaskId<T>>>,
 }
 
 impl<T> Default for ConcurrentState<T> {
@@ -262,6 +264,7 @@ impl<T> Default for ConcurrentState<T> {
                 current_poll_cx: UnsafeCell::new(ptr::null_mut()),
             },
             result: None,
+            waiters: HashMap::new(),
         }
     }
 }
@@ -489,7 +492,8 @@ fn maybe_send_event<'a, T: 'static>(
             }
         }
         store.concurrent_state().guest_task = old_task;
-    } else if let Some(mut fiber) = store
+        Ok(store)
+    } else if let Some((fiber, callee_instance)) = store
         .concurrent_state()
         .table
         .get_mut(guest_task)?
@@ -497,35 +501,48 @@ fn maybe_send_event<'a, T: 'static>(
         .fiber
         .take()
     {
-        match unsafe { resume_fiber(&mut fiber, Some(store), Ok(())) } {
-            Ok((new_store, result)) => {
-                result?;
-                store = new_store;
-                if let Some(next) = store
-                    .concurrent_state()
-                    .table
-                    .get(guest_task)?
-                    .unwrap_guest_ref()
-                    .caller
-                    .as_ref()
-                    .map(|c| c.task)
-                {
-                    store.concurrent_state().table.delete(guest_task)?;
-                    store = maybe_send_event(store, next, EVENT_CALL_DONE, guest_task)?;
-                }
-            }
-            Err(new_store) => {
-                store = new_store.unwrap();
-                store
-                    .concurrent_state()
-                    .table
-                    .get_mut(guest_task)?
-                    .unwrap_guest_mut()
-                    .fiber = Some(fiber);
+        resume(store, guest_task, fiber, callee_instance)
+    } else {
+        Ok(store)
+    }
+}
+
+fn resume<'a, T: 'static>(
+    mut store: StoreContextMut<'a, T>,
+    guest_task: TaskId<T>,
+    mut fiber: StoreFiber,
+    callee_instance: usize,
+) -> Result<StoreContextMut<'a, T>> {
+    match unsafe { resume_fiber(&mut fiber, Some(store), Ok(())) } {
+        Ok((mut store, result)) => {
+            result?;
+            store = resume_next_waiter(store, callee_instance)?;
+            if let Some(next) = store
+                .concurrent_state()
+                .table
+                .get(guest_task)?
+                .unwrap_guest_ref()
+                .caller
+                .as_ref()
+                .map(|c| c.task)
+            {
+                store.concurrent_state().table.delete(guest_task)?;
+                maybe_send_event(store, next, EVENT_CALL_DONE, guest_task)
+            } else {
+                Ok(store)
             }
         }
+        Err(new_store) => {
+            store = new_store.unwrap();
+            store
+                .concurrent_state()
+                .table
+                .get_mut(guest_task)?
+                .unwrap_guest_mut()
+                .fiber = Some((fiber, callee_instance));
+            Ok(store)
+        }
     }
-    Ok(store)
 }
 
 fn poll_loop<'a, T: 'static>(mut store: StoreContextMut<'a, T>) -> Result<StoreContextMut<'a, T>> {
@@ -566,6 +583,38 @@ fn poll_loop<'a, T: 'static>(mut store: StoreContextMut<'a, T>) -> Result<StoreC
     }
 
     Ok(store)
+}
+
+fn resume_next_waiter<'a, T: 'static>(
+    mut store: StoreContextMut<'a, T>,
+    callee_instance: usize,
+) -> Result<StoreContextMut<'a, T>> {
+    match store
+        .concurrent_state()
+        .waiters
+        .get_mut(&callee_instance)
+        .map(|v| v.pop_front())
+    {
+        Some(Some(task)) => {
+            let (fiber, _) = store
+                .concurrent_state()
+                .table
+                .get_mut(task)?
+                .unwrap_guest_mut()
+                .fiber
+                .take()
+                .unwrap();
+
+            // TODO: Avoid tail calling `resume` here, because it may call us, leading to recursion limited only by
+            // the number of waiters.  Flatten this into an iteration instead.
+            resume(store, task, fiber, callee_instance)
+        }
+        Some(None) => {
+            store.concurrent_state().waiters.remove(&callee_instance);
+            Ok(store)
+        }
+        None => Ok(store),
+    }
 }
 
 struct StoreFiber {
@@ -931,23 +980,38 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                     Ok(())
                 })?;
 
-                let mut cx = Some(cx);
-                loop {
-                    match resume_fiber(&mut fiber, cx.take(), Ok(())) {
-                        Ok((cx, result)) => {
-                            result?;
-                            break cx;
-                        }
-                        Err(cx) => {
-                            if let Some(mut cx) = cx {
-                                cx.concurrent_state()
-                                    .table
-                                    .get_mut(guest_task)?
-                                    .unwrap_guest_mut()
-                                    .fiber = Some(fiber);
-                                break cx;
-                            } else {
-                                suspend_fiber::<T>(fiber.suspend, fiber.stack_limit, None)?;
+                let callee_instance = (*callee.as_ptr()).vmctx as usize;
+                if let Some(waiters) = cx.concurrent_state().waiters.get_mut(&callee_instance) {
+                    waiters.push_back(guest_task);
+                    cx.concurrent_state()
+                        .table
+                        .get_mut(guest_task)?
+                        .unwrap_guest_mut()
+                        .fiber = Some((fiber, callee_instance));
+                    cx
+                } else {
+                    cx.concurrent_state()
+                        .waiters
+                        .insert(callee_instance, VecDeque::new());
+
+                    let mut cx = Some(cx);
+                    loop {
+                        match resume_fiber(&mut fiber, cx.take(), Ok(())) {
+                            Ok((cx, result)) => {
+                                result?;
+                                break resume_next_waiter(cx, callee_instance)?;
+                            }
+                            Err(cx) => {
+                                if let Some(mut cx) = cx {
+                                    cx.concurrent_state()
+                                        .table
+                                        .get_mut(guest_task)?
+                                        .unwrap_guest_mut()
+                                        .fiber = Some((fiber, callee_instance));
+                                    break cx;
+                                } else {
+                                    suspend_fiber::<T>(fiber.suspend, fiber.stack_limit, None)?;
+                                }
                             }
                         }
                     }
