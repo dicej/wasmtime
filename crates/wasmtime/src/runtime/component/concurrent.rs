@@ -1,4 +1,4 @@
-use crate::{AsContextMut, StoreContextMut, ValRaw};
+use crate::{AsContextMut, Engine, StoreContextMut, ValRaw};
 use anyhow::{anyhow, Error, Result};
 use futures::{
     channel::oneshot,
@@ -162,9 +162,9 @@ impl<T: Copy> Drop for Reset<T> {
 struct AsyncState {
     current_suspend: UnsafeCell<
         *const Suspend<
+            (Option<*mut dyn Store>, Result<()>),
             Option<*mut dyn Store>,
-            Option<*mut dyn Store>,
-            (*mut dyn Store, Result<()>),
+            (Option<*mut dyn Store>, Result<()>),
         >,
     >,
     current_poll_cx: UnsafeCell<*mut Context<'static>>,
@@ -175,9 +175,9 @@ unsafe impl Sync for AsyncState {}
 
 pub(crate) struct AsyncCx {
     current_suspend: *mut *const wasmtime_fiber::Suspend<
+        (Option<*mut dyn Store>, Result<()>),
         Option<*mut dyn Store>,
-        Option<*mut dyn Store>,
-        (*mut dyn Store, Result<()>),
+        (Option<*mut dyn Store>, Result<()>),
     >,
     current_poll_cx: *mut *mut Context<'static>,
     track_pkey_context_switch: bool,
@@ -198,9 +198,12 @@ impl AsyncCx {
         mut store: Option<StoreContextMut<'a, T>>,
     ) -> Result<(U, Option<StoreContextMut<'a, T>>)> {
         loop {
-            let poll_cx = ptr::replace(self.current_poll_cx, ptr::null_mut());
-            let result = future.as_mut().poll(&mut *poll_cx);
-            *self.current_poll_cx = poll_cx;
+            let result = {
+                let poll_cx = *self.current_poll_cx;
+                let _reset = Reset(self.current_poll_cx, poll_cx);
+                *self.current_poll_cx = ptr::null_mut();
+                future.as_mut().poll(&mut *poll_cx)
+            };
 
             match result {
                 Poll::Ready(v) => break Ok((v, store)),
@@ -214,7 +217,10 @@ impl AsyncCx {
             } else {
                 ProtectionMask::all()
             };
-            store = suspend_fiber(self.current_suspend, store.take());
+            eprintln!("suspend in block_on");
+            let v = suspend_fiber(self.current_suspend, store.take());
+            eprintln!("unsuspend in block_on");
+            store = v?;
             if self.track_pkey_context_switch {
                 mpk::allow(previous_mask);
             }
@@ -315,14 +321,18 @@ pub(crate) async fn on_fiber<'a, R: 'static, T: 'static>(
     })?;
 
     let poll_cx = store.concurrent_state().async_state.current_poll_cx.get();
-    let suspend = store.concurrent_state().async_state.current_suspend.get();
     let mut store = Some(store);
     future::poll_fn(move |cx| unsafe {
         let _reset = Reset(poll_cx, *poll_cx);
         *poll_cx = mem::transmute::<&mut Context<'_>, *mut Context<'static>>(cx);
-        match resume_fiber(&mut fiber, store.take(), suspend) {
-            Ok((_, result)) => Poll::Ready(result),
+        eprintln!("resume in on_fiber");
+        match resume_fiber(&mut fiber, store.take(), Ok(())) {
+            Ok((_, result)) => {
+                eprintln!("got result in on_fiber");
+                Poll::Ready(result)
+            }
             Err(s) => {
+                eprintln!("pending in on_fiber");
                 if let Some(range) = fiber.fiber.stack().range() {
                     AsyncWasmCallState::assert_current_state_not_in_range(range);
                 }
@@ -424,15 +434,37 @@ fn poll_loop<T: 'static>(store: &mut StoreContextMut<T>) -> Result<()> {
     Ok(())
 }
 
-// TODO: impl Drop for this doing the same things as in FiberFuture::drop
 struct StoreFiber {
     fiber: Fiber<
         'static,
+        (Option<*mut dyn Store>, Result<()>),
         Option<*mut dyn Store>,
-        Option<*mut dyn Store>,
-        (*mut dyn Store, Result<()>),
+        (Option<*mut dyn Store>, Result<()>),
     >,
     state: Option<AsyncWasmCallState>,
+    engine: Engine,
+    suspend: *mut *const Suspend<
+        (Option<*mut dyn Store>, Result<()>),
+        Option<*mut dyn Store>,
+        (Option<*mut dyn Store>, Result<()>),
+    >,
+}
+
+impl Drop for StoreFiber {
+    fn drop(&mut self) {
+        if !self.fiber.done() {
+            let result = unsafe { resume_fiber_raw(self, None, Err(anyhow!("future dropped"))) };
+            debug_assert!(result.is_ok());
+        }
+
+        self.state.take().unwrap().assert_null();
+
+        unsafe {
+            self.engine
+                .allocator()
+                .deallocate_fiber_stack(self.fiber.stack());
+        }
+    }
 }
 
 unsafe impl Send for StoreFiber {}
@@ -442,31 +474,38 @@ fn make_fiber<T>(
     store: &mut StoreContextMut<T>,
     fun: impl FnOnce(StoreContextMut<T>) -> Result<()> + 'static,
 ) -> Result<StoreFiber> {
-    let stack = store.engine().allocator().allocate_fiber_stack()?;
+    let engine = store.engine().clone();
+    let stack = engine.allocator().allocate_fiber_stack()?;
     Ok(StoreFiber {
-        fiber: Fiber::new(stack, move |store_ptr: Option<*mut dyn Store>, suspend| {
-            let store_ptr = store_ptr.unwrap();
-            unsafe {
-                let mut store = StoreContextMut::from_raw(store_ptr);
-                let suspend_ptr = store.concurrent_state().async_state.current_suspend.get();
-                let _reset = Reset(suspend_ptr, *suspend_ptr);
-                *suspend_ptr = suspend;
-                (store_ptr, fun(store.as_context_mut()))
-            }
-        })?,
+        fiber: Fiber::new(
+            stack,
+            move |(store_ptr, result): (Option<*mut dyn Store>, Result<()>), suspend| {
+                if result.is_err() {
+                    (store_ptr, result)
+                } else {
+                    unsafe {
+                        let store_ptr = store_ptr.unwrap();
+                        let mut store = StoreContextMut::from_raw(store_ptr);
+                        let suspend_ptr =
+                            store.concurrent_state().async_state.current_suspend.get();
+                        let _reset = Reset(suspend_ptr, *suspend_ptr);
+                        *suspend_ptr = suspend;
+                        (Some(store_ptr), fun(store.as_context_mut()))
+                    }
+                }
+            },
+        )?,
         state: Some(AsyncWasmCallState::new()),
+        engine,
+        suspend: store.concurrent_state().async_state.current_suspend.get(),
     })
 }
 
-unsafe fn resume_fiber<'a, T: 'static>(
+unsafe fn resume_fiber_raw(
     fiber: &mut StoreFiber,
-    store: Option<StoreContextMut<'a, T>>,
-    suspend: *mut *const Suspend<
-        Option<*mut dyn Store>,
-        Option<*mut dyn Store>,
-        (*mut dyn Store, Result<()>),
-    >,
-) -> Result<(StoreContextMut<'a, T>, Result<()>), Option<StoreContextMut<'a, T>>> {
+    store: Option<*mut dyn Store>,
+    result: Result<()>,
+) -> Result<(Option<*mut dyn Store>, Result<()>), Option<*mut dyn Store>> {
     struct Restore<'a> {
         fiber: &'a mut StoreFiber,
         state: Option<PreviousAsyncWasmCallState>,
@@ -481,30 +520,41 @@ unsafe fn resume_fiber<'a, T: 'static>(
     }
 
     unsafe {
+        let suspend = fiber.suspend;
         let state = Some(fiber.state.take().unwrap().push());
         let restore = Restore { fiber, state };
         let _reset = Reset(suspend, *suspend);
-        restore
-            .fiber
-            .fiber
-            .resume(store.map(|s| s.0 as _))
-            .map(|(store, result)| (StoreContextMut::from_raw(store), result))
-            .map_err(|v| v.map(|v| StoreContextMut::from_raw(v)))
+        eprintln!("start resume fiber");
+        let v = restore.fiber.fiber.resume((store, result));
+        eprintln!("finish resume fiber");
+        v
     }
+}
+
+unsafe fn resume_fiber<'a, T: 'static>(
+    fiber: &mut StoreFiber,
+    store: Option<StoreContextMut<'a, T>>,
+    result: Result<()>,
+) -> Result<(StoreContextMut<'a, T>, Result<()>), Option<StoreContextMut<'a, T>>> {
+    resume_fiber_raw(fiber, store.map(|s| s.0 as _), result)
+        .map(|(store, result)| (StoreContextMut::from_raw(store.unwrap()), result))
+        .map_err(|v| v.map(|v| StoreContextMut::from_raw(v)))
 }
 
 unsafe fn suspend_fiber<'a, T: 'static>(
     suspend: *mut *const Suspend<
+        (Option<*mut dyn Store>, Result<()>),
         Option<*mut dyn Store>,
-        Option<*mut dyn Store>,
-        (*mut dyn Store, Result<()>),
+        (Option<*mut dyn Store>, Result<()>),
     >,
     store: Option<StoreContextMut<'a, T>>,
-) -> Option<StoreContextMut<'a, T>> {
+) -> Result<Option<StoreContextMut<'a, T>>> {
     let _reset = Reset(suspend, *suspend);
-    (**suspend)
-        .suspend(store.map(|s| s.0 as _))
-        .map(|v| StoreContextMut::from_raw(v))
+    eprintln!("start suspend fiber");
+    let (store, result) = (**suspend).suspend(store.map(|s| s.0 as _));
+    eprintln!("finish suspend fiber");
+    result?;
+    Ok(store.map(|v| StoreContextMut::from_raw(v)))
 }
 
 unsafe fn handle_result<T>(func: impl FnOnce() -> Result<T>) -> T {
@@ -708,17 +758,12 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                         .unwrap();
                     lower(&mut cx, &mut storage[..param_count])?;
 
-                    eprintln!(
-                        "calling callee; param_count {param_count} result_count {result_count}"
-                    );
                     crate::Func::call_unchecked_raw(
                         &mut cx,
                         callee.as_non_null(),
                         storage.as_mut_ptr() as _,
                         param_count.max(result_count),
                     )?;
-
-                    eprintln!("callee returned");
 
                     let lift = cx
                         .concurrent_state()
@@ -752,16 +797,18 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                     Ok(())
                 })?;
 
-                let suspend = cx.concurrent_state().async_state.current_suspend.get();
                 let mut cx = Some(cx);
                 loop {
-                    match resume_fiber(&mut fiber, cx.take(), suspend) {
+                    eprintln!("resume in async_exit");
+                    match resume_fiber(&mut fiber, cx.take(), Ok(())) {
                         Ok((cx, result)) => {
+                            eprintln!("got result in async_exit");
                             result?;
                             break cx;
                         }
                         Err(cx) => {
                             if let Some(mut cx) = cx {
+                                eprintln!("got store in async_exit");
                                 cx.concurrent_state()
                                     .table
                                     .get_mut(guest_task)?
@@ -769,7 +816,9 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                                     .fiber = Some(fiber);
                                 break cx;
                             } else {
-                                suspend_fiber::<T>(suspend, None);
+                                eprintln!("suspend in async_exit");
+                                suspend_fiber::<T>(fiber.suspend, None)?;
+                                eprintln!("unsuspend in async_exit");
                             }
                         }
                     }
@@ -806,6 +855,8 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                 STATUS_DONE
             };
 
+            eprintln!("return status {status}");
+
             if guest_context != 0 {
                 task.callback = Some((
                     SendSyncPtr::new(NonNull::new(callback).unwrap()),
@@ -838,6 +889,7 @@ pub(crate) fn enter<T: Send>(
     lower_params: Lower<T>,
     lift_result: Lift<T>,
 ) -> Result<()> {
+    eprintln!("enter");
     assert!(store.concurrent_state().guest_task.is_none());
 
     let guest_task = store.concurrent_state().table.push(Task::Guest(GuestTask {
@@ -858,6 +910,7 @@ pub(crate) fn exit<T: Send + 'static, R: 'static>(
     callback: NonNull<VMFuncRef>,
     guest_context: u32,
 ) -> Result<R> {
+    eprintln!("exit with guest context {guest_context}");
     if guest_context != 0 {
         let guest_task = store.concurrent_state().guest_task.unwrap();
         store

@@ -296,7 +296,6 @@ where
         let mut lower = LowerContext::new(cx, &options, types, instance);
         storage.lower_results(&mut lower, result_tys, ret)?;
         flags.set_may_leave(true);
-
         lower.exit_call()?;
     }
 

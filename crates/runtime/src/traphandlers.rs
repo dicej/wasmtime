@@ -642,6 +642,7 @@ pub(crate) mod tls {
         /// that this doesn't push stale data and the data is popped
         /// appropriately.
         pub unsafe fn push(self) -> PreviousAsyncWasmCallState {
+            eprintln!("call state push");
             // Our `state` pointer is a linked list of oldest-to-youngest so by
             // pushing in order of the list we restore the youngest-to-oldest
             // list as stored in the state of this current thread.
@@ -696,6 +697,7 @@ pub(crate) mod tls {
         /// Must be paired with a `push` and only performed at a time when a
         /// fiber is being suspended.
         pub unsafe fn restore(self) -> AsyncWasmCallState {
+            eprintln!("call state restore");
             let thread_head = self.state;
             mem::forget(self);
             let mut ret = AsyncWasmCallState::new();

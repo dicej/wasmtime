@@ -380,7 +380,15 @@ impl Func {
         );
         store
             .on_fiber(|store| self.call_impl(store, params, results))
-            .await?
+            .await
+            .map_err(|v| {
+                eprintln!("call_async trouble: {v:?}");
+                v
+            })?
+            .map_err(|v| {
+                eprintln!("call_async trouble 2: {v:?}");
+                v
+            })
     }
 
     fn call_impl(

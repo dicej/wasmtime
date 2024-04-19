@@ -244,7 +244,8 @@ impl Backtrace {
             // or equal to `trampoline_sp` (except s390x, where it needs to be
             // strictly greater than).
             let next_older_fp = *(fp as *mut usize).add(arch::NEXT_OLDER_FP_FROM_FP_OFFSET);
-            if arch::reached_entry_sp(next_older_fp, trampoline_sp) {
+            // FIXME dicej: remove the `next_older_fp == 0 || ` hack
+            if next_older_fp == 0 || arch::reached_entry_sp(next_older_fp, trampoline_sp) {
                 log::trace!("=== Done tracing contiguous sequence of Wasm frames ===");
                 return ControlFlow::Continue(());
             }
