@@ -97,7 +97,7 @@ impl HostFunc {
         }
     }
 
-    pub(crate) fn new_dynamic<T, F>(func: F) -> Arc<HostFunc>
+    pub(crate) fn new_dynamic<T: 'static, F>(func: F) -> Arc<HostFunc>
     where
         F: Fn(StoreContextMut<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static,
     {
@@ -324,7 +324,7 @@ where
             }
         }
 
-        unsafe fn lower_results<T>(
+        unsafe fn lower_results<T: 'static>(
             &mut self,
             cx: &mut LowerContext<'_, T>,
             ty: InterfaceType,
@@ -372,7 +372,7 @@ unsafe fn handle_result(func: impl FnOnce() -> Result<()>) {
     }
 }
 
-unsafe fn call_host_dynamic<T, F>(
+unsafe fn call_host_dynamic<T: 'static, F>(
     cx: *mut VMOpaqueContext,
     ty: TypeFuncIndex,
     mut flags: InstanceFlags,
@@ -491,7 +491,7 @@ fn validate_inbounds_dynamic(abi: &CanonicalAbiInfo, memory: &[u8], ptr: &ValRaw
     Ok(ptr)
 }
 
-extern "C" fn dynamic_entrypoint<T, F>(
+extern "C" fn dynamic_entrypoint<T: 'static, F>(
     cx: *mut VMOpaqueContext,
     data: *mut u8,
     ty: TypeFuncIndex,

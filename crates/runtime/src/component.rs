@@ -10,11 +10,12 @@ use crate::{
     SendSyncPtr, Store, VMArrayCallFunction, VMFuncRef, VMGlobalDefinition, VMMemoryDefinition,
     VMNativeCallFunction, VMOpaqueContext, VMSharedTypeIndex, VMWasmCallFunction, ValRaw,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use memoffset::offset_of;
 use sptr::Strict;
 use std::alloc::{self, Layout};
 use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::marker;
 use std::mem;
 use std::ops::Deref;
@@ -55,6 +56,10 @@ pub struct ComponentInstance {
     /// This is paired with other information to create a `ResourceTables` which
     /// is how this field is manipulated.
     component_resource_tables: PrimaryMap<TypeResourceTableIndex, ResourceTable>,
+
+    handle_table: HashSet<(TableIndex, u32)>,
+
+    error_table: HashMap<(TypeErrorTableIndex, u32), usize>,
 
     /// Storage for the type information about resources within this component
     /// instance.
@@ -156,6 +161,58 @@ pub type VMAsyncExitCallback = extern "C" fn(
     flags: u32,
 ) -> u32;
 
+/// TODO: docs
+pub type VMFutureNewCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    ty: TypeFutureTableIndex,
+    results: u32,
+);
+
+/// TODO: docs
+pub type VMFutureTransmitCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    ty: TypeFutureTableIndex,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32;
+
+/// TODO: docs
+pub type VMFutureDropCallback =
+    extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeFutureTableIndex, handle: u32);
+
+/// TODO: docs
+pub type VMStreamNewCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    ty: TypeStreamTableIndex,
+    results: u32,
+);
+
+/// TODO: docs
+pub type VMStreamTransmitCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    ty: TypeStreamTableIndex,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32;
+
+/// TODO: docs
+pub type VMStreamDropCallback =
+    extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeStreamTableIndex, handle: u32);
+
+/// TODO: docs
+pub type VMErrorDropCallback =
+    extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeErrorTableIndex, handle: u32);
+
 /// This is a marker type to represent the underlying allocation of a
 /// `VMComponentContext`.
 ///
@@ -172,6 +229,15 @@ pub type VMAsyncExitCallback = extern "C" fn(
 pub struct VMComponentContext {
     /// For more information about this see the equivalent field in `VMContext`
     _marker: marker::PhantomPinned,
+}
+
+/// TODO: docs
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub enum TableIndex {
+    /// TODO: docs
+    Future(TypeFutureTableIndex),
+    /// TODO: docs
+    Stream(TypeStreamTableIndex),
 }
 
 impl ComponentInstance {
@@ -242,6 +308,8 @@ impl ComponentInstance {
                     .unwrap(),
                 ),
                 component_resource_tables,
+                handle_table: HashSet::new(),
+                error_table: HashMap::new(),
                 runtime_info,
                 resource_types,
                 vmctx: VMComponentContext {
@@ -492,12 +560,34 @@ impl ComponentInstance {
         return_: VMAsyncCallback,
         enter: VMAsyncEnterCallback,
         exit: VMAsyncExitCallback,
+        future_new: VMFutureNewCallback,
+        future_send: VMFutureTransmitCallback,
+        future_receive: VMFutureTransmitCallback,
+        future_drop_sender: VMFutureDropCallback,
+        future_drop_receiver: VMFutureDropCallback,
+        stream_new: VMStreamNewCallback,
+        stream_send: VMStreamTransmitCallback,
+        stream_receive: VMStreamTransmitCallback,
+        stream_drop_sender: VMStreamDropCallback,
+        stream_drop_receiver: VMStreamDropCallback,
+        error_drop: VMErrorDropCallback,
     ) {
         unsafe {
             *self.vmctx_plus_offset_mut(self.offsets.async_start()) = start;
             *self.vmctx_plus_offset_mut(self.offsets.async_return()) = return_;
             *self.vmctx_plus_offset_mut(self.offsets.async_enter()) = enter;
             *self.vmctx_plus_offset_mut(self.offsets.async_exit()) = exit;
+            *self.vmctx_plus_offset_mut(self.offsets.future_new()) = future_new;
+            *self.vmctx_plus_offset_mut(self.offsets.future_send()) = future_send;
+            *self.vmctx_plus_offset_mut(self.offsets.future_receive()) = future_receive;
+            *self.vmctx_plus_offset_mut(self.offsets.future_drop_sender()) = future_drop_sender;
+            *self.vmctx_plus_offset_mut(self.offsets.future_drop_receiver()) = future_drop_receiver;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_new()) = stream_new;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_send()) = stream_send;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_receive()) = stream_receive;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_drop_sender()) = stream_drop_sender;
+            *self.vmctx_plus_offset_mut(self.offsets.stream_drop_receiver()) = stream_drop_receiver;
+            *self.vmctx_plus_offset_mut(self.offsets.error_drop()) = error_drop;
         }
     }
 
@@ -632,6 +722,16 @@ impl ComponentInstance {
         }
     }
 
+    /// TODO: docs
+    pub fn handle_table(&mut self) -> &mut HashSet<(TableIndex, u32)> {
+        &mut self.handle_table
+    }
+
+    /// TODO: docs
+    pub fn error_table(&mut self) -> &mut HashMap<(TypeErrorTableIndex, u32), usize> {
+        &mut self.error_table
+    }
+
     /// Returns the runtime state of resources associated with this component.
     #[inline]
     pub fn component_resource_tables(
@@ -699,6 +799,49 @@ impl ComponentInstance {
 
     pub(crate) fn resource_exit_call(&mut self) -> Result<()> {
         self.resource_tables().exit_call()
+    }
+
+    pub(crate) fn future_transfer(
+        &mut self,
+        idx: u32,
+        src: TypeFutureTableIndex,
+        dst: TypeFutureTableIndex,
+    ) -> Result<u32> {
+        self.handle_transfer(idx, TableIndex::Future(src), TableIndex::Future(dst))
+    }
+
+    pub(crate) fn stream_transfer(
+        &mut self,
+        idx: u32,
+        src: TypeStreamTableIndex,
+        dst: TypeStreamTableIndex,
+    ) -> Result<u32> {
+        self.handle_transfer(idx, TableIndex::Stream(src), TableIndex::Stream(dst))
+    }
+
+    fn handle_transfer(&mut self, idx: u32, src: TableIndex, dst: TableIndex) -> Result<u32> {
+        if !self.handle_table.remove(&(src, idx)) {
+            bail!("invalid handle");
+        }
+
+        assert!(self.handle_table.insert((dst, idx)));
+
+        Ok(idx)
+    }
+
+    pub(crate) fn error_transfer(
+        &mut self,
+        idx: u32,
+        src: TypeErrorTableIndex,
+        dst: TypeErrorTableIndex,
+    ) -> Result<u32> {
+        if !self.error_table.contains_key(&(src, idx)) {
+            bail!("invalid handle");
+        }
+
+        *self.error_table.entry((dst, idx)).or_default() += 1;
+
+        Ok(idx)
     }
 }
 
@@ -838,10 +981,36 @@ impl OwnedComponentInstance {
         return_: VMAsyncCallback,
         enter: VMAsyncEnterCallback,
         exit: VMAsyncExitCallback,
+        future_new: VMFutureNewCallback,
+        future_send: VMFutureTransmitCallback,
+        future_receive: VMFutureTransmitCallback,
+        future_drop_sender: VMFutureDropCallback,
+        future_drop_receiver: VMFutureDropCallback,
+        stream_new: VMStreamNewCallback,
+        stream_send: VMStreamTransmitCallback,
+        stream_receive: VMStreamTransmitCallback,
+        stream_drop_sender: VMStreamDropCallback,
+        stream_drop_receiver: VMStreamDropCallback,
+        error_drop: VMErrorDropCallback,
     ) {
         unsafe {
-            self.instance_mut()
-                .set_async_callbacks(start, return_, enter, exit)
+            self.instance_mut().set_async_callbacks(
+                start,
+                return_,
+                enter,
+                exit,
+                future_new,
+                future_send,
+                future_receive,
+                future_drop_sender,
+                future_drop_receiver,
+                stream_new,
+                stream_send,
+                stream_receive,
+                stream_drop_sender,
+                stream_drop_receiver,
+                error_drop,
+            )
         }
     }
 }

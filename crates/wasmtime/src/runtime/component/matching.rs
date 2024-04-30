@@ -1,14 +1,17 @@
 use crate::component::func::HostFunc;
 use crate::component::linker::{Definition, NameMap, Strings};
-use crate::component::ResourceType;
+use crate::component::{
+    types::{FutureType, StreamType},
+    ResourceType,
+};
 use crate::types::matching;
 use crate::Module;
 use anyhow::{anyhow, bail, Context, Result};
 use std::any::Any;
 use std::sync::Arc;
 use wasmtime_environ::component::{
-    ComponentTypes, ResourceIndex, TypeComponentInstance, TypeDef, TypeFuncIndex, TypeModule,
-    TypeResourceTableIndex,
+    ComponentTypes, ResourceIndex, TypeComponentInstance, TypeDef, TypeFuncIndex,
+    TypeFutureTableIndex, TypeModule, TypeResourceTableIndex, TypeStreamTableIndex,
 };
 use wasmtime_environ::PrimaryMap;
 use wasmtime_runtime::component::ComponentInstance;
@@ -199,6 +202,14 @@ impl<'a> InstanceType<'a> {
             .get(index)
             .copied()
             .unwrap_or_else(|| ResourceType::uninstantiated(&self.types, index))
+    }
+
+    pub fn future_type(&self, index: TypeFutureTableIndex) -> FutureType {
+        FutureType::from(self.types[index].ty, self)
+    }
+
+    pub fn stream_type(&self, index: TypeStreamTableIndex) -> StreamType {
+        StreamType::from(self.types[index].ty, self)
     }
 }
 

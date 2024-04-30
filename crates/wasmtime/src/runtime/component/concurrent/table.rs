@@ -1,50 +1,81 @@
 // TODO: This duplicates a lot of resource_table.rs; consider reducing that duplication.
 
-use super::{Task, TaskId};
-use std::collections::BTreeSet;
+use std::{any::Any, collections::BTreeSet, marker::PhantomData};
 
-#[derive(Debug)]
-/// Errors returned by operations on `TaskTable`
-pub enum TaskTableError {
-    /// TaskTable has no free keys
-    Full,
-    /// Task not present in table
-    NotPresent,
-    /// Task cannot be deleted because child tasks exist in the table.
-    HasChildren,
+pub struct TableId<T> {
+    rep: u32,
+    _marker: PhantomData<fn() -> T>,
 }
 
-impl std::fmt::Display for TaskTableError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Full => write!(f, "task table has no free keys"),
-            Self::NotPresent => write!(f, "task not present"),
-            Self::HasChildren => write!(f, "task has children"),
+impl<T> TableId<T> {
+    pub fn new(rep: u32) -> Self {
+        Self {
+            rep,
+            _marker: PhantomData,
         }
     }
 }
-impl std::error::Error for TaskTableError {}
 
-/// The `TaskTable` type maps a `TaskId` to its `Task`.
-pub struct TaskTable<T> {
-    entries: Vec<Entry<T>>,
+impl<T> Clone for TableId<T> {
+    fn clone(&self) -> Self {
+        Self::new(self.rep)
+    }
+}
+
+impl<T> Copy for TableId<T> {}
+
+impl<T> TableId<T> {
+    pub fn rep(&self) -> u32 {
+        self.rep
+    }
+}
+
+#[derive(Debug)]
+/// Errors returned by operations on `Table`
+pub enum TableError {
+    /// Table has no free keys
+    Full,
+    /// Entry not present in table
+    NotPresent,
+    /// Resource present in table, but with a different type
+    WrongType,
+    /// Entry cannot be deleted because child entrys exist in the table.
+    HasChildren,
+}
+
+impl std::fmt::Display for TableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => write!(f, "table has no free keys"),
+            Self::NotPresent => write!(f, "entry not present"),
+            Self::WrongType => write!(f, "entry is of another type"),
+            Self::HasChildren => write!(f, "entry has children"),
+        }
+    }
+}
+impl std::error::Error for TableError {}
+
+/// The `Table` type maps a `TableId` to its entry.
+#[derive(Default)]
+pub struct Table {
+    entries: Vec<Entry>,
     free_head: Option<usize>,
 }
 
-enum Entry<T> {
+enum Entry {
     Free { next: Option<usize> },
-    Occupied { entry: TableEntry<T> },
+    Occupied { entry: TableEntry },
 }
 
-impl<T> Entry<T> {
-    pub fn occupied(&self) -> Option<&TableEntry<T>> {
+impl Entry {
+    pub fn occupied(&self) -> Option<&TableEntry> {
         match self {
             Self::Occupied { entry } => Some(entry),
             Self::Free { .. } => None,
         }
     }
 
-    pub fn occupied_mut(&mut self) -> Option<&mut TableEntry<T>> {
+    pub fn occupied_mut(&mut self) -> Option<&mut TableEntry> {
         match self {
             Self::Occupied { entry } => Some(entry),
             Self::Free { .. } => None,
@@ -61,19 +92,19 @@ impl<T> Entry<T> {
 /// * whenever a child is created, its index is added to children.
 /// * whenever a child is deleted, its index is removed from children.
 /// * an entry with children may not be deleted.
-struct TableEntry<T> {
+struct TableEntry {
     /// The entry in the table
-    task: Task<T>,
+    entry: Box<dyn Any + Send + Sync>,
     /// The index of the parent of this entry, if it has one.
     parent: Option<u32>,
     /// The indicies of any children of this entry.
     children: BTreeSet<u32>,
 }
 
-impl<T> TableEntry<T> {
-    fn new(task: Task<T>, parent: Option<u32>) -> Self {
+impl TableEntry {
+    fn new(entry: Box<dyn Any + Send + Sync>, parent: Option<u32>) -> Self {
         Self {
-            task,
+            entry,
             parent,
             children: BTreeSet::new(),
         }
@@ -88,7 +119,7 @@ impl<T> TableEntry<T> {
     }
 }
 
-impl<T> TaskTable<T> {
+impl Table {
     /// Create an empty table
     pub fn new() -> Self {
         Self {
@@ -97,11 +128,11 @@ impl<T> TaskTable<T> {
         }
     }
 
-    /// Inserts a new task into this table, returning a corresponding
-    /// `TaskId<T>` which can be used to refer to it after it was inserted.
-    pub fn push(&mut self, task: Task<T>) -> Result<TaskId<T>, TaskTableError> {
-        let idx = self.push_(TableEntry::new(task, None))?;
-        Ok(TaskId::new(idx))
+    /// Inserts a new entry into this table, returning a corresponding
+    /// `TableId<T>` which can be used to refer to it after it was inserted.
+    pub fn push<T: Send + Sync + 'static>(&mut self, entry: T) -> Result<TableId<T>, TableError> {
+        let idx = self.push_(TableEntry::new(Box::new(entry), None))?;
+        Ok(TableId::new(idx))
     }
 
     /// Pop an index off of the free list, if it's not empty.
@@ -119,7 +150,7 @@ impl<T> TaskTable<T> {
     }
 
     /// Free an entry in the table, returning its [`TableEntry`]. Add the index to the free list.
-    fn free_entry(&mut self, ix: usize) -> TableEntry<T> {
+    fn free_entry(&mut self, ix: usize) -> TableEntry {
         let entry = match std::mem::replace(
             &mut self.entries[ix],
             Entry::Free {
@@ -137,7 +168,7 @@ impl<T> TaskTable<T> {
 
     /// Push a new entry into the table, returning its handle. This will prefer to use free entries
     /// if they exist, falling back on pushing new entries onto the end of the table.
-    fn push_(&mut self, e: TableEntry<T>) -> Result<u32, TaskTableError> {
+    fn push_(&mut self, e: TableEntry) -> Result<u32, TableError> {
         if let Some(free) = self.pop_free_list() {
             self.entries[free] = Entry::Occupied { entry: e };
             Ok(free as u32)
@@ -146,32 +177,32 @@ impl<T> TaskTable<T> {
                 .entries
                 .len()
                 .try_into()
-                .map_err(|_| TaskTableError::Full)?;
+                .map_err(|_| TableError::Full)?;
             self.entries.push(Entry::Occupied { entry: e });
             Ok(ix)
         }
     }
 
-    fn occupied(&self, key: u32) -> Result<&TableEntry<T>, TaskTableError> {
+    fn occupied(&self, key: u32) -> Result<&TableEntry, TableError> {
         self.entries
             .get(key as usize)
             .and_then(Entry::occupied)
-            .ok_or(TaskTableError::NotPresent)
+            .ok_or(TableError::NotPresent)
     }
 
-    fn occupied_mut(&mut self, key: u32) -> Result<&mut TableEntry<T>, TaskTableError> {
+    fn occupied_mut(&mut self, key: u32) -> Result<&mut TableEntry, TableError> {
         self.entries
             .get_mut(key as usize)
             .and_then(Entry::occupied_mut)
-            .ok_or(TaskTableError::NotPresent)
+            .ok_or(TableError::NotPresent)
     }
 
-    /// Insert a task at the next available index, and track that it has a
-    /// parent task.
+    /// Insert a entry at the next available index, and track that it has a
+    /// parent entry.
     ///
-    /// The parent must exist to create a child. All child tasks must be
-    /// destroyed before a parent can be destroyed - otherwise
-    /// [`TaskTable::delete`] will fail with [`TaskTableError::HasChildren`].
+    /// The parent must exist to create a child. All child entrys must be
+    /// destroyed before a parent can be destroyed - otherwise [`Table::delete`]
+    /// will fail with [`TableError::HasChildren`].
     ///
     /// Parent-child relationships are tracked inside the table to ensure that a
     /// parent is not deleted while it has live children. This allows children
@@ -180,52 +211,59 @@ impl<T> TaskTable<T> {
     /// design issues, such as child existence extending lifetime of parent
     /// referent even after parent is destroyed, possibility for deadlocks.
     ///
-    /// Parent-child relationships may not be modified once created. There
-    /// is no way to observe these relationships through the [`TaskTable`]
-    /// methods except for erroring on deletion, or the [`std::fmt::Debug`]
-    /// impl.
-    pub fn push_child(
+    /// Parent-child relationships may not be modified once created. There is no
+    /// way to observe these relationships through the [`Table`] methods except
+    /// for erroring on deletion, or the [`std::fmt::Debug`] impl.
+    pub fn push_child<T: Send + Sync + 'static, U>(
         &mut self,
-        task: Task<T>,
-        parent: TaskId<T>,
-    ) -> Result<TaskId<T>, TaskTableError> {
+        entry: T,
+        parent: TableId<U>,
+    ) -> Result<TableId<T>, TableError> {
         let parent = parent.rep();
         self.occupied(parent)?;
-        let child = self.push_(TableEntry::new(task, Some(parent)))?;
+        let child = self.push_(TableEntry::new(Box::new(entry), Some(parent)))?;
         self.occupied_mut(parent)?.add_child(child);
-        Ok(TaskId::new(child))
+        Ok(TableId::new(child))
     }
 
     /// Get an immutable reference to a task of a given type at a given index.
     ///
     /// Multiple shared references can be borrowed at any given time.
-    pub fn get(&self, key: TaskId<T>) -> Result<&Task<T>, TaskTableError> {
-        self.get_(key.rep())
+    pub fn get<T: 'static>(&self, key: TableId<T>) -> Result<&T, TableError> {
+        self.get_(key.rep())?
+            .downcast_ref()
+            .ok_or(TableError::WrongType)
     }
 
-    fn get_(&self, key: u32) -> Result<&Task<T>, TaskTableError> {
+    fn get_(&self, key: u32) -> Result<&dyn Any, TableError> {
         let r = self.occupied(key)?;
-        Ok(&r.task)
+        Ok(&*r.entry)
     }
 
     /// Get an mutable reference to a task of a given type at a given index.
-    pub fn get_mut(&mut self, key: TaskId<T>) -> Result<&mut Task<T>, TaskTableError> {
-        self.get_mut_(key.rep())
+    pub fn get_mut<T: 'static>(&mut self, key: TableId<T>) -> Result<&mut T, TableError> {
+        self.get_mut_(key.rep())?
+            .downcast_mut()
+            .ok_or(TableError::WrongType)
     }
 
-    pub fn get_mut_(&mut self, key: u32) -> Result<&mut Task<T>, TaskTableError> {
+    pub fn get_mut_(&mut self, key: u32) -> Result<&mut dyn Any, TableError> {
         let r = self.occupied_mut(key)?;
-        Ok(&mut r.task)
+        Ok(&mut *r.entry)
     }
 
     /// Delete the specified task
-    pub fn delete(&mut self, key: TaskId<T>) -> Result<Task<T>, TaskTableError> {
-        Ok(self.delete_entry(key.rep())?.task)
+    pub fn delete<T: 'static>(&mut self, key: TableId<T>) -> Result<T, TableError> {
+        self.delete_entry(key.rep())?
+            .entry
+            .downcast()
+            .map(|v| *v)
+            .map_err(|_| TableError::WrongType)
     }
 
-    fn delete_entry(&mut self, key: u32) -> Result<TableEntry<T>, TaskTableError> {
+    fn delete_entry(&mut self, key: u32) -> Result<TableEntry, TableError> {
         if !self.occupied(key)?.children.is_empty() {
-            return Err(TaskTableError::HasChildren);
+            return Err(TableError::HasChildren);
         }
         let e = self.free_entry(key as usize);
         if let Some(parent) = e.parent {
@@ -237,11 +275,5 @@ impl<T> TaskTable<T> {
                 .remove_child(key);
         }
         Ok(e)
-    }
-}
-
-impl<T> Default for TaskTable<T> {
-    fn default() -> Self {
-        Self::new()
     }
 }

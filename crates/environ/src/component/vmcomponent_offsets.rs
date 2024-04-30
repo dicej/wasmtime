@@ -8,6 +8,17 @@
 //      async_return: VMAsyncCallback,
 //      async_enter: VMAsyncEnterCallback,
 //      async_exit: VMAsyncExitCallback,
+//      future_new: VMFutureNewCallback,
+//      future_send: VMFutureTransmitCallback,
+//      future_receive: VMFutureTransmitCallback,
+//      future_drop_sender: VMFutureDropCallback,
+//      future_drop_receiver: VMFutureDropCallback,
+//      stream_new: VMStreamNewCallback,
+//      stream_send: VMStreamTransmitCallback,
+//      stream_receive: VMStreamTransmitCallback,
+//      stream_drop_sender: VMStreamDropCallback,
+//      stream_drop_receiver: VMStreamDropCallback,
+//      error_drop: VMErrorDropCallback,
 //      limits: *const VMRuntimeLimits,
 //      flags: [VMGlobalDefinition; component.num_runtime_component_instances],
 //      trampoline_func_refs: [VMFuncRef; component.num_trampolines],
@@ -71,6 +82,17 @@ pub struct VMComponentOffsets<P> {
     async_return: u32,
     async_enter: u32,
     async_exit: u32,
+    future_new: u32,
+    future_send: u32,
+    future_receive: u32,
+    future_drop_sender: u32,
+    future_drop_receiver: u32,
+    stream_new: u32,
+    stream_send: u32,
+    stream_receive: u32,
+    stream_drop_sender: u32,
+    stream_drop_receiver: u32,
+    error_drop: u32,
     limits: u32,
     flags: u32,
     trampoline_func_refs: u32,
@@ -123,6 +145,17 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             async_return: 0,
             async_enter: 0,
             async_exit: 0,
+            future_new: 0,
+            future_send: 0,
+            future_receive: 0,
+            future_drop_sender: 0,
+            future_drop_receiver: 0,
+            stream_new: 0,
+            stream_send: 0,
+            stream_receive: 0,
+            stream_drop_sender: 0,
+            stream_drop_receiver: 0,
+            error_drop: 0,
         };
 
         // Convenience functions for checked addition and multiplication.
@@ -159,6 +192,17 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             size(async_return) = ret.ptr.size(),
             size(async_enter) = ret.ptr.size(),
             size(async_exit) = ret.ptr.size(),
+            size(future_new) = ret.ptr.size(),
+            size(future_send) = ret.ptr.size(),
+            size(future_receive) = ret.ptr.size(),
+            size(future_drop_sender) = ret.ptr.size(),
+            size(future_drop_receiver) = ret.ptr.size(),
+            size(stream_new) = ret.ptr.size(),
+            size(stream_send) = ret.ptr.size(),
+            size(stream_receive) = ret.ptr.size(),
+            size(stream_drop_sender) = ret.ptr.size(),
+            size(stream_drop_receiver) = ret.ptr.size(),
+            size(error_drop) = ret.ptr.size(),
             align(16),
             size(flags) = cmul(ret.num_runtime_component_instances, ret.ptr.size_of_vmglobal_definition()),
             align(u32::from(ret.ptr.size())),
@@ -255,6 +299,61 @@ impl<P: PtrSize> VMComponentOffsets<P> {
     /// TODO: docs
     pub fn async_exit(&self) -> u32 {
         self.async_exit
+    }
+
+    /// TODO: docs
+    pub fn future_new(&self) -> u32 {
+        self.future_new
+    }
+
+    /// TODO: docs
+    pub fn future_send(&self) -> u32 {
+        self.future_send
+    }
+
+    /// TODO: docs
+    pub fn future_receive(&self) -> u32 {
+        self.future_receive
+    }
+
+    /// TODO: docs
+    pub fn future_drop_sender(&self) -> u32 {
+        self.future_drop_sender
+    }
+
+    /// TODO: docs
+    pub fn future_drop_receiver(&self) -> u32 {
+        self.future_drop_receiver
+    }
+
+    /// TODO: docs
+    pub fn stream_new(&self) -> u32 {
+        self.stream_new
+    }
+
+    /// TODO: docs
+    pub fn stream_send(&self) -> u32 {
+        self.stream_send
+    }
+
+    /// TODO: docs
+    pub fn stream_receive(&self) -> u32 {
+        self.stream_receive
+    }
+
+    /// TODO: docs
+    pub fn stream_drop_sender(&self) -> u32 {
+        self.stream_drop_sender
+    }
+
+    /// TODO: docs
+    pub fn stream_drop_receiver(&self) -> u32 {
+        self.stream_drop_receiver
+    }
+
+    /// TODO: docs
+    pub fn error_drop(&self) -> u32 {
+        self.error_drop
     }
 
     /// The offset of the `VMLowering` for the `index` specified.

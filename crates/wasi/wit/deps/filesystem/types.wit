@@ -24,7 +24,7 @@ package wasi:filesystem@0.2.0;
 ///
 /// [WASI filesystem path resolution]: https://github.com/WebAssembly/wasi-filesystem/blob/main/path-resolution.md
 interface types {
-    use wasi:io/streams@0.2.0.{input-stream, output-stream, error};
+    use wasi:io/streams@0.2.0.{input-stream, output-stream, %error};
     use wasi:clocks/wall-clock@0.2.0.{datetime};
 
     /// File size or length of a region within a file.
@@ -630,5 +630,5 @@ interface types {
     ///
     /// Note that this function is fallible because not all stream-related
     /// errors are filesystem-related errors.
-    filesystem-error-code: func(err: borrow<error>) -> option<error-code>;
+    filesystem-error-code: func(err: borrow<%error>) -> option<error-code>;
 }

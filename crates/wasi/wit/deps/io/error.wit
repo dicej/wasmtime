@@ -1,7 +1,7 @@
 package wasi:io@0.2.0;
 
 
-interface error {
+interface %error {
     /// A resource which represents some error information.
     ///
     /// The only method provided by this resource is `to-debug-string`,
@@ -21,7 +21,7 @@ interface error {
     ///
     /// The set of functions which can "downcast" an `error` into a more
     /// concrete type is open.
-    resource error {
+    resource %error {
         /// Returns a string that is suitable to assist humans in debugging
         /// this error.
         ///

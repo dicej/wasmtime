@@ -231,4 +231,9 @@ impl ResourcesBuilder {
     pub fn set_current_instance(&mut self, instance: RuntimeComponentInstanceIndex) {
         self.current_instance = Some(instance);
     }
+
+    /// TODO: docs
+    pub fn get_current_instance(&self) -> Option<RuntimeComponentInstanceIndex> {
+        self.current_instance
+    }
 }

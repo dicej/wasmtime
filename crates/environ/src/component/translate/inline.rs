@@ -689,6 +689,146 @@ impl<'a> Inliner<'a> {
                     .push((*core_type, dfg::Trampoline::AsyncReturn(component_type)));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
+            FutureNew { ty, func, memory } => {
+                let InterfaceType::Future(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let (memory, _) = self.memory(frame, types, *memory);
+                let memory = self.result.memories.push(memory);
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::FutureNew { ty, memory }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            FutureSend { ty, func, options } => {
+                let InterfaceType::Future(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let options = self.adapter_options(frame, types, options);
+                let options = self.canonical_options(options);
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::FutureSend { ty, options }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            FutureReceive { ty, func, options } => {
+                let InterfaceType::Future(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let options = self.adapter_options(frame, types, options);
+                let options = self.canonical_options(options);
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::FutureReceive { ty, options }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            FutureDropSender { ty, func } => {
+                let InterfaceType::Future(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::FutureDropSender { ty }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            FutureDropReceiver { ty, func } => {
+                let InterfaceType::Future(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::FutureDropReceiver { ty }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            StreamNew { ty, func, memory } => {
+                let InterfaceType::Stream(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let (memory, _) = self.memory(frame, types, *memory);
+                let memory = self.result.memories.push(memory);
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::StreamNew { ty, memory }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            StreamSend { ty, func, options } => {
+                let InterfaceType::Stream(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let options = self.adapter_options(frame, types, options);
+                let options = self.canonical_options(options);
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::StreamSend { ty, options }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            StreamReceive { ty, func, options } => {
+                let InterfaceType::Stream(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let options = self.adapter_options(frame, types, options);
+                let options = self.canonical_options(options);
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::StreamReceive { ty, options }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            StreamDropSender { ty, func } => {
+                let InterfaceType::Stream(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::StreamDropSender { ty }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            StreamDropReceiver { ty, func } => {
+                let InterfaceType::Stream(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::StreamDropReceiver { ty }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            ErrorDrop { func } => {
+                let ty = types.error_type()?;
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::ErrorDrop { ty }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
 
             ModuleStatic(idx) => {
                 frame.modules.push(ModuleDef::Static(*idx));
@@ -970,6 +1110,35 @@ impl<'a> Inliner<'a> {
         }
     }
 
+    fn memory(
+        &mut self,
+        frame: &InlinerFrame<'a>,
+        types: &ComponentTypesBuilder,
+        memory: MemoryIndex,
+    ) -> (dfg::CoreExport<MemoryIndex>, bool) {
+        let memory = frame.memories[memory].clone().map_index(|i| match i {
+            EntityIndex::Memory(i) => i,
+            _ => unreachable!(),
+        });
+        let memory64 = match &self.runtime_instances[memory.instance] {
+            InstanceModule::Static(idx) => match &memory.item {
+                ExportItem::Index(i) => {
+                    let plan = &self.nested_modules[*idx].module.memory_plans[*i];
+                    plan.memory.memory64
+                }
+                ExportItem::Name(_) => unreachable!(),
+            },
+            InstanceModule::Import(ty) => match &memory.item {
+                ExportItem::Name(name) => match types[*ty].exports[name] {
+                    EntityType::Memory(m) => m.memory64,
+                    _ => unreachable!(),
+                },
+                ExportItem::Index(_) => unreachable!(),
+            },
+        };
+        (memory, memory64)
+    }
+
     /// Translates a `LocalCanonicalOptions` which indexes into the `frame`
     /// specified into a runtime representation.
     fn adapter_options(
@@ -978,31 +1147,9 @@ impl<'a> Inliner<'a> {
         types: &ComponentTypesBuilder,
         options: &LocalCanonicalOptions,
     ) -> AdapterOptions {
-        let memory = options.memory.map(|i| {
-            frame.memories[i].clone().map_index(|i| match i {
-                EntityIndex::Memory(i) => i,
-                _ => unreachable!(),
-            })
-        });
-        let memory64 = match &memory {
-            Some(memory) => match &self.runtime_instances[memory.instance] {
-                InstanceModule::Static(idx) => match &memory.item {
-                    ExportItem::Index(i) => {
-                        let plan = &self.nested_modules[*idx].module.memory_plans[*i];
-                        plan.memory.memory64
-                    }
-                    ExportItem::Name(_) => unreachable!(),
-                },
-                InstanceModule::Import(ty) => match &memory.item {
-                    ExportItem::Name(name) => match types[*ty].exports[name] {
-                        EntityType::Memory(m) => m.memory64,
-                        _ => unreachable!(),
-                    },
-                    ExportItem::Index(_) => unreachable!(),
-                },
-            },
-            None => false,
-        };
+        let memory = options.memory.map(|i| self.memory(frame, types, i));
+        let memory64 = memory.as_ref().map(|(_, v)| *v).unwrap_or(false);
+        let memory = memory.map(|(v, _)| v);
         let realloc = options.realloc.map(|i| frame.funcs[i].clone());
         let callback = options.callback.map(|i| frame.funcs[i].clone());
         let post_return = options.post_return.map(|i| frame.funcs[i].clone());

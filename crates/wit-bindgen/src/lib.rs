@@ -107,6 +107,8 @@ pub struct Opts {
     /// Remapping of interface names to rust module names.
     /// TODO: is there a better type to use for the value of this map?
     pub with: HashMap<String, String>,
+
+    pub debug: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,34 +126,63 @@ pub enum AsyncConfig {
     #[default]
     None,
     /// All generated functions should be `async`.
-    All,
-    Concurrent,
+    All { concurrent: bool },
     /// These imported functions should not be async, but everything else is.
-    AllExceptImports(HashSet<String>),
+    AllExceptImports {
+        concurrent: bool,
+        names: HashSet<String>,
+    },
     /// These functions are the only imports that are async, all other imports
     /// are sync.
     ///
     /// Note that all exports are still async in this situation.
-    OnlyImports(HashSet<String>),
+    OnlyImports {
+        concurrent: bool,
+        names: HashSet<String>,
+    },
+}
+
+pub enum CallStyle {
+    Sync,
+    Async,
+    Concurrent,
 }
 
 impl AsyncConfig {
-    pub fn is_import_async(&self, f: &str) -> bool {
+    pub fn import_call_style(&self, qualifier: Option<&str>, f: &str) -> CallStyle {
+        let matched = |names: &HashSet<String>| {
+            names.contains(f)
+                || qualifier
+                    .map(|v| names.contains(&format!("{v}#{f}")))
+                    .unwrap_or(false)
+        };
+
         match self {
-            AsyncConfig::None => false,
-            AsyncConfig::All | AsyncConfig::Concurrent => true,
-            AsyncConfig::AllExceptImports(set) => !set.contains(f),
-            AsyncConfig::OnlyImports(set) => set.contains(f),
+            AsyncConfig::AllExceptImports { names, .. } if matched(names) => CallStyle::Sync,
+            AsyncConfig::OnlyImports { names, .. } if !matched(names) => CallStyle::Sync,
+            _ => self.call_style(),
         }
     }
 
-    pub fn maybe_async(&self) -> bool {
+    pub fn call_style(&self) -> CallStyle {
         match self {
-            AsyncConfig::None => false,
-            AsyncConfig::All
-            | AsyncConfig::Concurrent
-            | AsyncConfig::AllExceptImports(_)
-            | AsyncConfig::OnlyImports(_) => true,
+            AsyncConfig::None => CallStyle::Sync,
+
+            AsyncConfig::All { concurrent: false }
+            | AsyncConfig::AllExceptImports {
+                concurrent: false, ..
+            }
+            | AsyncConfig::OnlyImports {
+                concurrent: false, ..
+            } => CallStyle::Async,
+
+            AsyncConfig::All { concurrent: true }
+            | AsyncConfig::AllExceptImports {
+                concurrent: true, ..
+            }
+            | AsyncConfig::OnlyImports {
+                concurrent: true, ..
+            } => CallStyle::Concurrent,
         }
     }
 }
@@ -519,10 +550,11 @@ impl Wasmtime {
         }
         self.src.push_str("}\n");
 
-        let (async_, async__, send, await_) = if self.opts.async_.maybe_async() {
-            ("async", "_async", ":Send + 'static", ".await")
-        } else {
-            ("", "", ":'static", "")
+        let (async_, async__, send, await_) = match self.opts.async_.call_style() {
+            CallStyle::Async | CallStyle::Concurrent => {
+                ("async", "_async", ":Send + 'static", ".await")
+            }
+            CallStyle::Sync => ("", "", ":'static", ""),
         };
 
         self.toplevel_import_trait(resolve, world);
@@ -827,7 +859,7 @@ impl Wasmtime {
         }
 
         let world_camel = to_rust_upper_camel_case(&resolve.worlds[world].name);
-        if self.opts.async_.maybe_async() {
+        if let CallStyle::Async = self.opts.async_.call_style() {
             uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]")
         }
         uwrite!(self.src, "pub trait {world_camel}Imports");
@@ -873,7 +905,7 @@ impl Wasmtime {
         );
         let world_camel = to_rust_upper_camel_case(&resolve.worlds[world].name);
         let world_trait = format!("{world_camel}Imports");
-        for (i, name) in interfaces
+        let bounds = interfaces
             .iter()
             .map(|n| format!("{n}::Host"))
             .chain(if has_world_trait {
@@ -881,21 +913,16 @@ impl Wasmtime {
             } else {
                 None
             })
-            .enumerate()
-        {
-            if i > 0 {
-                self.src.push_str(" + ");
-            }
-            self.src.push_str(&name);
-        }
+            .collect::<Vec<_>>()
+            .join(" + ");
 
-        let maybe_send = if self.opts.async_.maybe_async() {
-            " + Send, T: Send"
-        } else {
-            ""
+        let bounds = match self.opts.async_.call_style() {
+            CallStyle::Async => format!("{bounds} + Send, T: Send"),
+            CallStyle::Concurrent => format!("{bounds} + Send, T: {bounds} + Send"),
+            CallStyle::Sync => bounds,
         };
 
-        self.src.push_str(maybe_send);
+        self.src.push_str(&bounds);
         self.src.push_str(",\n{\n");
         for name in interfaces.iter() {
             uwriteln!(self.src, "{name}::add_to_linker(linker, get)?;");
@@ -915,7 +942,7 @@ impl Wasmtime {
                     linker: &mut wasmtime::component::Linker<T>,
                     get: impl Fn(&mut T) -> &mut U + Send + Sync + Copy + 'static,
                 ) -> wasmtime::Result<()>
-                    where U: {world_trait}{maybe_send}
+                    where U: {world_trait}{bounds}
                 {{
                     let mut linker = linker.root();
             ",
@@ -1048,6 +1075,7 @@ impl<'a> InterfaceGenerator<'a> {
             TypeDefKind::Type(t) => self.type_alias(id, name, t, &ty.docs),
             TypeDefKind::Future(_) => todo!("generate for future"),
             TypeDefKind::Stream(_) => todo!("generate for stream"),
+            TypeDefKind::Error => todo!("generate for error"),
             TypeDefKind::Handle(handle) => self.type_handle(id, name, handle, &ty.docs),
             TypeDefKind::Resource => self.type_resource(id, name, ty, &ty.docs),
             TypeDefKind::Unknown => unreachable!(),
@@ -1086,11 +1114,11 @@ impl<'a> InterfaceGenerator<'a> {
                 }
             }
 
-            if self.gen.opts.async_.maybe_async() {
+            if let CallStyle::Async = self.gen.opts.async_.call_style() {
                 uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]")
             }
 
-            uwriteln!(self.src, "pub trait Host{camel} {{");
+            uwriteln!(self.src, "pub trait Host{camel}: Sized {{");
 
             let functions = match resource.owner {
                 TypeOwner::World(id) => self.resolve.worlds[id]
@@ -1586,6 +1614,26 @@ impl<'a> InterfaceGenerator<'a> {
         }
     }
 
+    fn print_result_ty_tuple(&mut self, results: &Results, mode: TypeMode) {
+        self.push_str("(");
+        match results {
+            Results::Named(rs) if rs.is_empty() => self.push_str(")"),
+            Results::Named(rs) => {
+                for (i, (_, ty)) in rs.iter().enumerate() {
+                    if i > 0 {
+                        self.push_str(", ")
+                    }
+                    self.print_ty(ty, mode)
+                }
+                self.push_str(")");
+            }
+            Results::Anon(ty) => {
+                self.print_ty(ty, mode);
+                self.push_str(",)");
+            }
+        }
+    }
+
     fn special_case_trappable_error(
         &self,
         results: &Results,
@@ -1621,14 +1669,16 @@ impl<'a> InterfaceGenerator<'a> {
         let iface = &self.resolve.interfaces[id];
         let owner = TypeOwner::Interface(id);
 
-        if self.gen.opts.async_.maybe_async() {
+        if let CallStyle::Async = self.gen.opts.async_.call_style() {
             uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]")
         }
         // Generate the `pub trait` which represents the host functionality for
         // this import which additionally inherits from all resource traits
         // for this interface defined by `type_resource`.
         uwrite!(self.src, "pub trait Host");
+        let mut saw_resources = false;
         for (i, resource) in get_resources(self.resolve, id).enumerate() {
+            saw_resources = true;
             if i == 0 {
                 uwrite!(self.src, ": ");
             } else {
@@ -1636,7 +1686,11 @@ impl<'a> InterfaceGenerator<'a> {
             }
             uwrite!(self.src, "Host{}", resource.to_upper_camel_case());
         }
-        uwriteln!(self.src, " {{");
+        self.src.push_str(if saw_resources {
+            " + Sized {"
+        } else {
+            ": Sized {"
+        });
         for (_, func) in iface.functions.iter() {
             match func.kind {
                 FunctionKind::Freestanding => {}
@@ -1686,11 +1740,12 @@ impl<'a> InterfaceGenerator<'a> {
         }
         uwriteln!(self.src, "}}");
 
-        let mut where_clause = if self.gen.opts.async_.maybe_async() {
-            "T: Send, U: Host + Send".to_string()
-        } else {
-            "U: Host".to_string()
-        };
+        let mut where_clause = match self.gen.opts.async_.call_style() {
+            CallStyle::Async => "T: Send, U: Host + Send",
+            CallStyle::Concurrent => "T: Host + Send, U: Host + Send",
+            CallStyle::Sync => "U: Host",
+        }
+        .to_string();
 
         for t in required_conversion_traits {
             where_clause.push_str(" + ");
@@ -1731,14 +1786,24 @@ impl<'a> InterfaceGenerator<'a> {
         uwriteln!(self.src, "}}");
     }
 
+    fn qualifier(&self) -> Option<String> {
+        self.current_interface
+            .map(|(_, key, _)| self.resolve.name_world_key(key))
+    }
+
     fn generate_add_function_to_linker(&mut self, owner: TypeOwner, func: &Function, linker: &str) {
         uwrite!(
             self.src,
             "{linker}.{}(\"{}\", ",
-            if self.gen.opts.async_.is_import_async(&func.name) {
-                "func_wrap_async"
-            } else {
-                "func_wrap"
+            match self
+                .gen
+                .opts
+                .async_
+                .import_call_style(self.qualifier().as_deref(), &func.name)
+            {
+                CallStyle::Sync => "func_wrap",
+                CallStyle::Async => "func_wrap_async",
+                CallStyle::Concurrent => "func_wrap_concurrent",
             },
             func.name
         );
@@ -1764,11 +1829,16 @@ impl<'a> InterfaceGenerator<'a> {
             self.src.push_str(", ");
         }
         self.src.push_str(") |");
-        if self.gen.opts.async_.is_import_async(&func.name) {
-            self.src.push_str(" Box::new(async move { \n");
-        } else {
-            self.src.push_str(" { \n");
-        }
+
+        let style = self
+            .gen
+            .opts
+            .async_
+            .import_call_style(self.qualifier().as_deref(), &func.name);
+        self.src.push_str(match &style {
+            CallStyle::Sync | CallStyle::Concurrent => " {\n",
+            CallStyle::Async => " Box::new(async move {\n",
+        });
 
         if self.gen.opts.tracing {
             uwrite!(
@@ -1809,7 +1879,11 @@ impl<'a> InterfaceGenerator<'a> {
             );
         }
 
-        self.src.push_str("let host = get(caller.data_mut());\n");
+        self.src.push_str(if let CallStyle::Concurrent = &style {
+            "let host = caller;\n"
+        } else {
+            "let host = get(caller.data_mut());\n"
+        });
         let func_name = rust_function_name(func);
         let host_trait = match func.kind {
             FunctionKind::Freestanding => match owner {
@@ -1833,10 +1907,19 @@ impl<'a> InterfaceGenerator<'a> {
         for (i, _) in func.params.iter().enumerate() {
             uwrite!(self.src, "arg{},", i);
         }
-        if self.gen.opts.async_.is_import_async(&func.name) {
-            uwrite!(self.src, ").await;\n");
-        } else {
-            uwrite!(self.src, ");\n");
+        self.src.push_str(match &style {
+            CallStyle::Sync | CallStyle::Concurrent => ");\n",
+            CallStyle::Async => ").await;\n",
+        });
+
+        if let CallStyle::Concurrent = &style {
+            self.src.push_str(
+                "Box::pin(async move {
+                     let fun = r.await;
+                     Box::new(move |mut caller: wasmtime::StoreContextMut<'_, T>| {
+                         let r = fun(caller);
+                ",
+            );
         }
 
         if self.gen.opts.tracing {
@@ -1871,23 +1954,46 @@ impl<'a> InterfaceGenerator<'a> {
             uwrite!(self.src, "r\n");
         }
 
-        if self.gen.opts.async_.is_import_async(&func.name) {
-            // Need to close Box::new and async block
-            self.src.push_str("})");
-        } else {
-            self.src.push_str("}");
+        match &style {
+            CallStyle::Sync => self.push_str("}"),
+            CallStyle::Async => self.push_str("})"),
+            CallStyle::Concurrent => {
+                let old_source = mem::take(&mut self.src);
+                self.print_result_ty_tuple(&func.results, TypeMode::Owned);
+                let result_type = String::from(mem::replace(&mut self.src, old_source));
+                let box_fn = format!(
+                    "Box<dyn FnOnce(wasmtime::StoreContextMut<'_, T>) -> \
+                     wasmtime::Result<{result_type}>>"
+                );
+                uwriteln!(
+                    self.src,
+                    "        }}) as {box_fn}
+                         }}) as ::std::pin::Pin<Box<dyn ::std::future::Future<Output = {box_fn}> \
+                               + Send + Sync + 'static>>
+                     }}"
+                );
+            }
         }
     }
 
     fn generate_function_trait_sig(&mut self, func: &Function) {
         self.rustdoc(&func.docs);
 
-        if self.gen.opts.async_.is_import_async(&func.name) {
+        let style = self
+            .gen
+            .opts
+            .async_
+            .import_call_style(self.qualifier().as_deref(), &func.name);
+        if let CallStyle::Async = &style {
             self.push_str("async ");
         }
         self.push_str("fn ");
         self.push_str(&rust_function_name(func));
-        self.push_str("(&mut self, ");
+        self.push_str(if let CallStyle::Concurrent = &style {
+            "(store: wasmtime::StoreContextMut<'_, Self>, "
+        } else {
+            "(&mut self, "
+        });
         for (name, param) in func.params.iter() {
             let name = to_rust_ident(name);
             self.push_str(&name);
@@ -1897,6 +2003,10 @@ impl<'a> InterfaceGenerator<'a> {
         }
         self.push_str(")");
         self.push_str(" -> ");
+
+        if let CallStyle::Concurrent = &style {
+            self.push_str("impl ::std::future::Future<Output = impl FnOnce(wasmtime::StoreContextMut<'_, Self>) -> ");
+        }
 
         if let Some((r, _id, error_typename)) = self.special_case_trappable_error(&func.results) {
             // Functions which have a single result `result<ok,err>` get special
@@ -1917,6 +2027,10 @@ impl<'a> InterfaceGenerator<'a> {
             self.push_str("wasmtime::Result<");
             self.print_result_ty(&func.results, TypeMode::Owned);
             self.push_str(">");
+        }
+
+        if let CallStyle::Concurrent = &style {
+            self.push_str(" + 'static> + Send + Sync + 'static");
         }
 
         self.push_str(";\n");
@@ -1952,12 +2066,10 @@ impl<'a> InterfaceGenerator<'a> {
     ) {
         // Exports must be async if anything could be async, it's just imports
         // that get to be optionally async/sync.
-        let is_async = self.gen.opts.async_.maybe_async();
-
-        let (async_, async__, await_) = if is_async {
-            ("async", "_async", ".await")
-        } else {
-            ("", "", "")
+        let style = self.gen.opts.async_.call_style();
+        let (async_, async__, await_) = match &style {
+            CallStyle::Async | CallStyle::Concurrent => ("async", "_async", ".await"),
+            CallStyle::Sync => ("", "", ""),
         };
 
         self.rustdoc(&func.docs);
@@ -1968,9 +2080,15 @@ impl<'a> InterfaceGenerator<'a> {
             func.item_name().to_snake_case(),
         );
 
+        let param_mode = if let CallStyle::Concurrent = &style {
+            TypeMode::Owned
+        } else {
+            TypeMode::AllBorrowed("'_")
+        };
+
         for (i, param) in func.params.iter().enumerate() {
             uwrite!(self.src, "arg{}: ", i);
-            self.print_ty(&param.1, TypeMode::AllBorrowed("'_"));
+            self.print_ty(&param.1, param_mode);
             self.push_str(",");
         }
 
@@ -2002,7 +2120,7 @@ impl<'a> InterfaceGenerator<'a> {
         self.src.push_str("let callee = unsafe {\n");
         self.src.push_str("wasmtime::component::TypedFunc::<(");
         for (_, ty) in func.params.iter() {
-            self.print_ty(ty, TypeMode::AllBorrowed("'_"));
+            self.print_ty(ty, param_mode);
             self.push_str(", ");
         }
         self.src.push_str("), (");

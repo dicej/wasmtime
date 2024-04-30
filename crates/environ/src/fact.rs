@@ -67,6 +67,9 @@ pub struct Module<'a> {
     imported_resource_exit_call: Option<FuncIndex>,
     imported_async_enter_call: Option<FuncIndex>,
     imported_async_exit_call: Option<FuncIndex>,
+    imported_future_transfer: Option<FuncIndex>,
+    imported_stream_transfer: Option<FuncIndex>,
+    imported_error_transfer: Option<FuncIndex>,
 
     // Current status of index spaces from the imports generated so far.
     imported_funcs: PrimaryMap<FuncIndex, Option<CoreDef>>,
@@ -199,6 +202,9 @@ impl<'a> Module<'a> {
             imported_resource_exit_call: None,
             imported_async_enter_call: None,
             imported_async_exit_call: None,
+            imported_future_transfer: None,
+            imported_stream_transfer: None,
+            imported_error_transfer: None,
             globals_by_type: Default::default(),
             globals: Default::default(),
             exports: Vec::new(),
@@ -235,20 +241,19 @@ impl<'a> Module<'a> {
             self.import_func("post_return", name, ty, func.clone())
         });
 
+        let adapter = &AdapterData {
+            name: name.to_string(),
+            lift,
+            lower,
+            callee,
+            // FIXME(#4185) should be plumbed and handled as part of the new
+            // reentrance rules not yet implemented here.
+            called_as_export: true,
+        };
+
         // This will internally create the adapter as specified and append
         // anything necessary to `self.funcs`.
-        trampoline::compile(
-            self,
-            &AdapterData {
-                name: name.to_string(),
-                lift,
-                lower,
-                callee,
-                // FIXME(#4185) should be plumbed and handled as part of the new
-                // reentrance rules not yet implemented here.
-                called_as_export: true,
-            },
-        );
+        trampoline::compile(self, adapter);
 
         while let Some((result, helper)) = self.helper_worklist.pop() {
             trampoline::compile_helper(self, result, helper);
@@ -493,6 +498,39 @@ impl<'a> Module<'a> {
         )
     }
 
+    fn import_future_transfer(&mut self) -> FuncIndex {
+        self.import_simple(
+            "future",
+            "transfer",
+            &[ValType::I32; 4],
+            &[ValType::I32],
+            Import::FutureTransfer,
+            |me| &mut me.imported_future_transfer,
+        )
+    }
+
+    fn import_stream_transfer(&mut self) -> FuncIndex {
+        self.import_simple(
+            "stream",
+            "transfer",
+            &[ValType::I32; 4],
+            &[ValType::I32],
+            Import::StreamTransfer,
+            |me| &mut me.imported_stream_transfer,
+        )
+    }
+
+    fn import_error_transfer(&mut self) -> FuncIndex {
+        self.import_simple(
+            "error",
+            "transfer",
+            &[ValType::I32; 3],
+            &[ValType::I32],
+            Import::ErrorTransfer,
+            |me| &mut me.imported_error_transfer,
+        )
+    }
+
     fn import_resource_transfer_own(&mut self) -> FuncIndex {
         self.import_simple(
             "resource",
@@ -693,6 +731,12 @@ pub enum Import {
     AsyncEnterCall,
     /// TODO: docs
     AsyncExitCall(Option<CoreDef>),
+    /// TODO: docs
+    FutureTransfer,
+    /// TODO: docs
+    StreamTransfer,
+    /// TODO: docs
+    ErrorTransfer,
 }
 
 impl Options {

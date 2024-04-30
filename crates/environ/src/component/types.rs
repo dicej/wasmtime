@@ -109,6 +109,16 @@ indices! {
     pub struct TypeResultIndex(u32);
     /// Index pointing to a list type in the component model.
     pub struct TypeListIndex(u32);
+    /// TODO: docs
+    pub struct TypeFutureIndex(u32);
+    /// TODO: docs
+    pub struct TypeFutureTableIndex(u32);
+    /// TODO: docs
+    pub struct TypeStreamIndex(u32);
+    /// TODO: docs
+    pub struct TypeStreamTableIndex(u32);
+    /// TODO: docs
+    pub struct TypeErrorTableIndex(u32);
 
     /// Index pointing to a resource table within a component.
     ///
@@ -256,7 +266,12 @@ pub struct ComponentTypes {
     flags: PrimaryMap<TypeFlagsIndex, TypeFlags>,
     options: PrimaryMap<TypeOptionIndex, TypeOption>,
     results: PrimaryMap<TypeResultIndex, TypeResult>,
+    futures: PrimaryMap<TypeFutureIndex, TypeFuture>,
+    future_tables: PrimaryMap<TypeFutureTableIndex, TypeFutureTable>,
+    streams: PrimaryMap<TypeStreamIndex, TypeStream>,
+    stream_tables: PrimaryMap<TypeStreamTableIndex, TypeStreamTable>,
     resource_tables: PrimaryMap<TypeResourceTableIndex, TypeResourceTable>,
+    error_tables: PrimaryMap<TypeErrorTableIndex, TypeErrorTable>,
 
     module_types: ModuleTypes,
 }
@@ -281,7 +296,10 @@ impl ComponentTypes {
             | InterfaceType::Float32
             | InterfaceType::Char
             | InterfaceType::Own(_)
-            | InterfaceType::Borrow(_) => &CanonicalAbiInfo::SCALAR4,
+            | InterfaceType::Borrow(_)
+            | InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::Error(_) => &CanonicalAbiInfo::SCALAR4,
 
             InterfaceType::U64 | InterfaceType::S64 | InterfaceType::Float64 => {
                 &CanonicalAbiInfo::SCALAR8
@@ -334,6 +352,11 @@ impl_index! {
     impl Index<TypeResultIndex> for ComponentTypes { TypeResult => results }
     impl Index<TypeListIndex> for ComponentTypes { TypeList => lists }
     impl Index<TypeResourceTableIndex> for ComponentTypes { TypeResourceTable => resource_tables }
+    impl Index<TypeFutureIndex> for ComponentTypes { TypeFuture => futures }
+    impl Index<TypeStreamIndex> for ComponentTypes { TypeStream => streams }
+    impl Index<TypeFutureTableIndex> for ComponentTypes { TypeFutureTable => future_tables }
+    impl Index<TypeStreamTableIndex> for ComponentTypes { TypeStreamTable => stream_tables }
+    impl Index<TypeErrorTableIndex> for ComponentTypes { TypeErrorTable => error_tables }
 }
 
 // Additionally forward anything that can index `ModuleTypes` to `ModuleTypes`
@@ -373,6 +396,11 @@ pub struct ComponentTypesBuilder {
     flags: HashMap<TypeFlags, TypeFlagsIndex>,
     options: HashMap<TypeOption, TypeOptionIndex>,
     results: HashMap<TypeResult, TypeResultIndex>,
+    futures: HashMap<TypeFuture, TypeFutureIndex>,
+    streams: HashMap<TypeStream, TypeStreamIndex>,
+    future_tables: HashMap<TypeFutureTable, TypeFutureTableIndex>,
+    stream_tables: HashMap<TypeStreamTable, TypeStreamTableIndex>,
+    error_tables: HashMap<TypeErrorTable, TypeErrorTableIndex>,
 
     component_types: ComponentTypes,
     module_types: ModuleTypesBuilder,
@@ -673,7 +701,8 @@ impl ComponentTypesBuilder {
         })
     }
 
-    fn defined_type(
+    /// TODO: docs
+    pub fn defined_type(
         &mut self,
         types: types::TypesRef<'_>,
         id: types::ComponentDefinedTypeId,
@@ -704,12 +733,24 @@ impl ComponentTypesBuilder {
             types::ComponentDefinedType::Borrow(r) => {
                 InterfaceType::Borrow(self.resource_id(r.resource()))
             }
+            types::ComponentDefinedType::Future(ty) => {
+                InterfaceType::Future(self.future_table_type(types, ty)?)
+            }
+            types::ComponentDefinedType::Stream(ty) => {
+                InterfaceType::Stream(self.stream_table_type(types, ty)?)
+            }
+            types::ComponentDefinedType::Error => InterfaceType::Error(self.error_table_type()?),
         };
         let info = self.type_information(&ret);
         if info.depth > MAX_TYPE_DEPTH {
             bail!("type nesting is too deep");
         }
         Ok(ret)
+    }
+
+    /// TODO: docs
+    pub fn error_type(&mut self) -> Result<TypeErrorTableIndex> {
+        self.error_table_type()
     }
 
     fn valtype(
@@ -822,6 +863,10 @@ impl ComponentTypesBuilder {
         ty: &types::ComponentValType,
     ) -> Result<TypeOptionIndex> {
         let ty = self.valtype(types, ty)?;
+        self.option_type_from_interface_type(ty)
+    }
+
+    fn option_type_from_interface_type(&mut self, ty: InterfaceType) -> Result<TypeOptionIndex> {
         let (info, abi) = VariantInfo::new([None, Some(self.component_types.canonical_abi(&ty))]);
         Ok(self.add_option_type(TypeOption { ty, abi, info }))
     }
@@ -840,11 +885,85 @@ impl ComponentTypesBuilder {
             Some(ty) => Some(self.valtype(types, ty)?),
             None => None,
         };
+        self.result_type_from_interface_types(ok, err)
+    }
+
+    fn result_type_from_interface_types(
+        &mut self,
+        ok: Option<InterfaceType>,
+        err: Option<InterfaceType>,
+    ) -> Result<TypeResultIndex> {
         let (info, abi) = VariantInfo::new([
             ok.as_ref().map(|t| self.component_types.canonical_abi(t)),
             err.as_ref().map(|t| self.component_types.canonical_abi(t)),
         ]);
         Ok(self.add_result_type(TypeResult { ok, err, abi, info }))
+    }
+
+    fn future_type(
+        &mut self,
+        types: types::TypesRef<'_>,
+        ty: &Option<types::ComponentValType>,
+    ) -> Result<TypeFutureIndex> {
+        let payload = ty.as_ref().map(|ty| self.valtype(types, ty)).transpose()?;
+        let error = Some(InterfaceType::Error(self.error_type()?));
+        let send_result = self.result_type_from_interface_types(None, error)?;
+        let receive_result = self.result_type_from_interface_types(payload, error)?;
+        Ok(self.add_future_type(TypeFuture {
+            payload,
+            send_result,
+            receive_result,
+        }))
+    }
+
+    fn future_table_type(
+        &mut self,
+        types: types::TypesRef<'_>,
+        ty: &Option<types::ComponentValType>,
+    ) -> Result<TypeFutureTableIndex> {
+        let ty = self.future_type(types, ty)?;
+        Ok(self.add_future_table_type(TypeFutureTable {
+            ty,
+            instance: self.resources.get_current_instance().unwrap(),
+        }))
+    }
+
+    fn stream_type(
+        &mut self,
+        types: types::TypesRef<'_>,
+        ty: &types::ComponentValType,
+    ) -> Result<TypeStreamIndex> {
+        let payload = self.valtype(types, ty)?;
+        let list = self.list_type_from_interface_type(payload)?;
+        let error = Some(InterfaceType::Error(self.error_type()?));
+        let send_result = self.result_type_from_interface_types(None, error)?;
+        let result =
+            self.result_type_from_interface_types(Some(InterfaceType::List(list)), error)?;
+        let receive_option = self.option_type_from_interface_type(InterfaceType::Result(result))?;
+        Ok(self.add_stream_type(TypeStream {
+            payload,
+            list,
+            send_result,
+            receive_option,
+        }))
+    }
+
+    fn stream_table_type(
+        &mut self,
+        types: types::TypesRef<'_>,
+        ty: &types::ComponentValType,
+    ) -> Result<TypeStreamTableIndex> {
+        let ty = self.stream_type(types, ty)?;
+        Ok(self.add_stream_table_type(TypeStreamTable {
+            ty,
+            instance: self.resources.get_current_instance().unwrap(),
+        }))
+    }
+
+    fn error_table_type(&mut self) -> Result<TypeErrorTableIndex> {
+        Ok(self.add_error_table_type(TypeErrorTable {
+            instance: self.resources.get_current_instance().unwrap(),
+        }))
     }
 
     fn list_type(
@@ -853,6 +972,10 @@ impl ComponentTypesBuilder {
         ty: &types::ComponentValType,
     ) -> Result<TypeListIndex> {
         let element = self.valtype(types, ty)?;
+        self.list_type_from_interface_type(element)
+    }
+
+    fn list_type_from_interface_type(&mut self, element: InterfaceType) -> Result<TypeListIndex> {
         Ok(self.add_list_type(TypeList { element }))
     }
 
@@ -907,6 +1030,43 @@ impl ComponentTypesBuilder {
         intern_and_fill_flat_types!(self, lists, ty)
     }
 
+    /// TODO: docs
+    pub fn add_future_type(&mut self, ty: TypeFuture) -> TypeFutureIndex {
+        intern(&mut self.futures, &mut self.component_types.futures, ty)
+    }
+
+    /// TODO: docs
+    pub fn add_future_table_type(&mut self, ty: TypeFutureTable) -> TypeFutureTableIndex {
+        intern(
+            &mut self.future_tables,
+            &mut self.component_types.future_tables,
+            ty,
+        )
+    }
+
+    /// TODO: docs
+    pub fn add_stream_type(&mut self, ty: TypeStream) -> TypeStreamIndex {
+        intern(&mut self.streams, &mut self.component_types.streams, ty)
+    }
+
+    /// TODO: docs
+    pub fn add_stream_table_type(&mut self, ty: TypeStreamTable) -> TypeStreamTableIndex {
+        intern(
+            &mut self.stream_tables,
+            &mut self.component_types.stream_tables,
+            ty,
+        )
+    }
+
+    /// TODO: docs
+    pub fn add_error_table_type(&mut self, ty: TypeErrorTable) -> TypeErrorTableIndex {
+        intern(
+            &mut self.error_tables,
+            &mut self.component_types.error_tables,
+            ty,
+        )
+    }
+
     /// Returns the canonical ABI information about the specified type.
     pub fn canonical_abi(&self, ty: &InterfaceType) -> &CanonicalAbiInfo {
         self.component_types.canonical_abi(ty)
@@ -937,7 +1097,10 @@ impl ComponentTypesBuilder {
             | InterfaceType::U32
             | InterfaceType::S32
             | InterfaceType::Char
-            | InterfaceType::Own(_) => {
+            | InterfaceType::Own(_)
+            | InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::Error(_) => {
                 static INFO: TypeInformation = TypeInformation::primitive(FlatType::I32);
                 &INFO
             }
@@ -1125,6 +1288,9 @@ pub enum InterfaceType {
     Result(TypeResultIndex),
     Own(TypeResourceTableIndex),
     Borrow(TypeResourceTableIndex),
+    Future(TypeFutureTableIndex),
+    Stream(TypeStreamTableIndex),
+    Error(TypeErrorTableIndex),
 }
 
 impl From<&wasmparser::PrimitiveValType> for InterfaceType {
@@ -1604,6 +1770,57 @@ pub struct TypeResult {
     pub abi: CanonicalAbiInfo,
     /// Byte information about this variant type.
     pub info: VariantInfo,
+}
+
+/// TODO: docs
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeFuture {
+    /// TODO: docs
+    pub payload: Option<InterfaceType>,
+    /// TODO: docs
+    pub send_result: TypeResultIndex,
+    /// TODO: docs
+    pub receive_result: TypeResultIndex,
+}
+
+/// TODO: docs
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeFutureTable {
+    /// TODO: docs
+    pub ty: TypeFutureIndex,
+
+    /// TODO: docs
+    pub instance: RuntimeComponentInstanceIndex,
+}
+
+/// TODO: docs
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeStream {
+    /// TODO: docs
+    pub payload: InterfaceType,
+    /// TODO: docs
+    pub list: TypeListIndex,
+    /// TODO: docs
+    pub send_result: TypeResultIndex,
+    /// TODO: docs
+    pub receive_option: TypeOptionIndex,
+}
+
+/// TODO: docs
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeStreamTable {
+    /// TODO: docs
+    pub ty: TypeStreamIndex,
+
+    /// TODO: docs
+    pub instance: RuntimeComponentInstanceIndex,
+}
+
+/// TODO: docs
+#[derive(Serialize, Deserialize, Clone, Hash, Eq, PartialEq, Debug)]
+pub struct TypeErrorTable {
+    /// TODO: docs
+    pub instance: RuntimeComponentInstanceIndex,
 }
 
 /// Metadata about a resource table added to a component.

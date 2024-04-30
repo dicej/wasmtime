@@ -269,12 +269,68 @@ pub enum Trampoline {
     ResourceDrop(TypeResourceTableIndex),
     AsyncStart(TypeFuncIndex),
     AsyncReturn(TypeFuncIndex),
+    FutureNew {
+        ty: TypeFutureTableIndex,
+        memory: MemoryId,
+    },
+    FutureSend {
+        ty: TypeFutureTableIndex,
+        options: CanonicalOptions,
+    },
+    FutureReceive {
+        ty: TypeFutureTableIndex,
+        options: CanonicalOptions,
+    },
+    FutureDropSender {
+        ty: TypeFutureTableIndex,
+    },
+    FutureDropReceiver {
+        ty: TypeFutureTableIndex,
+    },
+    StreamNew {
+        ty: TypeStreamTableIndex,
+        memory: MemoryId,
+    },
+    StreamSend {
+        ty: TypeStreamTableIndex,
+        options: CanonicalOptions,
+    },
+    StreamReceive {
+        ty: TypeStreamTableIndex,
+        options: CanonicalOptions,
+    },
+    StreamDropSender {
+        ty: TypeStreamTableIndex,
+    },
+    StreamDropReceiver {
+        ty: TypeStreamTableIndex,
+    },
+    ErrorDrop {
+        ty: TypeErrorTableIndex,
+    },
     ResourceTransferOwn,
     ResourceTransferBorrow,
     ResourceEnterCall,
     ResourceExitCall,
     AsyncEnterCall,
     AsyncExitCall(Option<CallbackId>),
+    FutureTransfer,
+    StreamTransfer,
+    ErrorTransfer,
+}
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct FutureInfo {
+    pub instance: RuntimeComponentInstanceIndex,
+    pub payload_type: Option<InterfaceType>,
+}
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct StreamInfo {
+    pub instance: RuntimeComponentInstanceIndex,
+    pub payload_type: InterfaceType,
 }
 
 /// Same as `info::CanonicalOptions`
@@ -624,6 +680,39 @@ impl LinearizeDfg<'_> {
             Trampoline::ResourceRep(ty) => info::Trampoline::ResourceRep(*ty),
             Trampoline::AsyncStart(ty) => info::Trampoline::AsyncStart(*ty),
             Trampoline::AsyncReturn(ty) => info::Trampoline::AsyncReturn(*ty),
+            Trampoline::FutureNew { ty, memory, .. } => info::Trampoline::FutureNew {
+                ty: *ty,
+                memory: self.runtime_memory(*memory),
+            },
+            Trampoline::FutureSend { ty, options } => info::Trampoline::FutureSend {
+                ty: *ty,
+                options: self.options(options),
+            },
+            Trampoline::FutureReceive { ty, options } => info::Trampoline::FutureReceive {
+                ty: *ty,
+                options: self.options(options),
+            },
+            Trampoline::FutureDropSender { ty } => info::Trampoline::FutureDropSender { ty: *ty },
+            Trampoline::FutureDropReceiver { ty } => {
+                info::Trampoline::FutureDropReceiver { ty: *ty }
+            }
+            Trampoline::StreamNew { ty, memory, .. } => info::Trampoline::StreamNew {
+                ty: *ty,
+                memory: self.runtime_memory(*memory),
+            },
+            Trampoline::StreamSend { ty, options } => info::Trampoline::StreamSend {
+                ty: *ty,
+                options: self.options(options),
+            },
+            Trampoline::StreamReceive { ty, options } => info::Trampoline::StreamReceive {
+                ty: *ty,
+                options: self.options(options),
+            },
+            Trampoline::StreamDropSender { ty } => info::Trampoline::StreamDropSender { ty: *ty },
+            Trampoline::StreamDropReceiver { ty } => {
+                info::Trampoline::StreamDropReceiver { ty: *ty }
+            }
+            Trampoline::ErrorDrop { ty } => info::Trampoline::ErrorDrop { ty: *ty },
             Trampoline::ResourceTransferOwn => info::Trampoline::ResourceTransferOwn,
             Trampoline::ResourceTransferBorrow => info::Trampoline::ResourceTransferBorrow,
             Trampoline::ResourceEnterCall => info::Trampoline::ResourceEnterCall,
@@ -632,6 +721,9 @@ impl LinearizeDfg<'_> {
             Trampoline::AsyncExitCall(callback) => {
                 info::Trampoline::AsyncExitCall(callback.map(|v| self.runtime_callback(v)))
             }
+            Trampoline::FutureTransfer => info::Trampoline::FutureTransfer,
+            Trampoline::StreamTransfer => info::Trampoline::StreamTransfer,
+            Trampoline::ErrorTransfer => info::Trampoline::ErrorTransfer,
         };
         let i1 = self.trampolines.push(*signature);
         let i2 = self.trampoline_defs.push(trampoline);

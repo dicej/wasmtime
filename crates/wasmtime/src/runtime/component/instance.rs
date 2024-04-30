@@ -303,6 +303,17 @@ impl<'a> Instantiator<'a> {
             concurrent::async_return::<T>,
             concurrent::async_enter::<T>,
             concurrent::async_exit::<T>,
+            concurrent::future_new::<T>,
+            concurrent::future_send::<T>,
+            concurrent::future_receive::<T>,
+            concurrent::future_drop_sender::<T>,
+            concurrent::future_drop_receiver::<T>,
+            concurrent::stream_new::<T>,
+            concurrent::stream_send::<T>,
+            concurrent::stream_receive::<T>,
+            concurrent::stream_drop_sender::<T>,
+            concurrent::stream_drop_receiver::<T>,
+            concurrent::error_drop::<T>,
         );
 
         // Before all initializers are processed configure all destructors for

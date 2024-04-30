@@ -296,7 +296,7 @@ where
     /// This is only valid to call when the "flatten count" is small enough, or
     /// when the canonical ABI says arguments go through the stack rather than
     /// the heap.
-    fn lower_stack_args<T>(
+    fn lower_stack_args<T: 'static>(
         cx: &mut LowerContext<'_, T>,
         params: &Params,
         ty: InterfaceType,
@@ -313,7 +313,7 @@ where
     /// the `MAX_FLAT_PARAMS` threshold. Here the wasm's `realloc` function is
     /// invoked to allocate space and then parameters are stored at that heap
     /// pointer location.
-    fn lower_heap_args<T>(
+    fn lower_heap_args<T: 'static>(
         cx: &mut LowerContext<'_, T>,
         params: &Params,
         ty: InterfaceType,
@@ -378,7 +378,7 @@ where
         Return::load(cx, ty, bytes)
     }
 
-    fn lower_heap_args_guest<T>(
+    fn lower_heap_args_guest<T: 'static>(
         cx: &mut LowerContext<'_, T>,
         params: &Params,
         ty: InterfaceType,
@@ -592,7 +592,7 @@ pub unsafe trait Lower: ComponentType {
     ///
     /// This will only be called if `typecheck` passes for `Op::Lower`.
     #[doc(hidden)]
-    fn lower<T>(
+    fn lower<T: 'static>(
         &self,
         cx: &mut LowerContext<'_, T>,
         ty: InterfaceType,
@@ -617,7 +617,7 @@ pub unsafe trait Lower: ComponentType {
     ///
     /// This will only be called if `typecheck` passes for `Op::Lower`.
     #[doc(hidden)]
-    fn store<T>(
+    fn store<T: 'static>(
         &self,
         cx: &mut LowerContext<'_, T>,
         ty: InterfaceType,
@@ -633,7 +633,7 @@ pub unsafe trait Lower: ComponentType {
     /// which can avoid some extra fluff and use a pattern that's more easily
     /// optimizable by LLVM.
     #[doc(hidden)]
-    fn store_list<T>(
+    fn store_list<T: 'static>(
         cx: &mut LowerContext<'_, T>,
         ty: InterfaceType,
         mut offset: usize,
@@ -748,7 +748,7 @@ forward_type_impls! {
 macro_rules! forward_lowers {
     ($(($($generics:tt)*) $a:ty => $b:ty,)*) => ($(
         unsafe impl <$($generics)*> Lower for $a {
-            fn lower<U>(
+            fn lower<U: 'static>(
                 &self,
                 cx: &mut LowerContext<'_, U>,
                 ty: InterfaceType,
@@ -757,7 +757,7 @@ macro_rules! forward_lowers {
                 <$b as Lower>::lower(self, cx, ty, dst)
             }
 
-            fn store<U>(
+            fn store<U: 'static>(
                 &self,
                 cx: &mut LowerContext<'_, U>,
                 ty: InterfaceType,
@@ -1489,7 +1489,7 @@ unsafe impl<T> Lower for [T]
 where
     T: Lower,
 {
-    fn lower<U>(
+    fn lower<U: 'static>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
@@ -1507,7 +1507,7 @@ where
         Ok(())
     }
 
-    fn store<U>(
+    fn store<U: 'static>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
@@ -1540,7 +1540,7 @@ where
 // pointer fo memory (I guess from `MemoryMut` itself?). Overall I'm not really
 // clear on what's happening there, but this is surely going to be a performance
 // bottleneck in the future.
-fn lower_list<T, U>(
+fn lower_list<T, U: 'static>(
     cx: &mut LowerContext<'_, U>,
     ty: InterfaceType,
     list: &[T],
@@ -1987,7 +1987,7 @@ unsafe impl<T> Lower for Option<T>
 where
     T: Lower,
 {
-    fn lower<U>(
+    fn lower<U: 'static>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
@@ -2018,7 +2018,7 @@ where
         Ok(())
     }
 
-    fn store<U>(
+    fn store<U: 'static>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
@@ -2159,7 +2159,7 @@ where
     T: Lower,
     E: Lower,
 {
-    fn lower<U>(
+    fn lower<U: 'static>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
@@ -2264,7 +2264,7 @@ where
         }
     }
 
-    fn store<U>(
+    fn store<U: 'static>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
@@ -2428,7 +2428,7 @@ macro_rules! impl_component_ty_for_tuples {
         unsafe impl<$($t,)*> Lower for ($($t,)*)
             where $($t: Lower),*
         {
-            fn lower<U>(
+            fn lower<U: 'static>(
                 &self,
                 cx: &mut LowerContext<'_, U>,
                 ty: InterfaceType,
@@ -2447,7 +2447,7 @@ macro_rules! impl_component_ty_for_tuples {
                 Ok(())
             }
 
-            fn store<U>(
+            fn store<U: 'static>(
                 &self,
                 cx: &mut LowerContext<'_, U>,
                 ty: InterfaceType,
@@ -2540,6 +2540,9 @@ pub fn desc(ty: &InterfaceType) -> &'static str {
         InterfaceType::Enum(_) => "enum",
         InterfaceType::Own(_) => "owned resource",
         InterfaceType::Borrow(_) => "borrowed resource",
+        InterfaceType::Future(_) => "future",
+        InterfaceType::Stream(_) => "stream",
+        InterfaceType::Error(_) => "error",
     }
 }
 

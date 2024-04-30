@@ -9,7 +9,8 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::mem;
 use wasmparser::types::{
-    AliasableResourceId, ComponentEntityType, ComponentFuncTypeId, ComponentInstanceTypeId, Types,
+    AliasableResourceId, ComponentDefinedTypeId, ComponentEntityType, ComponentFuncTypeId,
+    ComponentInstanceTypeId, Types,
 };
 use wasmparser::{Chunk, ComponentImportName, Encoding, Parser, Payload, Validator};
 use wasmtime_types::ModuleInternedTypeIndex;
@@ -187,6 +188,56 @@ enum LocalInitializer<'data> {
 
     AsyncStart(ComponentFuncTypeId, ModuleInternedTypeIndex),
     AsyncReturn(ComponentFuncTypeId, ModuleInternedTypeIndex),
+
+    FutureNew {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+        memory: MemoryIndex,
+    },
+    FutureSend {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+        options: LocalCanonicalOptions,
+    },
+    FutureReceive {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+        options: LocalCanonicalOptions,
+    },
+    FutureDropSender {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+    },
+    FutureDropReceiver {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+    },
+    StreamNew {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+        memory: MemoryIndex,
+    },
+    StreamSend {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+        options: LocalCanonicalOptions,
+    },
+    StreamReceive {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+        options: LocalCanonicalOptions,
+    },
+    StreamDropSender {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+    },
+    StreamDropReceiver {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+    },
+    ErrorDrop {
+        func: ModuleInternedTypeIndex,
+    },
 
     // core wasm modules
     ModuleStatic(StaticModuleIndex),
@@ -469,7 +520,8 @@ impl<'a, 'data> Translator<'a, 'data> {
             // Entries in the canonical section will get initializers recorded
             // with the listed options for lifting/lowering.
             Payload::ComponentCanonicalSection(s) => {
-                let mut core_func_index = self.validator.types(0).unwrap().function_count();
+                let types = self.validator.types(0).unwrap();
+                let mut core_func_index = types.function_count();
                 self.validator.component_canonical_section(&s)?;
                 for func in s {
                     let types = self.validator.types(0).unwrap();
@@ -538,6 +590,83 @@ impl<'a, 'data> Translator<'a, 'data> {
                             let core_type = self.core_func_signature(core_func_index);
                             core_func_index += 1;
                             LocalInitializer::AsyncReturn(component_type, core_type)
+                        }
+                        wasmparser::CanonicalFunction::FutureNew { ty, memory } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::FutureNew {
+                                ty,
+                                func,
+                                memory: MemoryIndex::from_u32(memory),
+                            }
+                        }
+                        wasmparser::CanonicalFunction::FutureSend { ty, options } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let options = self.canonical_options(&options);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::FutureSend { ty, func, options }
+                        }
+                        wasmparser::CanonicalFunction::FutureReceive { ty, options } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let options = self.canonical_options(&options);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::FutureReceive { ty, func, options }
+                        }
+                        wasmparser::CanonicalFunction::FutureDropSender { ty } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::FutureDropSender { ty, func }
+                        }
+                        wasmparser::CanonicalFunction::FutureDropReceiver { ty } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::FutureDropReceiver { ty, func }
+                        }
+                        wasmparser::CanonicalFunction::StreamNew { ty, memory } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::StreamNew {
+                                ty,
+                                func,
+                                memory: MemoryIndex::from_u32(memory),
+                            }
+                        }
+                        wasmparser::CanonicalFunction::StreamSend { ty, options } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let options = self.canonical_options(&options);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::StreamSend { ty, func, options }
+                        }
+                        wasmparser::CanonicalFunction::StreamReceive { ty, options } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let options = self.canonical_options(&options);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::StreamReceive { ty, func, options }
+                        }
+                        wasmparser::CanonicalFunction::StreamDropSender { ty } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::StreamDropSender { ty, func }
+                        }
+                        wasmparser::CanonicalFunction::StreamDropReceiver { ty } => {
+                            let ty = types.component_defined_type_at(ty);
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::StreamDropReceiver { ty, func }
+                        }
+                        wasmparser::CanonicalFunction::ErrorDrop => {
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::ErrorDrop { func }
                         }
                     };
                     self.result.initializers.push(init);

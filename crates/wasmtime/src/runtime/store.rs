@@ -76,7 +76,7 @@
 //! contents of `StoreOpaque`. This is an invariant that we, as the authors of
 //! `wasmtime`, must uphold for the public interface to be safe.
 
-use crate::component::concurrent::ConcurrentState;
+use crate::component::concurrent::{self, ConcurrentState};
 use crate::gc::RootSet;
 use crate::instance::InstanceData;
 use crate::linker::Definition;
@@ -1026,6 +1026,21 @@ impl<'a, T> StoreContextMut<'a, T> {
     }
 
     /// TODO: docs
+    pub async fn wait(self) -> Result<()>
+    where
+        T: Send + 'static,
+    {
+        concurrent::poll(self).await.map(drop)
+    }
+
+    /// TODO: docs
+    pub async fn wait_until<U>(self, future: impl Future<Output = U>) -> Result<U>
+    where
+        T: Send + 'static,
+    {
+        concurrent::poll_until(self, future).await.map(|(_, v)| v)
+    }
+
     pub(crate) fn concurrent_state(&mut self) -> &mut ConcurrentState<T> {
         self.0.concurrent_state()
     }

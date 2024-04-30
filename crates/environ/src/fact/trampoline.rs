@@ -17,9 +17,10 @@
 
 use crate::component::{
     CanonicalAbiInfo, ComponentTypesBuilder, FlatType, InterfaceType, StringEncoding,
-    TypeEnumIndex, TypeFlagsIndex, TypeListIndex, TypeOptionIndex, TypeRecordIndex,
-    TypeResourceTableIndex, TypeResultIndex, TypeTupleIndex, TypeVariantIndex, VariantInfo,
-    FLAG_MAY_ENTER, FLAG_MAY_LEAVE, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
+    TypeEnumIndex, TypeErrorTableIndex, TypeFlagsIndex, TypeFutureTableIndex, TypeListIndex,
+    TypeOptionIndex, TypeRecordIndex, TypeResourceTableIndex, TypeResultIndex,
+    TypeStreamTableIndex, TypeTupleIndex, TypeVariantIndex, VariantInfo, FLAG_MAY_ENTER,
+    FLAG_MAY_LEAVE, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
 };
 use crate::fact::signature::Signature;
 use crate::fact::transcode::{FixedEncoding as FE, Transcode, Transcoder};
@@ -1084,7 +1085,11 @@ impl Compiler<'_, '_> {
             InterfaceType::Option(_) | InterfaceType::Result(_) => 2,
 
             // TODO(#6696) - something nonzero, is 1 right?
-            InterfaceType::Own(_) | InterfaceType::Borrow(_) => 1,
+            InterfaceType::Own(_)
+            | InterfaceType::Borrow(_)
+            | InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::Error(_) => 1,
         };
 
         match self.fuel.checked_sub(cost) {
@@ -1119,6 +1124,9 @@ impl Compiler<'_, '_> {
                     InterfaceType::Result(t) => self.translate_result(*t, src, dst_ty, dst),
                     InterfaceType::Own(t) => self.translate_own(*t, src, dst_ty, dst),
                     InterfaceType::Borrow(t) => self.translate_borrow(*t, src, dst_ty, dst),
+                    InterfaceType::Future(t) => self.translate_future(*t, src, dst_ty, dst),
+                    InterfaceType::Stream(t) => self.translate_stream(*t, src, dst_ty, dst),
+                    InterfaceType::Error(t) => self.translate_error(*t, src, dst_ty, dst),
                 }
             }
 
@@ -2945,6 +2953,54 @@ impl Compiler<'_, '_> {
         }
     }
 
+    fn translate_future(
+        &mut self,
+        src_ty: TypeFutureTableIndex,
+        src: &Source<'_>,
+        dst_ty: &InterfaceType,
+        dst: &Destination,
+    ) {
+        let dst_ty = match dst_ty {
+            InterfaceType::Future(t) => *t,
+            _ => panic!("expected a `Future`"),
+        };
+        assert!(src_ty == dst_ty);
+        let transfer = self.module.import_future_transfer();
+        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
+    }
+
+    fn translate_stream(
+        &mut self,
+        src_ty: TypeStreamTableIndex,
+        src: &Source<'_>,
+        dst_ty: &InterfaceType,
+        dst: &Destination,
+    ) {
+        let dst_ty = match dst_ty {
+            InterfaceType::Stream(t) => *t,
+            _ => panic!("expected a `Stream`"),
+        };
+        assert!(src_ty == dst_ty);
+        let transfer = self.module.import_stream_transfer();
+        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
+    }
+
+    fn translate_error(
+        &mut self,
+        src_ty: TypeErrorTableIndex,
+        src: &Source<'_>,
+        dst_ty: &InterfaceType,
+        dst: &Destination,
+    ) {
+        let dst_ty = match dst_ty {
+            InterfaceType::Error(t) => *t,
+            _ => panic!("expected an `Error`"),
+        };
+        assert!(src_ty == dst_ty);
+        let transfer = self.module.import_error_transfer();
+        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
+    }
+
     fn translate_own(
         &mut self,
         src_ty: TypeResourceTableIndex,
@@ -2957,7 +3013,7 @@ impl Compiler<'_, '_> {
             _ => panic!("expected an `Own`"),
         };
         let transfer = self.module.import_resource_transfer_own();
-        self.translate_resource(src_ty, src, dst_ty, dst, transfer);
+        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
     }
 
     fn translate_borrow(
@@ -2973,21 +3029,14 @@ impl Compiler<'_, '_> {
         };
 
         let transfer = self.module.import_resource_transfer_borrow();
-        self.translate_resource(src_ty, src, dst_ty, dst, transfer);
+        self.translate_handle(src_ty.as_u32(), src, dst_ty.as_u32(), dst, transfer);
     }
 
-    /// Translates the index `src`, which resides in the table `src_ty`, into
-    /// and index within `dst_ty` and is stored at `dst`.
-    ///
-    /// Actual translation of the index happens in a wasmtime libcall, which a
-    /// cranelift-generated trampoline to satisfy this import will call. The
-    /// `transfer` function is an imported function which takes the src, src_ty,
-    /// and dst_ty, and returns the dst index.
-    fn translate_resource(
+    fn translate_handle(
         &mut self,
-        src_ty: TypeResourceTableIndex,
+        src_ty: u32,
         src: &Source<'_>,
-        dst_ty: TypeResourceTableIndex,
+        dst_ty: u32,
         dst: &Destination,
         transfer: FuncIndex,
     ) {
@@ -2996,8 +3045,8 @@ impl Compiler<'_, '_> {
             Source::Memory(mem) => self.i32_load(mem),
             Source::Stack(stack) => self.stack_get(stack, ValType::I32),
         }
-        self.instruction(I32Const(src_ty.as_u32() as i32));
-        self.instruction(I32Const(dst_ty.as_u32() as i32));
+        self.instruction(I32Const(src_ty as i32));
+        self.instruction(I32Const(dst_ty as i32));
         self.instruction(Call(transfer.as_u32()));
         match dst {
             Destination::Memory(mem) => self.i32_store(mem),

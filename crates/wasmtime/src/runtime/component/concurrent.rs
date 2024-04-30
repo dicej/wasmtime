@@ -1,7 +1,15 @@
-use crate::{AsContextMut, Engine, StoreContextMut, ValRaw};
-use anyhow::{anyhow, Error, Result};
+use crate::{
+    component::{
+        func::{self, Lift as _, LiftContext, Lower as _, LowerContext, Options},
+        matching::InstanceType,
+        Val,
+    },
+    AsContextMut, Engine, StoreContextMut, ValRaw,
+};
+use anyhow::{anyhow, bail, Result};
 use futures::{
-    future::{self, FutureExt},
+    channel::oneshot,
+    future::{self, Either, FutureExt},
     stream::{FuturesUnordered, ReadyChunks, StreamExt},
 };
 use once_cell::sync::Lazy;
@@ -18,16 +26,23 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Wake, Waker},
 };
-use task_table::TaskTable;
-use wasmtime_environ::component::{TypeFuncIndex, MAX_FLAT_PARAMS};
+use table::{Table, TableId};
+use wasmtime_environ::component::{
+    CanonicalAbiInfo, ComponentTypes, InterfaceType, StringEncoding, TypeErrorTableIndex,
+    TypeFuncIndex, TypeFutureIndex, TypeFutureTableIndex, TypeStreamIndex, TypeStreamTableIndex,
+    MAX_FLAT_PARAMS,
+};
 use wasmtime_fiber::{Fiber, Suspend};
 use wasmtime_runtime::{
-    component::VMComponentContext,
+    component::{ComponentInstance, TableIndex, VMComponentContext},
     mpk::{self, ProtectionMask},
-    AsyncWasmCallState, PreviousAsyncWasmCallState, SendSyncPtr, Store, VMFuncRef, VMOpaqueContext,
+    AsyncWasmCallState, PreviousAsyncWasmCallState, SendSyncPtr, Store, VMFuncRef,
+    VMMemoryDefinition, VMOpaqueContext,
 };
 
-mod task_table;
+mod table;
+
+/// TODO: add `validate_inbounds` calls where appropriate
 
 const STATUS_NOT_STARTED: u32 = 0;
 const STATUS_PARAMS_READ: u32 = 1;
@@ -42,32 +57,889 @@ const ENTER_FLAG_EXPECT_RETPTR: u32 = 1 << 0;
 const EXIT_FLAG_ASYNC_CALLER: u32 = 1 << 0;
 const EXIT_FLAG_ASYNC_CALLEE: u32 = 1 << 1;
 
-pub(crate) struct TaskId<T> {
+fn send<
+    T: func::Lower + Send + Sync + 'static,
+    W: func::Lower + Send + Sync + 'static,
+    U: 'static,
+    S: AsContextMut<Data = U>,
+>(
+    mut store: S,
     rep: u32,
-    _marker: PhantomData<fn() -> T>,
+    value: T,
+    wrap: impl Fn(T) -> W + Send + Sync + 'static,
+) -> Result<()> {
+    let mut store = store.as_context_mut();
+    let transmit = store
+        .concurrent_state()
+        .table
+        .get(TableId::<TransmitSender<U>>::new(rep))?
+        .0;
+    let transmit = store.concurrent_state().table.get_mut(transmit)?;
+    let new_state = if let ReceiveState::Closed = &transmit.receive {
+        ReceiveState::Closed
+    } else {
+        ReceiveState::Open
+    };
+
+    match mem::replace(&mut transmit.receive, new_state) {
+        ReceiveState::Open => {
+            assert!(matches!(&transmit.send, SendState::Open));
+
+            transmit.send = SendState::HostReady {
+                accept: Box::new(move |receiver| {
+                    match receiver {
+                        Receiver::Guest { lower, ty, offset } => {
+                            wrap(value).store(lower, ty, offset)?;
+                        }
+                        Receiver::Host { accept } => accept(Box::new(value))?,
+                        Receiver::None => {}
+                    }
+                    Ok(())
+                }),
+                close: false,
+            };
+        }
+
+        ReceiveState::GuestReady {
+            options,
+            results,
+            instance,
+            tx: _receive_tx,
+            entry,
+        } => unsafe {
+            let types = (*instance.as_ptr()).component_types();
+            let ty = match transmit.ty {
+                TransmitStateIndex::Future(ty) => InterfaceType::Result(types[ty].receive_result),
+                TransmitStateIndex::Stream(ty) => InterfaceType::Option(types[ty].receive_option),
+                TransmitStateIndex::Unknown => unreachable!(),
+            };
+            let lower =
+                &mut LowerContext::new(store.as_context_mut(), &options, types, instance.as_ptr());
+            wrap(value).store(lower, ty, usize::try_from(results).unwrap())?;
+
+            if let Some(entry) = entry {
+                (*instance.as_ptr()).handle_table().insert(entry);
+            }
+        },
+
+        ReceiveState::HostReady { accept } => {
+            accept(Sender::Host {
+                value: Box::new(value),
+            })?;
+        }
+
+        // TODO: should we return an error here?
+        ReceiveState::Closed => {}
+    }
+
+    Ok(())
 }
 
-impl<T> TaskId<T> {
-    fn new(rep: u32) -> Self {
-        Self {
-            rep,
-            _marker: PhantomData,
+pub fn receive<T: func::Lift + Sync + Send + 'static, U: 'static, S: AsContextMut<Data = U>>(
+    mut store: S,
+    rep: u32,
+) -> Result<oneshot::Receiver<Option<T>>> {
+    let mut store = store.as_context_mut();
+    let (tx, rx) = oneshot::channel();
+    let transmit_id = store
+        .concurrent_state()
+        .table
+        .get(TableId::<TransmitReceiver<U>>::new(rep))?
+        .0;
+    let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
+    let new_state = if let SendState::Closed = &transmit.send {
+        SendState::Closed
+    } else {
+        SendState::Open
+    };
+
+    match mem::replace(&mut transmit.send, new_state) {
+        SendState::Open => {
+            assert!(matches!(&transmit.receive, ReceiveState::Open));
+
+            transmit.receive = ReceiveState::HostReady {
+                accept: Box::new(move |sender| {
+                    match sender {
+                        Sender::Guest { lift, ty, ptr } => {
+                            _ = tx.send(
+                                ty.map(|ty| {
+                                    T::load(
+                                        lift,
+                                        ty,
+                                        &lift.memory()[usize::try_from(ptr).unwrap()..]
+                                            [..T::SIZE32],
+                                    )
+                                })
+                                .transpose()?,
+                            );
+                        }
+                        Sender::Host { value } => {
+                            _ = tx.send(Some(
+                                *value
+                                    .downcast()
+                                    .map_err(|_| anyhow!("transmit type mismatch"))?,
+                            ));
+                        }
+                        Sender::None => {}
+                    }
+                    Ok(())
+                }),
+            };
+        }
+
+        SendState::GuestReady {
+            options,
+            params,
+            results,
+            instance,
+            tx: _send_tx,
+            entry,
+            close,
+        } => unsafe {
+            let types = (*instance.as_ptr()).component_types();
+            let ty = match transmit.ty {
+                TransmitStateIndex::Future(ty) => types[ty].payload,
+                TransmitStateIndex::Stream(ty) => Some(InterfaceType::List(types[ty].list)),
+                TransmitStateIndex::Unknown => unreachable!(),
+            };
+            let send_result = transmit.ty.send_result(types);
+            let lift = &mut LiftContext::new(store.0, &options, types, instance.as_ptr());
+            _ = tx.send(
+                ty.map(|ty| {
+                    T::load(
+                        lift,
+                        ty,
+                        &lift.memory()[usize::try_from(params).unwrap()..][..T::SIZE32],
+                    )
+                })
+                .transpose()?,
+            );
+
+            let mut lower =
+                LowerContext::new(store.as_context_mut(), &options, types, instance.as_ptr());
+            Ok::<(), Error>(()).store(
+                &mut lower,
+                send_result,
+                usize::try_from(results).unwrap(),
+            )?;
+
+            if close {
+                store.concurrent_state().table.get_mut(transmit_id)?.send = SendState::Closed;
+            } else if let Some(entry) = entry {
+                (*instance.as_ptr()).handle_table().insert(entry);
+            }
+        },
+
+        SendState::HostReady { accept, close } => {
+            accept(Receiver::Host {
+                accept: Box::new(move |any| {
+                    _ = tx.send(Some(
+                        *any.downcast()
+                            .map_err(|_| anyhow!("transmit type mismatch"))?,
+                    ));
+                    Ok(())
+                }),
+            })?;
+
+            if close {
+                store.concurrent_state().table.get_mut(transmit_id)?.send = SendState::Closed;
+            }
+        }
+
+        SendState::Closed => {}
+    }
+
+    Ok(rx)
+}
+
+fn close_sender<U: 'static, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Result<()> {
+    let mut store = store.as_context_mut();
+    let sender = store
+        .concurrent_state()
+        .table
+        .delete::<TransmitSender<U>>(TableId::new(rep))?;
+    let transmit = store.concurrent_state().table.get_mut(sender.0)?;
+
+    match &mut transmit.send {
+        SendState::GuestReady { close, .. } => {
+            *close = true;
+        }
+
+        SendState::HostReady { close, .. } => {
+            *close = true;
+        }
+
+        v @ SendState::Open => {
+            *v = SendState::Closed;
+        }
+
+        SendState::Closed => unreachable!(),
+    }
+
+    let new_state = if let ReceiveState::Closed = &transmit.receive {
+        ReceiveState::Closed
+    } else {
+        ReceiveState::Open
+    };
+
+    match mem::replace(&mut transmit.receive, new_state) {
+        ReceiveState::GuestReady {
+            options,
+            results,
+            instance,
+            tx: _tx,
+            entry,
+        } => unsafe {
+            let types = (*instance.as_ptr()).component_types();
+            let ty = transmit.ty;
+            let mut lower =
+                LowerContext::new(store.as_context_mut(), &options, types, instance.as_ptr());
+
+            match ty {
+                TransmitStateIndex::Future(ty) => {
+                    Err::<(), _>(Error { rep: 0 }).store(
+                        &mut lower,
+                        InterfaceType::Result(types[ty].receive_result),
+                        usize::try_from(results).unwrap(),
+                    )?;
+                }
+                TransmitStateIndex::Stream(ty) => {
+                    Val::Option(None).store(
+                        &mut lower,
+                        InterfaceType::Option(types[ty].receive_option),
+                        usize::try_from(results).unwrap(),
+                    )?;
+                }
+                TransmitStateIndex::Unknown => unreachable!(),
+            }
+
+            if let Some(entry) = entry {
+                (*instance.as_ptr()).handle_table().insert(entry);
+            }
+        },
+
+        ReceiveState::HostReady { accept } => {
+            accept(Sender::None)?;
+        }
+
+        ReceiveState::Open => {}
+
+        ReceiveState::Closed => {
+            store.concurrent_state().table.delete(sender.0)?;
+        }
+    }
+    Ok(())
+}
+
+fn close_receiver<U: 'static, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Result<()> {
+    let mut store = store.as_context_mut();
+    let receiver = store
+        .concurrent_state()
+        .table
+        .delete::<TransmitReceiver<U>>(TableId::new(rep))?;
+    let transmit = store.concurrent_state().table.get_mut(receiver.0)?;
+
+    transmit.receive = ReceiveState::Closed;
+
+    let new_state = if let SendState::Closed = &transmit.send {
+        SendState::Closed
+    } else {
+        SendState::Open
+    };
+
+    match mem::replace(&mut transmit.send, new_state) {
+        SendState::GuestReady {
+            options,
+            params: _,
+            instance,
+            results,
+            tx: _tx,
+            entry,
+            close,
+        } => unsafe {
+            let types = (*instance.as_ptr()).component_types();
+            let ty = transmit.ty;
+            let mut lower =
+                LowerContext::new(store.as_context_mut(), &options, types, instance.as_ptr());
+            Err::<(), _>(Error { rep: 0 }).store(
+                &mut lower,
+                ty.send_result(types),
+                usize::try_from(results).unwrap(),
+            )?;
+
+            if close {
+                store.concurrent_state().table.delete(receiver.0)?;
+            } else if let Some(entry) = entry {
+                (*instance.as_ptr()).handle_table().insert(entry);
+            }
+        },
+
+        SendState::HostReady { accept, close } => {
+            accept(Receiver::None)?;
+
+            if close {
+                store.concurrent_state().table.delete(receiver.0)?;
+            }
+        }
+
+        SendState::Open => {}
+
+        SendState::Closed => {
+            store.concurrent_state().table.delete(receiver.0)?;
+        }
+    }
+    Ok(())
+}
+
+/// TODO: docs
+pub struct FutureSender<T> {
+    rep: u32,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> FutureSender<T> {
+    /// TODO: docs
+    pub fn send<U: 'static, S: AsContextMut<Data = U>>(self, store: S, value: T) -> Result<()>
+    where
+        T: func::Lower + Send + Sync + 'static,
+    {
+        send(store, self.rep, value, |v| Ok::<_, Error>(v))
+    }
+
+    pub fn close<U: 'static, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
+        close_sender(store, self.rep)
+    }
+}
+
+/// TODO: docs
+pub struct FutureReceiver<T> {
+    rep: u32,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> FutureReceiver<T> {
+    /// TODO: docs
+    pub fn receive<U: 'static, S: AsContextMut<Data = U>>(
+        self,
+        store: S,
+    ) -> Result<oneshot::Receiver<Option<T>>>
+    where
+        T: func::Lift + Sync + Send + 'static,
+    {
+        receive(store, self.rep)
+    }
+
+    fn lower_to_index<U: 'static>(
+        &self,
+        cx: &mut LowerContext<'_, U>,
+        ty: InterfaceType,
+    ) -> Result<u32> {
+        match ty {
+            InterfaceType::Future(dst) => {
+                let lower_ty = unsafe { (*cx.instance).component_types()[dst].ty };
+
+                let transmit = cx
+                    .store
+                    .concurrent_state()
+                    .table
+                    .get(TableId::<TransmitReceiver<U>>::new(self.rep))?
+                    .0;
+                let transmit = cx.store.concurrent_state().table.get_mut(transmit)?;
+                match transmit.ty {
+                    TransmitStateIndex::Future(ty) => {
+                        if lower_ty != ty {
+                            bail!("mismatched future types");
+                        }
+                    }
+                    TransmitStateIndex::Stream(_) => bail!("expected future, got stream"),
+                    TransmitStateIndex::Unknown => {
+                        transmit.ty = TransmitStateIndex::Future(lower_ty);
+                    }
+                }
+
+                unsafe {
+                    assert!((*cx.instance)
+                        .handle_table()
+                        .insert((TableIndex::Future(dst), self.rep)));
+                }
+
+                Ok(self.rep)
+            }
+            _ => func::bad_type_info(),
+        }
+    }
+
+    fn lift_from_index(cx: &mut LiftContext<'_>, ty: InterfaceType, index: u32) -> Result<Self> {
+        match ty {
+            InterfaceType::Future(src) => {
+                unsafe {
+                    if !(*cx.instance)
+                        .handle_table()
+                        .remove(&(TableIndex::Future(src), index))
+                    {
+                        bail!("invalid handle");
+                    }
+                }
+
+                Ok(Self {
+                    rep: index,
+                    _phantom: PhantomData,
+                })
+            }
+            _ => func::bad_type_info(),
+        }
+    }
+
+    /// TODO: docs
+    pub fn close<U: 'static, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
+        close_receiver(store, self.rep)
+    }
+}
+
+unsafe impl<T> func::ComponentType for FutureReceiver<T> {
+    const ABI: CanonicalAbiInfo = CanonicalAbiInfo::SCALAR4;
+
+    type Lower = <u32 as func::ComponentType>::Lower;
+
+    fn typecheck(ty: &InterfaceType, _types: &InstanceType<'_>) -> Result<()> {
+        match ty {
+            InterfaceType::Future(_) => Ok(()),
+            other => bail!("expected `future`, found `{}`", func::desc(other)),
         }
     }
 }
 
-impl<T> Clone for TaskId<T> {
-    fn clone(&self) -> Self {
-        Self::new(self.rep)
+unsafe impl<T> func::Lower for FutureReceiver<T> {
+    fn lower<U: 'static>(
+        &self,
+        cx: &mut LowerContext<'_, U>,
+        ty: InterfaceType,
+        dst: &mut MaybeUninit<Self::Lower>,
+    ) -> Result<()> {
+        self.lower_to_index(cx, ty)?
+            .lower(cx, InterfaceType::U32, dst)
+    }
+
+    fn store<U: 'static>(
+        &self,
+        cx: &mut LowerContext<'_, U>,
+        ty: InterfaceType,
+        offset: usize,
+    ) -> Result<()> {
+        self.lower_to_index(cx, ty)?
+            .store(cx, InterfaceType::U32, offset)
     }
 }
 
-impl<T> Copy for TaskId<T> {}
-
-impl<T> TaskId<T> {
-    pub fn rep(&self) -> u32 {
-        self.rep
+unsafe impl<T> func::Lift for FutureReceiver<T> {
+    fn lift(cx: &mut LiftContext<'_>, ty: InterfaceType, src: &Self::Lower) -> Result<Self> {
+        let index = u32::lift(cx, InterfaceType::U32, src)?;
+        Self::lift_from_index(cx, ty, index)
     }
+
+    fn load(cx: &mut LiftContext<'_>, ty: InterfaceType, bytes: &[u8]) -> Result<Self> {
+        let index = u32::load(cx, InterfaceType::U32, bytes)?;
+        Self::lift_from_index(cx, ty, index)
+    }
+}
+
+/// TODO: docs
+pub fn future<T, U: 'static, S: AsContextMut<Data = U>>(
+    mut store: S,
+) -> Result<(FutureSender<T>, FutureReceiver<T>)> {
+    let mut store = store.as_context_mut();
+    let transmit = store.concurrent_state().table.push(TransmitState::<U> {
+        ty: TransmitStateIndex::Unknown,
+        receive: ReceiveState::Open,
+        send: SendState::Open,
+    })?;
+    let sender = store
+        .concurrent_state()
+        .table
+        .push_child(TransmitSender(transmit), transmit)?;
+    let receiver = store
+        .concurrent_state()
+        .table
+        .push_child(TransmitReceiver(transmit), transmit)?;
+
+    Ok((
+        FutureSender {
+            rep: sender.rep(),
+            _phantom: PhantomData,
+        },
+        FutureReceiver {
+            rep: receiver.rep(),
+            _phantom: PhantomData,
+        },
+    ))
+}
+
+/// TODO: docs
+pub struct StreamSender<T> {
+    rep: u32,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> StreamSender<T> {
+    /// TODO: docs
+    pub fn send<U: 'static, S: AsContextMut<Data = U>>(
+        &mut self,
+        store: S,
+        values: Vec<T>,
+    ) -> Result<()>
+    where
+        T: func::Lower + Send + Sync + 'static,
+    {
+        send(store, self.rep, values, |v| Some(Ok::<_, Error>(v)))
+    }
+
+    pub fn close<U: 'static, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
+        close_sender(store, self.rep)
+    }
+}
+
+/// TODO: docs
+pub struct StreamReceiver<T> {
+    rep: u32,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> StreamReceiver<T> {
+    /// TODO: docs
+    pub fn receive<U: 'static, S: AsContextMut<Data = U>>(
+        &mut self,
+        store: S,
+    ) -> Result<oneshot::Receiver<Option<Vec<T>>>>
+    where
+        T: func::Lift + Sync + Send + 'static,
+    {
+        receive(store, self.rep)
+    }
+
+    fn lower_to_index<U: 'static>(
+        &self,
+        cx: &mut LowerContext<'_, U>,
+        ty: InterfaceType,
+    ) -> Result<u32> {
+        match ty {
+            InterfaceType::Stream(dst) => {
+                let lower_ty = unsafe { (*cx.instance).component_types()[dst].ty };
+
+                let transmit = cx
+                    .store
+                    .concurrent_state()
+                    .table
+                    .get(TableId::<TransmitReceiver<U>>::new(self.rep))?
+                    .0;
+                let transmit = cx.store.concurrent_state().table.get_mut(transmit)?;
+                match transmit.ty {
+                    TransmitStateIndex::Stream(ty) => {
+                        if lower_ty != ty {
+                            bail!("mismatched stream types");
+                        }
+                    }
+                    TransmitStateIndex::Future(_) => bail!("expected stream, got future"),
+                    TransmitStateIndex::Unknown => {
+                        transmit.ty = TransmitStateIndex::Stream(lower_ty);
+                    }
+                }
+
+                unsafe {
+                    assert!((*cx.instance)
+                        .handle_table()
+                        .insert((TableIndex::Stream(dst), self.rep)));
+                }
+
+                Ok(self.rep)
+            }
+            _ => func::bad_type_info(),
+        }
+    }
+
+    fn lift_from_index(cx: &mut LiftContext<'_>, ty: InterfaceType, index: u32) -> Result<Self> {
+        match ty {
+            InterfaceType::Stream(src) => {
+                unsafe {
+                    if !(*cx.instance)
+                        .handle_table()
+                        .remove(&(TableIndex::Stream(src), index))
+                    {
+                        bail!("invalid handle");
+                    }
+                }
+
+                Ok(Self {
+                    rep: index,
+                    _phantom: PhantomData,
+                })
+            }
+            _ => func::bad_type_info(),
+        }
+    }
+
+    /// TODO: docs
+    pub fn close<U: 'static, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
+        close_receiver(store, self.rep)
+    }
+}
+
+unsafe impl<T> func::ComponentType for StreamReceiver<T> {
+    const ABI: CanonicalAbiInfo = CanonicalAbiInfo::SCALAR4;
+
+    type Lower = <u32 as func::ComponentType>::Lower;
+
+    fn typecheck(ty: &InterfaceType, _types: &InstanceType<'_>) -> Result<()> {
+        match ty {
+            InterfaceType::Stream(_) => Ok(()),
+            other => bail!("expected `stream`, found `{}`", func::desc(other)),
+        }
+    }
+}
+
+unsafe impl<T> func::Lower for StreamReceiver<T> {
+    fn lower<U: 'static>(
+        &self,
+        cx: &mut LowerContext<'_, U>,
+        ty: InterfaceType,
+        dst: &mut MaybeUninit<Self::Lower>,
+    ) -> Result<()> {
+        self.lower_to_index(cx, ty)?
+            .lower(cx, InterfaceType::U32, dst)
+    }
+
+    fn store<U: 'static>(
+        &self,
+        cx: &mut LowerContext<'_, U>,
+        ty: InterfaceType,
+        offset: usize,
+    ) -> Result<()> {
+        self.lower_to_index(cx, ty)?
+            .store(cx, InterfaceType::U32, offset)
+    }
+}
+
+unsafe impl<T> func::Lift for StreamReceiver<T> {
+    fn lift(cx: &mut LiftContext<'_>, ty: InterfaceType, src: &Self::Lower) -> Result<Self> {
+        let index = u32::lift(cx, InterfaceType::U32, src)?;
+        Self::lift_from_index(cx, ty, index)
+    }
+
+    fn load(cx: &mut LiftContext<'_>, ty: InterfaceType, bytes: &[u8]) -> Result<Self> {
+        let index = u32::load(cx, InterfaceType::U32, bytes)?;
+        Self::lift_from_index(cx, ty, index)
+    }
+}
+
+/// TODO: docs
+pub fn stream<T, U: 'static, S: AsContextMut<Data = U>>(
+    mut store: S,
+) -> Result<(StreamSender<T>, StreamReceiver<T>)> {
+    let mut store = store.as_context_mut();
+    let transmit = store.concurrent_state().table.push(TransmitState::<U> {
+        ty: TransmitStateIndex::Unknown,
+        receive: ReceiveState::Open,
+        send: SendState::Open,
+    })?;
+    let sender = store
+        .concurrent_state()
+        .table
+        .push_child(TransmitSender(transmit), transmit)?;
+    let receiver = store
+        .concurrent_state()
+        .table
+        .push_child(TransmitReceiver(transmit), transmit)?;
+
+    Ok((
+        StreamSender {
+            rep: sender.rep(),
+            _phantom: PhantomData,
+        },
+        StreamReceiver {
+            rep: receiver.rep(),
+            _phantom: PhantomData,
+        },
+    ))
+}
+
+/// TODO: docs
+pub struct Error {
+    rep: u32,
+}
+
+impl Error {
+    fn lower_to_index<U>(&self, cx: &mut LowerContext<'_, U>, ty: InterfaceType) -> Result<u32> {
+        match ty {
+            InterfaceType::Error(dst) => {
+                unsafe {
+                    *(*cx.instance)
+                        .error_table()
+                        .entry((dst, self.rep))
+                        .or_default() += 1;
+                }
+                Ok(self.rep)
+            }
+            _ => func::bad_type_info(),
+        }
+    }
+
+    fn lift_from_index(cx: &mut LiftContext<'_>, ty: InterfaceType, index: u32) -> Result<Self> {
+        match ty {
+            InterfaceType::Error(src) => {
+                if !unsafe { (*cx.instance).error_table().contains_key(&(src, index)) } {
+                    bail!("invalid handle");
+                }
+                Ok(Self { rep: index })
+            }
+            _ => func::bad_type_info(),
+        }
+    }
+}
+
+unsafe impl func::ComponentType for Error {
+    const ABI: CanonicalAbiInfo = CanonicalAbiInfo::SCALAR4;
+
+    type Lower = <u32 as func::ComponentType>::Lower;
+
+    fn typecheck(ty: &InterfaceType, _types: &InstanceType<'_>) -> Result<()> {
+        match ty {
+            InterfaceType::Error(_) => Ok(()),
+            other => bail!("expected `error`, found `{}`", func::desc(other)),
+        }
+    }
+}
+
+unsafe impl func::Lower for Error {
+    fn lower<T: 'static>(
+        &self,
+        cx: &mut LowerContext<'_, T>,
+        ty: InterfaceType,
+        dst: &mut MaybeUninit<Self::Lower>,
+    ) -> Result<()> {
+        self.lower_to_index(cx, ty)?
+            .lower(cx, InterfaceType::U32, dst)
+    }
+
+    fn store<T: 'static>(
+        &self,
+        cx: &mut LowerContext<'_, T>,
+        ty: InterfaceType,
+        offset: usize,
+    ) -> Result<()> {
+        self.lower_to_index(cx, ty)?
+            .store(cx, InterfaceType::U32, offset)
+    }
+}
+
+unsafe impl func::Lift for Error {
+    fn lift(cx: &mut LiftContext<'_>, ty: InterfaceType, src: &Self::Lower) -> Result<Self> {
+        let index = u32::lift(cx, InterfaceType::U32, src)?;
+        Self::lift_from_index(cx, ty, index)
+    }
+
+    fn load(cx: &mut LiftContext<'_>, ty: InterfaceType, bytes: &[u8]) -> Result<Self> {
+        let index = u32::load(cx, InterfaceType::U32, bytes)?;
+        Self::lift_from_index(cx, ty, index)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TransmitStateIndex {
+    Future(TypeFutureIndex),
+    Stream(TypeStreamIndex),
+    Unknown,
+}
+
+impl TransmitStateIndex {
+    fn send_result(self, types: &Arc<ComponentTypes>) -> InterfaceType {
+        InterfaceType::Result(match self {
+            TransmitStateIndex::Future(ty) => types[ty].send_result,
+            TransmitStateIndex::Stream(ty) => types[ty].send_result,
+            TransmitStateIndex::Unknown => unreachable!(),
+        })
+    }
+}
+
+struct TransmitState<T> {
+    ty: TransmitStateIndex,
+    send: SendState<T>,
+    receive: ReceiveState,
+}
+
+struct TransmitSender<T>(TableId<TransmitState<T>>);
+
+impl<T> Clone for TransmitSender<T> {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+impl<T> Copy for TransmitSender<T> {}
+
+struct TransmitReceiver<T>(TableId<TransmitState<T>>);
+
+impl<T> Clone for TransmitReceiver<T> {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+impl<T> Copy for TransmitReceiver<T> {}
+
+enum SendState<T> {
+    Open,
+    GuestReady {
+        options: Options,
+        params: u32,
+        results: u32,
+        instance: SendSyncPtr<ComponentInstance>,
+        tx: oneshot::Sender<()>,
+        entry: Option<(TableIndex, u32)>,
+        close: bool,
+    },
+    HostReady {
+        accept: Box<dyn FnOnce(Receiver<'_, T>) -> Result<()> + Send + Sync>,
+        close: bool,
+    },
+    Closed,
+}
+
+enum ReceiveState {
+    Open,
+    GuestReady {
+        options: Options,
+        results: u32,
+        instance: SendSyncPtr<ComponentInstance>,
+        tx: oneshot::Sender<()>,
+        entry: Option<(TableIndex, u32)>,
+    },
+    HostReady {
+        accept: Box<dyn FnOnce(Sender) -> Result<()> + Send + Sync>,
+    },
+    Closed,
+}
+
+enum Sender<'a> {
+    Guest {
+        lift: &'a mut LiftContext<'a>,
+        ty: Option<InterfaceType>,
+        ptr: u32,
+    },
+    Host {
+        value: Box<dyn Any>,
+    },
+    None,
+}
+
+enum Receiver<'a, T> {
+    Guest {
+        lower: &'a mut LowerContext<'a, T>,
+        ty: InterfaceType,
+        offset: usize,
+    },
+    Host {
+        accept: Box<dyn FnOnce(Box<dyn Any>) -> Result<()>>,
+    },
+    None,
 }
 
 type HostTaskFuture<T> = Pin<
@@ -79,12 +951,12 @@ type HostTaskFuture<T> = Pin<
     >,
 >;
 
-struct HostTask<T> {
-    caller: TaskId<T>,
+pub struct HostTask<T> {
+    caller: TableId<GuestTask<T>>,
 }
 
 struct Caller<T> {
-    task: TaskId<T>,
+    task: TableId<GuestTask<T>>,
     store_call: SendSyncPtr<VMFuncRef>,
     call: u32,
 }
@@ -96,45 +968,6 @@ struct GuestTask<T> {
     callback: Option<(SendSyncPtr<VMFuncRef>, u32)>,
     caller: Option<Caller<T>>,
     fiber: Option<StoreFiber>,
-}
-
-enum Task<T> {
-    Host(HostTask<T>),
-    Guest(GuestTask<T>),
-}
-
-impl<T> Task<T> {
-    fn unwrap_guest(self) -> GuestTask<T> {
-        if let Self::Guest(task) = self {
-            task
-        } else {
-            unreachable!()
-        }
-    }
-
-    fn unwrap_guest_ref(&self) -> &GuestTask<T> {
-        if let Self::Guest(task) = self {
-            task
-        } else {
-            unreachable!()
-        }
-    }
-
-    fn unwrap_guest_mut(&mut self) -> &mut GuestTask<T> {
-        if let Self::Guest(task) = self {
-            task
-        } else {
-            unreachable!()
-        }
-    }
-
-    fn unwrap_host(self) -> HostTask<T> {
-        if let Self::Host(task) = self {
-            task
-        } else {
-            unreachable!()
-        }
-    }
 }
 
 type Lower<T> = Box<
@@ -245,19 +1078,19 @@ impl AsyncCx {
 }
 
 pub struct ConcurrentState<T> {
-    guest_task: Option<TaskId<T>>,
+    guest_task: Option<TableId<GuestTask<T>>>,
     futures: ReadyChunks<FuturesUnordered<HostTaskFuture<T>>>,
-    table: TaskTable<T>,
+    table: Table,
     async_state: AsyncState,
     result: Option<Box<dyn Any + Send + Sync>>,
-    sync_task_queue: VecDeque<TaskId<T>>,
+    sync_task_queue: VecDeque<TableId<GuestTask<T>>>,
 }
 
 impl<T> Default for ConcurrentState<T> {
     fn default() -> Self {
         Self {
             guest_task: None,
-            table: TaskTable::new(),
+            table: Table::new(),
             futures: FuturesUnordered::new().ready_chunks(1024),
             async_state: AsyncState {
                 current_suspend: UnsafeCell::new(ptr::null()),
@@ -281,6 +1114,7 @@ fn dummy_waker() -> Waker {
     WAKER.clone().into()
 }
 
+/// TODO: docs
 pub fn for_any<F, R, T>(fun: F) -> F
 where
     F: FnOnce(StoreContextMut<T>) -> R + 'static,
@@ -289,22 +1123,22 @@ where
     fun
 }
 
-pub(crate) fn first_poll<T, R: Send + 'static>(
+pub(crate) fn first_poll<T: 'static, R: Send + 'static>(
     mut store: StoreContextMut<T>,
     future: impl Future<Output = impl FnOnce(StoreContextMut<T>) -> Result<R> + 'static>
         + Send
         + Sync
         + 'static,
     lower: impl FnOnce(StoreContextMut<T>, R) -> Result<()> + Send + Sync + 'static,
-) -> Result<Option<TaskId<T>>> {
+) -> Result<Option<TableId<HostTask<T>>>> {
     let caller = store.concurrent_state().guest_task.unwrap();
     let task = store
         .concurrent_state()
         .table
-        .push_child(Task::Host(HostTask { caller }), caller)?;
+        .push_child(HostTask { caller }, caller)?;
     let mut future = Box::pin(future.map(move |fun| {
         (
-            task.rep,
+            task.rep(),
             Box::new(for_any(move |mut store| {
                 let result = fun(store.as_context_mut())?;
                 lower(store, result)
@@ -339,21 +1173,23 @@ pub(crate) fn poll_and_block<'a, T: 'static, R: Send + Sync + 'static>(
 ) -> Result<(R, StoreContextMut<'a, T>)> {
     let async_cx = AsyncCx::new(&mut store);
     if let Some(caller) = store.concurrent_state().guest_task {
+        let old_result = store
+            .concurrent_state()
+            .table
+            .get_mut(caller)?
+            .result
+            .take();
         let task = store
             .concurrent_state()
             .table
-            .push_child(Task::Host(HostTask { caller }), caller)?;
+            .push_child(HostTask { caller }, caller)?;
         let mut future = Box::pin(future.map(move |fun| {
             (
-                task.rep,
+                task.rep(),
                 Box::new(for_any(move |mut store| {
                     let result = fun(store.as_context_mut())?;
-                    store
-                        .concurrent_state()
-                        .table
-                        .get_mut(caller)?
-                        .unwrap_guest_mut()
-                        .result = Some(Box::new(result) as _);
+                    store.concurrent_state().table.get_mut(caller)?.result =
+                        Some(Box::new(result) as _);
                     Ok(())
                 })) as Box<dyn FnOnce(StoreContextMut<T>) -> Result<()>>,
             )
@@ -367,16 +1203,13 @@ pub(crate) fn poll_and_block<'a, T: 'static, R: Send + Sync + 'static>(
                 Poll::Ready((_, fun)) => {
                     store.concurrent_state().table.delete(task)?;
                     fun(store.as_context_mut())?;
-                    let result = *store
-                        .concurrent_state()
-                        .table
-                        .get_mut(caller)?
-                        .unwrap_guest_mut()
-                        .result
-                        .take()
-                        .unwrap()
-                        .downcast()
-                        .unwrap();
+                    let result = *mem::replace(
+                        &mut store.concurrent_state().table.get_mut(caller)?.result,
+                        old_result,
+                    )
+                    .unwrap()
+                    .downcast()
+                    .unwrap();
                     (result, store)
                 }
                 Poll::Pending => {
@@ -386,10 +1219,10 @@ pub(crate) fn poll_and_block<'a, T: 'static, R: Send + Sync + 'static>(
                             .concurrent_state()
                             .table
                             .get_mut(caller)?
-                            .unwrap_guest_mut()
                             .result
                             .take()
                         {
+                            store.concurrent_state().table.get_mut(caller)?.result = old_result;
                             break (*result.downcast().unwrap(), store);
                         } else {
                             store = unsafe { async_cx.suspend(Some(store))?.unwrap() };
@@ -450,22 +1283,16 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: 'static>(
 
 fn maybe_send_event<'a, T: 'static>(
     mut store: StoreContextMut<'a, T>,
-    guest_task: TaskId<T>,
+    guest_task: TableId<GuestTask<T>>,
     event: u32,
-    call: TaskId<T>,
+    call: u32,
 ) -> Result<StoreContextMut<'a, T>> {
-    if let Some((callback, context)) = store
-        .concurrent_state()
-        .table
-        .get(guest_task)?
-        .unwrap_guest_ref()
-        .callback
-    {
+    if let Some((callback, context)) = store.concurrent_state().table.get(guest_task)?.callback {
         let old_task = store.concurrent_state().guest_task.replace(guest_task);
         let params = &mut [
             ValRaw::u32(context),
             ValRaw::u32(event),
-            ValRaw::u32(call.rep),
+            ValRaw::u32(call),
             ValRaw::i32(0),
         ];
         unsafe {
@@ -478,17 +1305,18 @@ fn maybe_send_event<'a, T: 'static>(
         }
         let done = params[0].get_u32() != 0;
         if done {
+            store.concurrent_state().table.get_mut(guest_task)?.callback = None;
+
             if let Some(next) = store
                 .concurrent_state()
                 .table
                 .get(guest_task)?
-                .unwrap_guest_ref()
                 .caller
                 .as_ref()
                 .map(|c| c.task)
             {
                 store.concurrent_state().table.delete(guest_task)?;
-                store = maybe_send_event(store, next, EVENT_CALL_DONE, guest_task)?;
+                store = maybe_send_event(store, next, EVENT_CALL_DONE, guest_task.rep())?;
             }
         }
         store.concurrent_state().guest_task = old_task;
@@ -497,7 +1325,6 @@ fn maybe_send_event<'a, T: 'static>(
         .concurrent_state()
         .table
         .get_mut(guest_task)?
-        .unwrap_guest_mut()
         .fiber
         .take()
     {
@@ -509,7 +1336,7 @@ fn maybe_send_event<'a, T: 'static>(
 
 fn resume<'a, T: 'static>(
     mut store: StoreContextMut<'a, T>,
-    guest_task: TaskId<T>,
+    guest_task: TableId<GuestTask<T>>,
     mut fiber: StoreFiber,
 ) -> Result<StoreContextMut<'a, T>> {
     match unsafe { resume_fiber(&mut fiber, Some(store), Ok(())) } {
@@ -520,62 +1347,60 @@ fn resume<'a, T: 'static>(
                 .concurrent_state()
                 .table
                 .get(guest_task)?
-                .unwrap_guest_ref()
                 .caller
                 .as_ref()
                 .map(|c| c.task)
             {
                 store.concurrent_state().table.delete(guest_task)?;
-                maybe_send_event(store, next, EVENT_CALL_DONE, guest_task)
+                maybe_send_event(store, next, EVENT_CALL_DONE, guest_task.rep())
             } else {
                 Ok(store)
             }
         }
         Err(new_store) => {
             store = new_store.unwrap();
-            store
-                .concurrent_state()
-                .table
-                .get_mut(guest_task)?
-                .unwrap_guest_mut()
-                .fiber = Some(fiber);
+            store.concurrent_state().table.get_mut(guest_task)?.fiber = Some(fiber);
             Ok(store)
         }
     }
 }
 
-fn poll_loop<'a, T: 'static>(mut store: StoreContextMut<'a, T>) -> Result<StoreContextMut<'a, T>> {
+fn poll_for_result<'a, T: 'static>(
+    mut store: StoreContextMut<'a, T>,
+) -> Result<StoreContextMut<'a, T>> {
     let task = store.concurrent_state().guest_task;
-    while task
-        .map(|task| {
-            Ok::<_, Error>(
-                store
-                    .concurrent_state()
-                    .table
-                    .get(task)?
-                    .unwrap_guest_ref()
-                    .result
-                    .is_none(),
-            )
+    poll_loop(store, move |store| {
+        task.map(|task| {
+            Ok::<_, anyhow::Error>(store.concurrent_state().table.get(task)?.result.is_none())
         })
-        .unwrap_or(Ok(true))?
-    {
+        .unwrap_or(Ok(true))
+    })
+}
+
+fn handle_ready<'a, T: 'static>(
+    mut store: StoreContextMut<'a, T>,
+    ready: Vec<(u32, Box<dyn FnOnce(StoreContextMut<'_, T>) -> Result<()>>)>,
+) -> Result<StoreContextMut<'a, T>> {
+    for (task, fun) in ready {
+        let task = TableId::<HostTask<T>>::new(task);
+        fun(store.as_context_mut())?;
+        let caller = store.concurrent_state().table.delete(task)?.caller;
+        store = maybe_send_event(store, caller, EVENT_CALL_DONE, task.rep())?;
+    }
+    Ok(store)
+}
+
+fn poll_loop<'a, T: 'static>(
+    mut store: StoreContextMut<'a, T>,
+    continue_: impl Fn(&mut StoreContextMut<'a, T>) -> Result<bool>,
+) -> Result<StoreContextMut<'a, T>> {
+    while continue_(&mut store)? {
         let cx = AsyncCx::new(&mut store);
         let mut future = pin!(store.concurrent_state().futures.next());
         let (ready, _) = unsafe { cx.block_on::<T, _>(future.as_mut(), None)? };
 
         if let Some(ready) = ready {
-            for (task, fun) in ready {
-                let task = TaskId::new(task);
-                fun(store.as_context_mut())?;
-                let caller = store
-                    .concurrent_state()
-                    .table
-                    .delete(task)?
-                    .unwrap_host()
-                    .caller;
-                store = maybe_send_event(store, caller, EVENT_CALL_DONE, task)?;
-            }
+            store = handle_ready(store, ready)?;
         } else {
             break;
         }
@@ -586,16 +1411,16 @@ fn poll_loop<'a, T: 'static>(mut store: StoreContextMut<'a, T>) -> Result<StoreC
 
 fn resume_next_sync_task<'a, T: 'static>(
     mut store: StoreContextMut<'a, T>,
-    current_task: TaskId<T>,
+    current_task: TableId<GuestTask<T>>,
 ) -> Result<StoreContextMut<'a, T>> {
     assert_eq!(
-        current_task.rep,
+        current_task.rep(),
         store
             .concurrent_state()
             .sync_task_queue
             .pop_front()
             .unwrap()
-            .rep
+            .rep()
     );
 
     if let Some(next) = store.concurrent_state().sync_task_queue.pop_front() {
@@ -603,7 +1428,6 @@ fn resume_next_sync_task<'a, T: 'static>(
             .concurrent_state()
             .table
             .get_mut(next)?
-            .unwrap_guest_mut()
             .fiber
             .take()
             .unwrap();
@@ -746,7 +1570,7 @@ unsafe fn handle_result<T>(func: impl FnOnce() -> Result<T>) -> T {
     }
 }
 
-pub(crate) extern "C" fn async_start<T>(
+pub(crate) extern "C" fn async_start<T: 'static>(
     cx: *mut VMOpaqueContext,
     _ty: TypeFuncIndex,
     storage: *mut MaybeUninit<ValRaw>,
@@ -763,7 +1587,6 @@ pub(crate) extern "C" fn async_start<T>(
                 .concurrent_state()
                 .table
                 .get_mut(guest_task)?
-                .unwrap_guest_mut()
                 .lower_params
                 .take()
                 .ok_or_else(|| anyhow!("call.start called more than once"))?;
@@ -773,7 +1596,7 @@ pub(crate) extern "C" fn async_start<T>(
     }
 }
 
-pub(crate) extern "C" fn async_return<T>(
+pub(crate) extern "C" fn async_return<T: 'static>(
     cx: *mut VMOpaqueContext,
     _ty: TypeFuncIndex,
     storage: *mut MaybeUninit<ValRaw>,
@@ -790,7 +1613,6 @@ pub(crate) extern "C" fn async_return<T>(
                 .concurrent_state()
                 .table
                 .get_mut(guest_task)?
-                .unwrap_guest_mut()
                 .lift_result
                 .take()
                 .ok_or_else(|| anyhow!("call.return called more than once"))?;
@@ -799,7 +1621,6 @@ pub(crate) extern "C" fn async_return<T>(
                 .concurrent_state()
                 .table
                 .get(guest_task)?
-                .unwrap_guest_ref()
                 .result
                 .is_none());
 
@@ -807,11 +1628,8 @@ pub(crate) extern "C" fn async_return<T>(
                 cx,
                 mem::transmute::<&[MaybeUninit<ValRaw>], &[ValRaw]>(storage),
             )?;
-            cx.concurrent_state()
-                .table
-                .get_mut(guest_task)?
-                .unwrap_guest_mut()
-                .result = result;
+
+            cx.concurrent_state().table.get_mut(guest_task)?.result = result;
 
             Ok(())
         })
@@ -837,8 +1655,8 @@ pub(crate) extern "C" fn async_enter<T: 'static>(
             let start = SendSyncPtr::new(NonNull::new(start).unwrap());
             let return_ = SendSyncPtr::new(NonNull::new(return_).unwrap());
             let old_task = cx.concurrent_state().guest_task.take();
-            let old_task_rep = old_task.map(|v| v.rep);
-            let new_task = Task::Guest(GuestTask {
+            let old_task_rep = old_task.map(|v| v.rep());
+            let new_task = GuestTask {
                 lower_params: Some(Box::new(move |mut cx, dst| {
                     assert!(dst.len() <= MAX_FLAT_PARAMS);
                     let mut src = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
@@ -861,7 +1679,12 @@ pub(crate) extern "C" fn async_enter<T: 'static>(
                     }
                     let task = cx.concurrent_state().guest_task.unwrap();
                     if let Some(rep) = old_task_rep {
-                        cx = maybe_send_event(cx, TaskId::new(rep), EVENT_CALL_STARTED, task)?;
+                        cx = maybe_send_event(
+                            cx,
+                            TableId::new(rep),
+                            EVENT_CALL_STARTED,
+                            task.rep(),
+                        )?;
                     }
                     Ok(cx)
                 })),
@@ -876,7 +1699,12 @@ pub(crate) extern "C" fn async_enter<T: 'static>(
                     )?;
                     let task = cx.concurrent_state().guest_task.unwrap();
                     if let Some(rep) = old_task_rep {
-                        cx = maybe_send_event(cx, TaskId::new(rep), EVENT_CALL_RETURNED, task)?;
+                        cx = maybe_send_event(
+                            cx,
+                            TableId::new(rep),
+                            EVENT_CALL_RETURNED,
+                            task.rep(),
+                        )?;
                     }
                     Ok((None, cx))
                 })),
@@ -888,7 +1716,7 @@ pub(crate) extern "C" fn async_enter<T: 'static>(
                     call,
                 }),
                 fiber: None,
-            });
+            };
             let guest_task = if let Some(old_task) = old_task {
                 cx.concurrent_state().table.push_child(new_task, old_task)
             } else {
@@ -924,17 +1752,12 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                 assert!(param_count <= MAX_FLAT_PARAMS);
                 assert!(result_count <= MAX_FLAT_PARAMS);
 
-                // TODO: check if callee instance has already been entered and, if so, stash the callee in the task
-                // so we can call it later.  Otherwise, mark it as entered, run the following code, and finally
-                // mark it as unentered.
-
                 let mut fiber = make_fiber(&mut cx, move |mut cx| {
                     let mut storage = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
                     let lower = cx
                         .concurrent_state()
                         .table
                         .get_mut(guest_task)?
-                        .unwrap_guest_mut()
                         .lower_params
                         .take()
                         .unwrap();
@@ -951,7 +1774,6 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                         .concurrent_state()
                         .table
                         .get_mut(guest_task)?
-                        .unwrap_guest_mut()
                         .lift_result
                         .take()
                         .unwrap();
@@ -960,7 +1782,6 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                         .concurrent_state()
                         .table
                         .get(guest_task)?
-                        .unwrap_guest_ref()
                         .result
                         .is_none());
 
@@ -970,11 +1791,7 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                             &storage[..result_count],
                         ),
                     )?;
-                    cx.concurrent_state()
-                        .table
-                        .get_mut(guest_task)?
-                        .unwrap_guest_mut()
-                        .result = result;
+                    cx.concurrent_state().table.get_mut(guest_task)?.result = result;
 
                     Ok(())
                 })?;
@@ -993,11 +1810,8 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                             }
                             Err(cx) => {
                                 if let Some(mut cx) = cx {
-                                    cx.concurrent_state()
-                                        .table
-                                        .get_mut(guest_task)?
-                                        .unwrap_guest_mut()
-                                        .fiber = Some(fiber);
+                                    cx.concurrent_state().table.get_mut(guest_task)?.fiber =
+                                        Some(fiber);
                                     break cx;
                                 } else {
                                     suspend_fiber::<T>(fiber.suspend, fiber.stack_limit, None)?;
@@ -1006,11 +1820,7 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                         }
                     }
                 } else {
-                    cx.concurrent_state()
-                        .table
-                        .get_mut(guest_task)?
-                        .unwrap_guest_mut()
-                        .fiber = Some(fiber);
+                    cx.concurrent_state().table.get_mut(guest_task)?.fiber = Some(fiber);
                     cx
                 }
             } else {
@@ -1023,17 +1833,12 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                 .concurrent_state()
                 .table
                 .get(guest_task)?
-                .unwrap_guest_ref()
                 .caller
                 .as_ref()
                 .map(|caller| (caller.task, caller.store_call.as_non_null(), caller.call));
             cx.concurrent_state().guest_task = caller.map(|(next, ..)| next);
 
-            let task = cx
-                .concurrent_state()
-                .table
-                .get_mut(guest_task)?
-                .unwrap_guest_mut();
+            let task = cx.concurrent_state().table.get_mut(guest_task)?;
 
             let status = if task.lower_params.is_some() {
                 STATUS_NOT_STARTED
@@ -1053,7 +1858,7 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
 
                 if (flags & EXIT_FLAG_ASYNC_CALLER) != 0 {
                     let (_, store_call, call) = caller.unwrap();
-                    let mut src = [ValRaw::u32(call), ValRaw::u32(guest_task.rep)];
+                    let mut src = [ValRaw::u32(call), ValRaw::u32(guest_task.rep())];
                     crate::Func::call_unchecked_raw(
                         &mut cx,
                         store_call,
@@ -1061,7 +1866,7 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                         src.len(),
                     )?;
                 } else {
-                    poll_loop(cx)?;
+                    poll_for_result(cx)?;
                 }
             } else if status == STATUS_DONE {
                 cx.concurrent_state().table.delete(guest_task)?;
@@ -1072,21 +1877,730 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
     }
 }
 
-pub(crate) fn enter<T: Send>(
+fn transmit_new<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    ty: TableIndex,
+    results: u32,
+) {
+    unsafe {
+        handle_result(|| {
+            let cx = VMComponentContext::from_opaque(vmctx);
+            let instance = (*cx).instance();
+            let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
+            let options = Options::new(
+                cx.0.id(),
+                NonNull::new(memory),
+                None,
+                StringEncoding::Utf8,
+                true,
+                None,
+            );
+            let types = (*instance).component_types();
+            let transmit = cx.concurrent_state().table.push(TransmitState::<T> {
+                ty: match ty {
+                    TableIndex::Future(ty) => TransmitStateIndex::Future(types[ty].ty),
+                    TableIndex::Stream(ty) => TransmitStateIndex::Stream(types[ty].ty),
+                },
+                receive: ReceiveState::Open,
+                send: SendState::Open,
+            })?;
+            let sender = cx
+                .concurrent_state()
+                .table
+                .push_child(TransmitSender(transmit), transmit)?;
+            let receiver = cx
+                .concurrent_state()
+                .table
+                .push_child(TransmitReceiver(transmit), transmit)?;
+            (*instance).handle_table().insert((ty, sender.rep()));
+            (*instance).handle_table().insert((ty, receiver.rep()));
+            let ptr = func::validate_inbounds::<(u32, u32)>(
+                options.memory_mut(cx.0),
+                &ValRaw::u32(results),
+            )?;
+            let mut lower = LowerContext::new(cx, &options, types, instance);
+            sender.rep().store(&mut lower, InterfaceType::U32, ptr)?;
+            receiver
+                .rep()
+                .store(&mut lower, InterfaceType::U32, ptr + 4)?;
+            Ok(())
+        })
+    }
+}
+
+unsafe fn copy<T: 'static>(
+    mut cx: StoreContextMut<'_, T>,
+    ty: TransmitStateIndex,
+    types: &Arc<ComponentTypes>,
+    instance: *mut ComponentInstance,
+    send_options: &Options,
+    send_params: u32,
+    receive_options: &Options,
+    receive_results: u32,
+) -> Result<()> {
+    match ty {
+        TransmitStateIndex::Future(ty) => {
+            let ty = &types[ty];
+            let val = ty
+                .payload
+                .map(|ty| {
+                    let lift = &mut LiftContext::new(cx.0, send_options, types, instance);
+                    Val::load(
+                        lift,
+                        ty,
+                        &lift.memory()[usize::try_from(send_params).unwrap()..]
+                            [..usize::try_from(types.canonical_abi(&ty).size32).unwrap()],
+                    )
+                })
+                .transpose()?;
+
+            let mut lower =
+                LowerContext::new(cx.as_context_mut(), receive_options, types, instance);
+            Val::Result(Ok(val.map(Box::new))).store(
+                &mut lower,
+                InterfaceType::Result(ty.receive_result),
+                usize::try_from(receive_results).unwrap(),
+            )?;
+        }
+        TransmitStateIndex::Stream(ty) => {
+            let ty = &types[ty];
+            let lift = &mut LiftContext::new(cx.0, send_options, types, instance);
+            let val = Val::load(
+                lift,
+                InterfaceType::List(ty.list),
+                &lift.memory()[usize::try_from(send_params).unwrap()..][..usize::try_from(
+                    types.canonical_abi(&InterfaceType::List(ty.list)).size32,
+                )
+                .unwrap()],
+            )?;
+
+            let mut lower =
+                LowerContext::new(cx.as_context_mut(), receive_options, types, instance);
+            Val::Option(Some(Box::new(Val::Result(Ok(Some(Box::new(val))))))).store(
+                &mut lower,
+                InterfaceType::Option(ty.receive_option),
+                usize::try_from(receive_results).unwrap(),
+            )?;
+        }
+        TransmitStateIndex::Unknown => unreachable!(),
+    }
+
+    Ok(())
+}
+
+fn transmit_send<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    table: TableIndex,
+    mut params: u32,
+    results: u32,
+    call: u32,
+) -> u32 {
+    unsafe {
+        handle_result(|| {
+            let cx = VMComponentContext::from_opaque(vmctx);
+            let instance = (*cx).instance();
+            let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
+            let options = Options::new(
+                cx.0.id(),
+                NonNull::new(memory),
+                NonNull::new(realloc),
+                string_encoding,
+                true,
+                None,
+            );
+            let types = (*instance).component_types();
+            let lift = &mut LiftContext::new(cx.0, &options, types, instance);
+            let sender_id = TableId::<TransmitSender<T>>::new(u32::load(
+                lift,
+                InterfaceType::U32,
+                &lift.memory()[usize::try_from(params).unwrap()..][..4],
+            )?);
+            params += 4;
+            if !(*instance).handle_table().remove(&(table, sender_id.rep())) {
+                bail!("invalid handle");
+            }
+            let (sender, ty, entry) = match table {
+                TableIndex::Future(ty) => (
+                    cx.concurrent_state().table.delete(sender_id)?,
+                    TransmitStateIndex::Future(types[ty].ty),
+                    None,
+                ),
+                TableIndex::Stream(ty) => (
+                    *cx.concurrent_state().table.get(sender_id)?,
+                    TransmitStateIndex::Stream(types[ty].ty),
+                    Some((table, sender_id.rep())),
+                ),
+            };
+            let transmit = cx.concurrent_state().table.get_mut(sender.0)?;
+            if ty != transmit.ty {
+                bail!("transmit type mismatch");
+            }
+            let on_done = || {
+                if let Some(entry) = entry {
+                    (*instance).handle_table().insert(entry);
+                }
+            };
+            let new_state = if let ReceiveState::Closed = &transmit.receive {
+                ReceiveState::Closed
+            } else {
+                ReceiveState::Open
+            };
+
+            match mem::replace(&mut transmit.receive, new_state) {
+                ReceiveState::GuestReady {
+                    options: receive_options,
+                    results: receive_results,
+                    instance: _,
+                    tx: _receive_tx,
+                    entry: receive_entry,
+                } => {
+                    let mut lower =
+                        LowerContext::new(cx.as_context_mut(), &options, types, instance);
+                    Ok::<_, Error>(()).store(
+                        &mut lower,
+                        ty.send_result(types),
+                        usize::try_from(results).unwrap(),
+                    )?;
+
+                    copy(
+                        cx.as_context_mut(),
+                        ty,
+                        types,
+                        instance,
+                        &options,
+                        params,
+                        &receive_options,
+                        receive_results,
+                    )?;
+
+                    if let Some(entry) = receive_entry {
+                        (*instance).handle_table().insert(entry);
+                    }
+
+                    on_done();
+
+                    Ok(STATUS_DONE)
+                }
+
+                ReceiveState::HostReady { accept } => {
+                    let lift = &mut LiftContext::new(cx.0, &options, types, instance);
+                    accept(Sender::Guest {
+                        lift,
+                        ty: match ty {
+                            TransmitStateIndex::Future(ty) => types[ty].payload,
+                            TransmitStateIndex::Stream(ty) => {
+                                Some(InterfaceType::List(types[ty].list))
+                            }
+                            TransmitStateIndex::Unknown => unreachable!(),
+                        },
+                        ptr: params,
+                    })?;
+
+                    on_done();
+
+                    Ok(STATUS_DONE)
+                }
+
+                ReceiveState::Open => {
+                    assert!(matches!(&transmit.send, SendState::Open));
+
+                    let caller = cx.concurrent_state().guest_task.unwrap();
+                    let task = cx
+                        .concurrent_state()
+                        .table
+                        .push_child(HostTask { caller }, caller)?;
+                    let (tx, rx) = oneshot::channel();
+                    let future = Box::pin(rx.map(move |_| {
+                        (
+                            task.rep(),
+                            Box::new(for_any(move |_| Ok(())))
+                                as Box<dyn FnOnce(StoreContextMut<T>) -> Result<()>>,
+                        )
+                    })) as HostTaskFuture<T>;
+                    cx.concurrent_state().futures.get_mut().push(future);
+
+                    let transmit = cx.concurrent_state().table.get_mut(sender.0)?;
+                    transmit.send = SendState::GuestReady {
+                        options,
+                        params,
+                        results,
+                        instance: SendSyncPtr::new(NonNull::new(instance).unwrap()),
+                        tx,
+                        entry,
+                        close: false,
+                    };
+
+                    let ptr = func::validate_inbounds::<u32>(
+                        options.memory_mut(cx.0),
+                        &ValRaw::u32(call),
+                    )?;
+                    let mut lower = LowerContext::new(cx, &options, types, instance);
+                    task.rep().store(&mut lower, InterfaceType::U32, ptr)?;
+
+                    Ok(STATUS_NOT_STARTED)
+                }
+
+                ReceiveState::Closed => {
+                    if let TransmitStateIndex::Future(_) = ty {
+                        cx.concurrent_state().table.delete(sender.0)?;
+                    }
+
+                    cx.concurrent_state().table.delete(sender.0)?;
+
+                    let mut lower = LowerContext::new(cx, &options, types, instance);
+                    Err::<(), _>(Error { rep: 0 }).store(
+                        &mut lower,
+                        ty.send_result(types),
+                        usize::try_from(results).unwrap(),
+                    )?;
+
+                    on_done();
+
+                    Ok(STATUS_DONE)
+                }
+            }
+        })
+    }
+}
+
+fn transmit_receive<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    table: TableIndex,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32 {
+    unsafe {
+        handle_result(|| {
+            let cx = VMComponentContext::from_opaque(vmctx);
+            let instance = (*cx).instance();
+            let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
+            let options = Options::new(
+                cx.0.id(),
+                NonNull::new(memory),
+                NonNull::new(realloc),
+                string_encoding,
+                true,
+                None,
+            );
+            let types = (*instance).component_types();
+            let lift = &mut LiftContext::new(cx.0, &options, types, instance);
+            let receiver_id = TableId::<TransmitReceiver<T>>::new(u32::load(
+                lift,
+                InterfaceType::U32,
+                &lift.memory()[usize::try_from(params).unwrap()..][..4],
+            )?);
+            if !(*instance)
+                .handle_table()
+                .remove(&(table, receiver_id.rep()))
+            {
+                bail!("invalid handle");
+            }
+            let (receiver, ty, entry) = match table {
+                TableIndex::Future(ty) => (
+                    cx.concurrent_state().table.delete(receiver_id)?,
+                    TransmitStateIndex::Future(types[ty].ty),
+                    None,
+                ),
+                TableIndex::Stream(ty) => (
+                    *cx.concurrent_state().table.get(receiver_id)?,
+                    TransmitStateIndex::Stream(types[ty].ty),
+                    Some((table, receiver_id.rep())),
+                ),
+            };
+            let transmit = cx.concurrent_state().table.get_mut(receiver.0)?;
+            if ty != transmit.ty {
+                bail!("transmit type mismatch");
+            }
+            let on_done = || {
+                if let Some(entry) = entry {
+                    (*instance).handle_table().insert(entry);
+                }
+            };
+            let new_state = if let SendState::Closed = &transmit.send {
+                SendState::Closed
+            } else {
+                SendState::Open
+            };
+
+            match mem::replace(&mut transmit.send, new_state) {
+                SendState::GuestReady {
+                    options: send_options,
+                    params: send_params,
+                    instance: _,
+                    results: send_results,
+                    tx: _send_tx,
+                    entry: send_entry,
+                    close,
+                } => {
+                    let mut lower =
+                        LowerContext::new(cx.as_context_mut(), &send_options, types, instance);
+                    Ok::<_, Error>(()).store(
+                        &mut lower,
+                        ty.send_result(types),
+                        usize::try_from(send_results).unwrap(),
+                    )?;
+
+                    copy(
+                        cx.as_context_mut(),
+                        ty,
+                        types,
+                        instance,
+                        &send_options,
+                        send_params,
+                        &options,
+                        results,
+                    )?;
+
+                    if close {
+                        cx.concurrent_state().table.get_mut(receiver.0)?.send = SendState::Closed;
+                    } else if let Some(entry) = send_entry {
+                        (*instance).handle_table().insert(entry);
+                    }
+
+                    on_done();
+
+                    Ok(STATUS_DONE)
+                }
+
+                SendState::HostReady { accept, close } => {
+                    let mut lower =
+                        LowerContext::new(cx.as_context_mut(), &options, types, instance);
+                    accept(Receiver::Guest {
+                        lower: &mut lower,
+                        ty: match ty {
+                            TransmitStateIndex::Future(ty) => {
+                                InterfaceType::Result(types[ty].receive_result)
+                            }
+                            TransmitStateIndex::Stream(ty) => {
+                                InterfaceType::Option(types[ty].receive_option)
+                            }
+                            TransmitStateIndex::Unknown => unreachable!(),
+                        },
+                        offset: usize::try_from(results).unwrap(),
+                    })?;
+
+                    if close {
+                        cx.concurrent_state().table.get_mut(receiver.0)?.send = SendState::Closed;
+                    }
+
+                    on_done();
+
+                    Ok(STATUS_DONE)
+                }
+
+                SendState::Open => {
+                    assert!(matches!(&transmit.receive, ReceiveState::Open));
+
+                    let caller = cx.concurrent_state().guest_task.unwrap();
+                    let task = cx
+                        .concurrent_state()
+                        .table
+                        .push_child(HostTask { caller }, caller)?;
+                    let (tx, rx) = oneshot::channel();
+                    let future = Box::pin(rx.map(move |_| {
+                        (
+                            task.rep(),
+                            Box::new(for_any(move |_| Ok(())))
+                                as Box<dyn FnOnce(StoreContextMut<T>) -> Result<()>>,
+                        )
+                    })) as HostTaskFuture<T>;
+                    cx.concurrent_state().futures.get_mut().push(future);
+
+                    let transmit = cx.concurrent_state().table.get_mut(receiver.0)?;
+                    transmit.receive = ReceiveState::GuestReady {
+                        options,
+                        results,
+                        instance: SendSyncPtr::new(NonNull::new(instance).unwrap()),
+                        tx,
+                        entry,
+                    };
+
+                    let ptr = func::validate_inbounds::<u32>(
+                        options.memory_mut(cx.0),
+                        &ValRaw::u32(call),
+                    )?;
+                    let mut lower = LowerContext::new(cx, &options, types, instance);
+                    task.rep().store(&mut lower, InterfaceType::U32, ptr)?;
+
+                    Ok(STATUS_NOT_STARTED)
+                }
+
+                SendState::Closed => {
+                    if let TransmitStateIndex::Future(_) = ty {
+                        cx.concurrent_state().table.delete(receiver.0)?;
+                    }
+
+                    let mut lower = LowerContext::new(cx, &options, types, instance);
+                    match ty {
+                        TransmitStateIndex::Future(ty) => {
+                            Err::<(), _>(Error { rep: 0 }).store(
+                                &mut lower,
+                                InterfaceType::Result(types[ty].receive_result),
+                                usize::try_from(results).unwrap(),
+                            )?;
+                        }
+                        TransmitStateIndex::Stream(ty) => {
+                            Val::Option(None).store(
+                                &mut lower,
+                                InterfaceType::Option(types[ty].receive_option),
+                                usize::try_from(results).unwrap(),
+                            )?;
+                        }
+                        TransmitStateIndex::Unknown => unreachable!(),
+                    }
+
+                    on_done();
+
+                    Ok(STATUS_DONE)
+                }
+            }
+        })
+    }
+}
+
+fn transmit_drop_sender<T: 'static>(vmctx: *mut VMOpaqueContext, ty: TableIndex, sender_rep: u32) {
+    unsafe {
+        handle_result(|| {
+            let cx = VMComponentContext::from_opaque(vmctx);
+            let instance = (*cx).instance();
+            let types = (*instance).component_types();
+            let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
+            if !(*instance).handle_table().remove(&(ty, sender_rep)) {
+                bail!("invalid handle");
+            }
+            let sender = *cx
+                .concurrent_state()
+                .table
+                .get::<TransmitSender<T>>(TableId::new(sender_rep))?;
+            let ty = match ty {
+                TableIndex::Future(ty) => TransmitStateIndex::Future(types[ty].ty),
+                TableIndex::Stream(ty) => TransmitStateIndex::Stream(types[ty].ty),
+            };
+            if ty != cx.concurrent_state().table.get(sender.0)?.ty {
+                bail!("transmit type mismatch");
+            }
+            close_sender(cx, sender_rep)
+        })
+    }
+}
+
+fn transmit_drop_receiver<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    ty: TableIndex,
+    receiver_rep: u32,
+) {
+    unsafe {
+        handle_result(|| {
+            let cx = VMComponentContext::from_opaque(vmctx);
+            let instance = (*cx).instance();
+            let types = (*instance).component_types();
+            let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
+            if !(*instance).handle_table().remove(&(ty, receiver_rep)) {
+                bail!("invalid handle");
+            }
+            let receiver = *cx
+                .concurrent_state()
+                .table
+                .get::<TransmitReceiver<T>>(TableId::new(receiver_rep))?;
+            let ty = match ty {
+                TableIndex::Future(ty) => TransmitStateIndex::Future(types[ty].ty),
+                TableIndex::Stream(ty) => TransmitStateIndex::Stream(types[ty].ty),
+            };
+            if ty != cx.concurrent_state().table.get(receiver.0)?.ty {
+                bail!("transmit type mismatch");
+            }
+            close_receiver(cx, receiver_rep)
+        })
+    }
+}
+
+pub(crate) extern "C" fn future_new<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    ty: TypeFutureTableIndex,
+    results: u32,
+) {
+    transmit_new::<T>(vmctx, memory, TableIndex::Future(ty), results)
+}
+
+pub(crate) extern "C" fn future_send<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    ty: TypeFutureTableIndex,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32 {
+    transmit_send::<T>(
+        vmctx,
+        memory,
+        realloc,
+        string_encoding,
+        TableIndex::Future(ty),
+        params,
+        results,
+        call,
+    )
+}
+
+pub(crate) extern "C" fn future_receive<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    ty: TypeFutureTableIndex,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32 {
+    transmit_receive::<T>(
+        vmctx,
+        memory,
+        realloc,
+        string_encoding,
+        TableIndex::Future(ty),
+        params,
+        results,
+        call,
+    )
+}
+
+pub(crate) extern "C" fn future_drop_sender<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    ty: TypeFutureTableIndex,
+    sender: u32,
+) {
+    transmit_drop_sender::<T>(vmctx, TableIndex::Future(ty), sender)
+}
+
+pub(crate) extern "C" fn future_drop_receiver<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    ty: TypeFutureTableIndex,
+    receiver: u32,
+) {
+    transmit_drop_receiver::<T>(vmctx, TableIndex::Future(ty), receiver)
+}
+
+pub(crate) extern "C" fn stream_new<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    ty: TypeStreamTableIndex,
+    results: u32,
+) {
+    transmit_new::<T>(vmctx, memory, TableIndex::Stream(ty), results)
+}
+
+pub(crate) extern "C" fn stream_send<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    ty: TypeStreamTableIndex,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32 {
+    transmit_send::<T>(
+        vmctx,
+        memory,
+        realloc,
+        string_encoding,
+        TableIndex::Stream(ty),
+        params,
+        results,
+        call,
+    )
+}
+
+pub(crate) extern "C" fn stream_receive<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: StringEncoding,
+    ty: TypeStreamTableIndex,
+    params: u32,
+    results: u32,
+    call: u32,
+) -> u32 {
+    transmit_receive::<T>(
+        vmctx,
+        memory,
+        realloc,
+        string_encoding,
+        TableIndex::Stream(ty),
+        params,
+        results,
+        call,
+    )
+}
+
+pub(crate) extern "C" fn stream_drop_sender<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    ty: TypeStreamTableIndex,
+    sender: u32,
+) {
+    transmit_drop_sender::<T>(vmctx, TableIndex::Stream(ty), sender)
+}
+
+pub(crate) extern "C" fn stream_drop_receiver<T: 'static>(
+    vmctx: *mut VMOpaqueContext,
+    ty: TypeStreamTableIndex,
+    receiver: u32,
+) {
+    transmit_drop_receiver::<T>(vmctx, TableIndex::Stream(ty), receiver)
+}
+
+pub(crate) extern "C" fn error_drop<T>(
+    vmctx: *mut VMOpaqueContext,
+    ty: TypeErrorTableIndex,
+    error: u32,
+) {
+    unsafe {
+        handle_result(|| {
+            let cx = VMComponentContext::from_opaque(vmctx);
+            let instance = (*cx).instance();
+            let count = if let Some(count) = (*instance).error_table().get_mut(&(ty, error)) {
+                assert!(*count > 0);
+                *count -= 1;
+                *count
+            } else {
+                bail!("invalid handle");
+            };
+
+            if count == 0 {
+                (*instance).error_table().remove(&(ty, error));
+            }
+
+            Ok(())
+        })
+    }
+}
+
+pub(crate) fn enter<T: Send + 'static>(
     mut store: StoreContextMut<T>,
     lower_params: Lower<T>,
     lift_result: Lift<T>,
 ) -> Result<()> {
     assert!(store.concurrent_state().guest_task.is_none());
 
-    let guest_task = store.concurrent_state().table.push(Task::Guest(GuestTask {
+    let guest_task = store.concurrent_state().table.push(GuestTask {
         lower_params: Some(lower_params),
         lift_result: Some(lift_result),
         result: None,
         callback: None,
         caller: None,
         fiber: None,
-    }))?;
+    })?;
     store.concurrent_state().guest_task = Some(guest_task);
 
     Ok(())
@@ -1099,29 +2613,77 @@ pub(crate) fn exit<'a, T: Send + 'static, R: 'static>(
 ) -> Result<(R, StoreContextMut<'a, T>)> {
     if guest_context != 0 {
         let guest_task = store.concurrent_state().guest_task.unwrap();
-        store
-            .concurrent_state()
-            .table
-            .get_mut(guest_task)?
-            .unwrap_guest_mut()
-            .callback = Some((SendSyncPtr::new(callback), guest_context));
+        store.concurrent_state().table.get_mut(guest_task)?.callback =
+            Some((SendSyncPtr::new(callback), guest_context));
 
-        {
-            store = poll_loop(store)?;
-        }
+        store = poll_for_result(store)?;
     }
 
-    let guest_task = store.concurrent_state().guest_task.take().unwrap();
+    let guest_task = store.concurrent_state().guest_task.unwrap();
     if let Some(result) = store
         .concurrent_state()
         .table
-        .delete(guest_task)?
-        .unwrap_guest()
+        .get_mut(guest_task)?
         .result
         .take()
     {
+        if store
+            .concurrent_state()
+            .table
+            .get(guest_task)?
+            .callback
+            .is_none()
+        {
+            // The task is finished -- delete it.
+            //
+            // Note that this isn't always the case -- a task may yield a result without completing, in which case
+            // it should be polled until it's completed using `poll_for_completion`.
+            store.concurrent_state().table.delete(guest_task)?;
+            store.concurrent_state().guest_task = None;
+        }
         Ok((*result.downcast().unwrap(), store))
     } else {
+        // All outstanding host tasks completed, but the guest never yielded a result.
         Err(anyhow!(crate::Trap::NoAsyncResult))
+    }
+}
+
+pub(crate) async fn poll<'a, T: Send + 'static>(
+    mut store: StoreContextMut<'a, T>,
+) -> Result<StoreContextMut<'a, T>> {
+    let guest_task = store.concurrent_state().guest_task.unwrap();
+    while store
+        .concurrent_state()
+        .table
+        .get(guest_task)?
+        .callback
+        .is_some()
+    {
+        if let Some(ready) = store.concurrent_state().futures.next().await {
+            store = handle_ready(store, ready)?;
+        } else {
+            break;
+        }
+    }
+
+    Ok(store)
+}
+
+pub(crate) async fn poll_until<'a, T: Send + 'static, U>(
+    mut store: StoreContextMut<'a, T>,
+    future: impl Future<Output = U>,
+) -> Result<(StoreContextMut<'a, T>, U)> {
+    let mut future = Box::pin(future);
+    loop {
+        let ready = pin!(store.concurrent_state().futures.next());
+
+        match future::select(ready, future).await {
+            Either::Left((None, future)) => break Ok((store, future.await)),
+            Either::Left((Some(ready), future_again)) => {
+                store = handle_ready(store, ready)?;
+                future = future_again;
+            }
+            Either::Right((result, _)) => break Ok((store, result)),
+        }
     }
 }

@@ -208,7 +208,7 @@ pub struct LowerContext<'a, T> {
     /// into.
     ///
     /// This pointer is required to be owned by the `store` provided.
-    instance: *mut ComponentInstance,
+    pub(crate) instance: *mut ComponentInstance,
 }
 
 #[doc(hidden)]
@@ -416,7 +416,7 @@ pub struct LiftContext<'a> {
 
     memory: Option<&'a [u8]>,
 
-    instance: *mut ComponentInstance,
+    pub(crate) instance: *mut ComponentInstance,
 
     host_table: &'a mut ResourceTable,
     host_resource_data: &'a mut HostResourceData,

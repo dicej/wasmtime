@@ -338,9 +338,9 @@ impl Func {
     /// Panics if this is called on a function in an asyncronous store. This
     /// only works with functions defined within a synchronous store. Also
     /// panics if `store` does not own this function.
-    pub fn call(
+    pub fn call<U: 'static>(
         &self,
-        mut store: impl AsContextMut,
+        mut store: impl AsContextMut<Data = U>,
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
@@ -371,7 +371,7 @@ impl Func {
         results: &mut [Val],
     ) -> Result<()>
     where
-        T: Send,
+        T: Send + 'static,
     {
         let mut store = store.as_context_mut();
         assert!(
@@ -391,9 +391,9 @@ impl Func {
             })
     }
 
-    fn call_impl(
+    fn call_impl<U: 'static>(
         &self,
-        mut store: impl AsContextMut,
+        mut store: impl AsContextMut<Data = U>,
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
@@ -506,6 +506,11 @@ impl Func {
                 let mut flags = instance.instance().instance_flags(component_instance);
 
                 unsafe {
+                    if !flags.may_enter() {
+                        bail!(crate::Trap::CannotEnterComponent);
+                    }
+                    flags.set_may_enter(false);
+
                     flags.set_may_leave(false);
                     let mut cx =
                         LowerContext::new(store.as_context_mut(), &options, &types, instance_ptr);
@@ -525,6 +530,7 @@ impl Func {
                 let FuncData {
                     options,
                     instance,
+                    component_instance,
                     ty,
                     ..
                 } = store.0[me];
@@ -532,8 +538,12 @@ impl Func {
                 let instance = store.0[instance.0].as_ref().unwrap();
                 let types = instance.component_types().clone();
                 let instance_ptr = instance.instance_ptr();
+                let mut flags = instance.instance().instance_flags(component_instance);
+
+                store.0[me].post_return_arg = Some(ValRaw::i32(0));
 
                 unsafe {
+                    flags.set_needs_post_return(true);
                     Ok((
                         Some(Box::new(lift(
                             &mut LiftContext::new(store.0, &options, &types, instance_ptr),
@@ -819,7 +829,7 @@ impl Func {
         Ok(())
     }
 
-    fn store_args<T>(
+    fn store_args<T: 'static>(
         &self,
         cx: &mut LowerContext<'_, T>,
         params_ty: &TypeTuple,

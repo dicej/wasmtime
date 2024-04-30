@@ -565,7 +565,7 @@ impl Expander for LowerExpander {
         let expanded = quote! {
             unsafe impl #impl_generics wasmtime::component::Lower for #name #ty_generics #where_clause {
                 #[inline]
-                fn lower<T>(
+                fn lower<T: 'static>(
                     &self,
                     cx: &mut #internal::LowerContext<'_, T>,
                     ty: #internal::InterfaceType,
@@ -577,7 +577,7 @@ impl Expander for LowerExpander {
                 }
 
                 #[inline]
-                fn store<T>(
+                fn store<T: 'static>(
                     &self,
                     cx: &mut #internal::LowerContext<'_, T>,
                     ty: #internal::InterfaceType,
@@ -673,7 +673,7 @@ impl Expander for LowerExpander {
         let expanded = quote! {
             unsafe impl #impl_generics wasmtime::component::Lower for #name #ty_generics #where_clause {
                 #[inline]
-                fn lower<T>(
+                fn lower<T: 'static>(
                     &self,
                     cx: &mut #internal::LowerContext<'_, T>,
                     ty: #internal::InterfaceType,
@@ -686,7 +686,7 @@ impl Expander for LowerExpander {
                 }
 
                 #[inline]
-                fn store<T>(
+                fn store<T: 'static>(
                     &self,
                     cx: &mut #internal::LowerContext<'_, T>,
                     ty: #internal::InterfaceType,
@@ -1216,7 +1216,7 @@ pub fn expand_flags(flags: &Flags) -> Result<TokenStream> {
         #component_type_impl
 
         unsafe impl wasmtime::component::Lower for #name {
-            fn lower<T>(
+            fn lower<T: 'static>(
                 &self,
                 cx: &mut #internal::LowerContext<'_, T>,
                 _ty: #internal::InterfaceType,
@@ -1232,7 +1232,7 @@ pub fn expand_flags(flags: &Flags) -> Result<TokenStream> {
                 Ok(())
             }
 
-            fn store<T>(
+            fn store<T: 'static>(
                 &self,
                 cx: &mut #internal::LowerContext<'_, T>,
                 _ty: #internal::InterfaceType,

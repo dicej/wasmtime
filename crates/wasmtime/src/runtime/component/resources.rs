@@ -817,7 +817,7 @@ unsafe impl<T: 'static> ComponentType for Resource<T> {
 }
 
 unsafe impl<T: 'static> Lower for Resource<T> {
-    fn lower<U>(
+    fn lower<U: 'static>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
@@ -827,7 +827,7 @@ unsafe impl<T: 'static> Lower for Resource<T> {
             .lower(cx, InterfaceType::U32, dst)
     }
 
-    fn store<U>(
+    fn store<U: 'static>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
@@ -1099,7 +1099,7 @@ unsafe impl ComponentType for ResourceAny {
 }
 
 unsafe impl Lower for ResourceAny {
-    fn lower<T>(
+    fn lower<T: 'static>(
         &self,
         cx: &mut LowerContext<'_, T>,
         ty: InterfaceType,
@@ -1109,7 +1109,7 @@ unsafe impl Lower for ResourceAny {
             .lower(cx, InterfaceType::U32, dst)
     }
 
-    fn store<T>(
+    fn store<T: 'static>(
         &self,
         cx: &mut LowerContext<'_, T>,
         ty: InterfaceType,

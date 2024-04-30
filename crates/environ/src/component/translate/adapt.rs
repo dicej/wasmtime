@@ -310,6 +310,9 @@ fn fact_import_to_core_def(
         fact::Import::AsyncExitCall(callback) => simple_intrinsic(dfg::Trampoline::AsyncExitCall(
             callback.clone().map(|v| dfg.callbacks.push(v)),
         )),
+        fact::Import::FutureTransfer => simple_intrinsic(dfg::Trampoline::FutureTransfer),
+        fact::Import::StreamTransfer => simple_intrinsic(dfg::Trampoline::StreamTransfer),
+        fact::Import::ErrorTransfer => simple_intrinsic(dfg::Trampoline::ErrorTransfer),
     }
 }
 

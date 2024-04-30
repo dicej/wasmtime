@@ -4,7 +4,9 @@ use crate::component::{ComponentInstance, VMComponentContext};
 use anyhow::{anyhow, Result};
 use std::cell::Cell;
 use std::slice;
-use wasmtime_environ::component::TypeResourceTableIndex;
+use wasmtime_environ::component::{
+    TypeErrorTableIndex, TypeFutureTableIndex, TypeResourceTableIndex, TypeStreamTableIndex,
+};
 
 const UTF16_TAG: usize = 1 << 31;
 
@@ -569,4 +571,43 @@ unsafe fn resource_enter_call(vmctx: *mut VMComponentContext) -> Result<()> {
 
 unsafe fn resource_exit_call(vmctx: *mut VMComponentContext) -> Result<()> {
     ComponentInstance::from_vmctx(vmctx, |instance| instance.resource_exit_call())
+}
+
+unsafe fn future_transfer(
+    vmctx: *mut VMComponentContext,
+    src_idx: u32,
+    src_table: u32,
+    dst_table: u32,
+) -> Result<u32> {
+    let src_table = TypeFutureTableIndex::from_u32(src_table);
+    let dst_table = TypeFutureTableIndex::from_u32(dst_table);
+    ComponentInstance::from_vmctx(vmctx, |instance| {
+        instance.future_transfer(src_idx, src_table, dst_table)
+    })
+}
+
+unsafe fn stream_transfer(
+    vmctx: *mut VMComponentContext,
+    src_idx: u32,
+    src_table: u32,
+    dst_table: u32,
+) -> Result<u32> {
+    let src_table = TypeStreamTableIndex::from_u32(src_table);
+    let dst_table = TypeStreamTableIndex::from_u32(dst_table);
+    ComponentInstance::from_vmctx(vmctx, |instance| {
+        instance.stream_transfer(src_idx, src_table, dst_table)
+    })
+}
+
+unsafe fn error_transfer(
+    vmctx: *mut VMComponentContext,
+    src_idx: u32,
+    src_table: u32,
+    dst_table: u32,
+) -> Result<u32> {
+    let src_table = TypeErrorTableIndex::from_u32(src_table);
+    let dst_table = TypeErrorTableIndex::from_u32(dst_table);
+    ComponentInstance::from_vmctx(vmctx, |instance| {
+        instance.error_transfer(src_idx, src_table, dst_table)
+    })
 }

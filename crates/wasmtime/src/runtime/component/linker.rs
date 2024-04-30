@@ -536,7 +536,10 @@ impl<T> LinkerInstance<'_, T> {
         &mut self,
         name: &str,
         func: impl Fn(StoreContextMut<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: 'static,
+    {
         self.insert(name, Definition::Func(HostFunc::new_dynamic(func)))?;
         Ok(())
     }
@@ -549,6 +552,7 @@ impl<T> LinkerInstance<'_, T> {
     #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn func_new_async<F>(&mut self, name: &str, f: F) -> Result<()>
     where
+        T: 'static,
         F: for<'a> Fn(
                 StoreContextMut<'a, T>,
                 &'a [Val],
