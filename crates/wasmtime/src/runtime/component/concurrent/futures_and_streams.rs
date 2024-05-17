@@ -31,8 +31,13 @@ use {
 
 // TODO: add `validate_inbounds` calls where appropriate
 
-// TODO: Many of these functions are used for both futures and streams using runtime branches for specialization.
-// We should consider using generics instead to move those branches to compile time.
+// TODO: Many of the functions in this module are used for both futures and streams, using runtime branches for
+// specialization.  We should consider using generics instead to move those branches to compile time.
+
+// TODO: guest-to-guest transmissions currently require `Val` and are very slow (e.g. item-by-item list element
+// lifting and lowering, even for primitive types).  We should add an optimized fast path for all flat payload
+// types (i.e. those whith no pointers or handles) which crates/cranelift/compiler/component.rs can select when
+// appropriate, only falling back to the slow path for non-flat types.
 
 fn receive_result(ty: TableIndex, types: &Arc<ComponentTypes>) -> InterfaceType {
     match ty {
