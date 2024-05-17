@@ -232,7 +232,7 @@ pub struct VMComponentContext {
 }
 
 /// TODO: docs
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TableIndex {
     /// TODO: docs
     Future(TypeFutureTableIndex),

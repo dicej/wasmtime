@@ -29,8 +29,7 @@ use std::{
 use table::{Table, TableId};
 use wasmtime_environ::component::{
     CanonicalAbiInfo, ComponentTypes, InterfaceType, StringEncoding, TypeErrorTableIndex,
-    TypeFuncIndex, TypeFutureIndex, TypeFutureTableIndex, TypeStreamIndex, TypeStreamTableIndex,
-    MAX_FLAT_PARAMS,
+    TypeFuncIndex, TypeFutureTableIndex, TypeStreamTableIndex, MAX_FLAT_PARAMS,
 };
 use wasmtime_fiber::{Fiber, Suspend};
 use wasmtime_runtime::{
@@ -56,6 +55,27 @@ const EVENT_CALL_DONE: u32 = 2;
 const ENTER_FLAG_EXPECT_RETPTR: u32 = 1 << 0;
 const EXIT_FLAG_ASYNC_CALLER: u32 = 1 << 0;
 const EXIT_FLAG_ASYNC_CALLEE: u32 = 1 << 1;
+
+fn receive_result(ty: TableIndex, types: &Arc<ComponentTypes>) -> InterfaceType {
+    match ty {
+        TableIndex::Future(ty) => InterfaceType::Result(types[ty].receive_result),
+        TableIndex::Stream(ty) => InterfaceType::Option(types[ty].receive_option),
+    }
+}
+
+fn send_result(ty: TableIndex, types: &Arc<ComponentTypes>) -> InterfaceType {
+    InterfaceType::Result(match ty {
+        TableIndex::Future(ty) => types[ty].send_result,
+        TableIndex::Stream(ty) => types[ty].send_result,
+    })
+}
+
+fn payload(ty: TableIndex, types: &Arc<ComponentTypes>) -> Option<InterfaceType> {
+    match ty {
+        TableIndex::Future(ty) => types[types[ty].ty].payload,
+        TableIndex::Stream(ty) => Some(InterfaceType::List(types[types[ty].ty].list)),
+    }
+}
 
 fn send<
     T: func::Lower + Send + Sync + 'static,
@@ -101,6 +121,7 @@ fn send<
         }
 
         ReceiveState::GuestReady {
+            ty,
             options,
             results,
             instance,
@@ -108,14 +129,13 @@ fn send<
             entry,
         } => unsafe {
             let types = (*instance.as_ptr()).component_types();
-            let ty = match transmit.ty {
-                TransmitStateIndex::Future(ty) => InterfaceType::Result(types[ty].receive_result),
-                TransmitStateIndex::Stream(ty) => InterfaceType::Option(types[ty].receive_option),
-                TransmitStateIndex::Unknown => unreachable!(),
-            };
             let lower =
                 &mut LowerContext::new(store.as_context_mut(), &options, types, instance.as_ptr());
-            wrap(value).store(lower, ty, usize::try_from(results).unwrap())?;
+            wrap(value).store(
+                lower,
+                receive_result(ty, types),
+                usize::try_from(results).unwrap(),
+            )?;
 
             if let Some(entry) = entry {
                 (*instance.as_ptr()).handle_table().insert(entry);
@@ -188,6 +208,7 @@ pub fn receive<T: func::Lift + Sync + Send + 'static, U: 'static, S: AsContextMu
         }
 
         SendState::GuestReady {
+            ty,
             options,
             params,
             results,
@@ -197,29 +218,24 @@ pub fn receive<T: func::Lift + Sync + Send + 'static, U: 'static, S: AsContextMu
             close,
         } => unsafe {
             let types = (*instance.as_ptr()).component_types();
-            let ty = match transmit.ty {
-                TransmitStateIndex::Future(ty) => types[ty].payload,
-                TransmitStateIndex::Stream(ty) => Some(InterfaceType::List(types[ty].list)),
-                TransmitStateIndex::Unknown => unreachable!(),
-            };
-            let send_result = transmit.ty.send_result(types);
             let lift = &mut LiftContext::new(store.0, &options, types, instance.as_ptr());
             _ = tx.send(
-                ty.map(|ty| {
-                    T::load(
-                        lift,
-                        ty,
-                        &lift.memory()[usize::try_from(params).unwrap()..][..T::SIZE32],
-                    )
-                })
-                .transpose()?,
+                payload(ty, types)
+                    .map(|ty| {
+                        T::load(
+                            lift,
+                            ty,
+                            &lift.memory()[usize::try_from(params).unwrap()..][..T::SIZE32],
+                        )
+                    })
+                    .transpose()?,
             );
 
             let mut lower =
                 LowerContext::new(store.as_context_mut(), &options, types, instance.as_ptr());
             Ok::<(), Error>(()).store(
                 &mut lower,
-                send_result,
+                send_result(ty, types),
                 usize::try_from(results).unwrap(),
             )?;
 
@@ -284,6 +300,7 @@ fn close_sender<U: 'static, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -
 
     match mem::replace(&mut transmit.receive, new_state) {
         ReceiveState::GuestReady {
+            ty,
             options,
             results,
             instance,
@@ -291,26 +308,24 @@ fn close_sender<U: 'static, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -
             entry,
         } => unsafe {
             let types = (*instance.as_ptr()).component_types();
-            let ty = transmit.ty;
             let mut lower =
                 LowerContext::new(store.as_context_mut(), &options, types, instance.as_ptr());
 
             match ty {
-                TransmitStateIndex::Future(ty) => {
+                TableIndex::Future(ty) => {
                     Err::<(), _>(Error { rep: 0 }).store(
                         &mut lower,
                         InterfaceType::Result(types[ty].receive_result),
                         usize::try_from(results).unwrap(),
                     )?;
                 }
-                TransmitStateIndex::Stream(ty) => {
+                TableIndex::Stream(ty) => {
                     Val::Option(None).store(
                         &mut lower,
                         InterfaceType::Option(types[ty].receive_option),
                         usize::try_from(results).unwrap(),
                     )?;
                 }
-                TransmitStateIndex::Unknown => unreachable!(),
             }
 
             if let Some(entry) = entry {
@@ -349,6 +364,7 @@ fn close_receiver<U: 'static, S: AsContextMut<Data = U>>(mut store: S, rep: u32)
 
     match mem::replace(&mut transmit.send, new_state) {
         SendState::GuestReady {
+            ty,
             options,
             params: _,
             instance,
@@ -358,12 +374,11 @@ fn close_receiver<U: 'static, S: AsContextMut<Data = U>>(mut store: S, rep: u32)
             close,
         } => unsafe {
             let types = (*instance.as_ptr()).component_types();
-            let ty = transmit.ty;
             let mut lower =
                 LowerContext::new(store.as_context_mut(), &options, types, instance.as_ptr());
             Err::<(), _>(Error { rep: 0 }).store(
                 &mut lower,
-                ty.send_result(types),
+                send_result(ty, types),
                 usize::try_from(results).unwrap(),
             )?;
 
@@ -436,27 +451,6 @@ impl<T> FutureReceiver<T> {
     ) -> Result<u32> {
         match ty {
             InterfaceType::Future(dst) => {
-                let lower_ty = unsafe { (*cx.instance).component_types()[dst].ty };
-
-                let transmit = cx
-                    .store
-                    .concurrent_state()
-                    .table
-                    .get(TableId::<TransmitReceiver<U>>::new(self.rep))?
-                    .0;
-                let transmit = cx.store.concurrent_state().table.get_mut(transmit)?;
-                match transmit.ty {
-                    TransmitStateIndex::Future(ty) => {
-                        if lower_ty != ty {
-                            bail!("mismatched future types");
-                        }
-                    }
-                    TransmitStateIndex::Stream(_) => bail!("expected future, got stream"),
-                    TransmitStateIndex::Unknown => {
-                        transmit.ty = TransmitStateIndex::Future(lower_ty);
-                    }
-                }
-
                 unsafe {
                     assert!((*cx.instance)
                         .handle_table()
@@ -549,7 +543,6 @@ pub fn future<T, U: 'static, S: AsContextMut<Data = U>>(
 ) -> Result<(FutureSender<T>, FutureReceiver<T>)> {
     let mut store = store.as_context_mut();
     let transmit = store.concurrent_state().table.push(TransmitState::<U> {
-        ty: TransmitStateIndex::Unknown,
         receive: ReceiveState::Open,
         send: SendState::Open,
     })?;
@@ -623,27 +616,6 @@ impl<T> StreamReceiver<T> {
     ) -> Result<u32> {
         match ty {
             InterfaceType::Stream(dst) => {
-                let lower_ty = unsafe { (*cx.instance).component_types()[dst].ty };
-
-                let transmit = cx
-                    .store
-                    .concurrent_state()
-                    .table
-                    .get(TableId::<TransmitReceiver<U>>::new(self.rep))?
-                    .0;
-                let transmit = cx.store.concurrent_state().table.get_mut(transmit)?;
-                match transmit.ty {
-                    TransmitStateIndex::Stream(ty) => {
-                        if lower_ty != ty {
-                            bail!("mismatched stream types");
-                        }
-                    }
-                    TransmitStateIndex::Future(_) => bail!("expected stream, got future"),
-                    TransmitStateIndex::Unknown => {
-                        transmit.ty = TransmitStateIndex::Stream(lower_ty);
-                    }
-                }
-
                 unsafe {
                     assert!((*cx.instance)
                         .handle_table()
@@ -736,7 +708,6 @@ pub fn stream<T, U: 'static, S: AsContextMut<Data = U>>(
 ) -> Result<(StreamSender<T>, StreamReceiver<T>)> {
     let mut store = store.as_context_mut();
     let transmit = store.concurrent_state().table.push(TransmitState::<U> {
-        ty: TransmitStateIndex::Unknown,
         receive: ReceiveState::Open,
         send: SendState::Open,
     })?;
@@ -842,25 +813,7 @@ unsafe impl func::Lift for Error {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TransmitStateIndex {
-    Future(TypeFutureIndex),
-    Stream(TypeStreamIndex),
-    Unknown,
-}
-
-impl TransmitStateIndex {
-    fn send_result(self, types: &Arc<ComponentTypes>) -> InterfaceType {
-        InterfaceType::Result(match self {
-            TransmitStateIndex::Future(ty) => types[ty].send_result,
-            TransmitStateIndex::Stream(ty) => types[ty].send_result,
-            TransmitStateIndex::Unknown => unreachable!(),
-        })
-    }
-}
-
 struct TransmitState<T> {
-    ty: TransmitStateIndex,
     send: SendState<T>,
     receive: ReceiveState,
 }
@@ -888,6 +841,7 @@ impl<T> Copy for TransmitReceiver<T> {}
 enum SendState<T> {
     Open,
     GuestReady {
+        ty: TableIndex,
         options: Options,
         params: u32,
         results: u32,
@@ -906,6 +860,7 @@ enum SendState<T> {
 enum ReceiveState {
     Open,
     GuestReady {
+        ty: TableIndex,
         options: Options,
         results: u32,
         instance: SendSyncPtr<ComponentInstance>,
@@ -1898,10 +1853,6 @@ fn transmit_new<T: 'static>(
             );
             let types = (*instance).component_types();
             let transmit = cx.concurrent_state().table.push(TransmitState::<T> {
-                ty: match ty {
-                    TableIndex::Future(ty) => TransmitStateIndex::Future(types[ty].ty),
-                    TableIndex::Stream(ty) => TransmitStateIndex::Stream(types[ty].ty),
-                },
                 receive: ReceiveState::Open,
                 send: SendState::Open,
             })?;
@@ -1931,18 +1882,18 @@ fn transmit_new<T: 'static>(
 
 unsafe fn copy<T: 'static>(
     mut cx: StoreContextMut<'_, T>,
-    ty: TransmitStateIndex,
     types: &Arc<ComponentTypes>,
     instance: *mut ComponentInstance,
+    send_ty: TableIndex,
     send_options: &Options,
     send_params: u32,
+    receive_ty: TableIndex,
     receive_options: &Options,
     receive_results: u32,
 ) -> Result<()> {
-    match ty {
-        TransmitStateIndex::Future(ty) => {
-            let ty = &types[ty];
-            let val = ty
+    match (send_ty, receive_ty) {
+        (TableIndex::Future(send_ty), TableIndex::Future(receive_ty)) => {
+            let val = types[types[send_ty].ty]
                 .payload
                 .map(|ty| {
                     let lift = &mut LiftContext::new(cx.0, send_options, types, instance);
@@ -1959,31 +1910,29 @@ unsafe fn copy<T: 'static>(
                 LowerContext::new(cx.as_context_mut(), receive_options, types, instance);
             Val::Result(Ok(val.map(Box::new))).store(
                 &mut lower,
-                InterfaceType::Result(ty.receive_result),
+                InterfaceType::Result(types[receive_ty].receive_result),
                 usize::try_from(receive_results).unwrap(),
             )?;
         }
-        TransmitStateIndex::Stream(ty) => {
-            let ty = &types[ty];
+        (TableIndex::Stream(send_ty), TableIndex::Stream(receive_ty)) => {
             let lift = &mut LiftContext::new(cx.0, send_options, types, instance);
+            let list = InterfaceType::List(types[types[send_ty].ty].list);
             let val = Val::load(
                 lift,
-                InterfaceType::List(ty.list),
-                &lift.memory()[usize::try_from(send_params).unwrap()..][..usize::try_from(
-                    types.canonical_abi(&InterfaceType::List(ty.list)).size32,
-                )
-                .unwrap()],
+                list,
+                &lift.memory()[usize::try_from(send_params).unwrap()..]
+                    [..usize::try_from(types.canonical_abi(&list).size32).unwrap()],
             )?;
 
             let mut lower =
                 LowerContext::new(cx.as_context_mut(), receive_options, types, instance);
             Val::Option(Some(Box::new(Val::Result(Ok(Some(Box::new(val))))))).store(
                 &mut lower,
-                InterfaceType::Option(ty.receive_option),
+                InterfaceType::Option(types[receive_ty].receive_option),
                 usize::try_from(receive_results).unwrap(),
             )?;
         }
-        TransmitStateIndex::Unknown => unreachable!(),
+        _ => unreachable!(),
     }
 
     Ok(())
@@ -1994,7 +1943,7 @@ fn transmit_send<T: 'static>(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     string_encoding: StringEncoding,
-    table: TableIndex,
+    ty: TableIndex,
     mut params: u32,
     results: u32,
     call: u32,
@@ -2020,59 +1969,40 @@ fn transmit_send<T: 'static>(
                 &lift.memory()[usize::try_from(params).unwrap()..][..4],
             )?);
             params += 4;
-            if !(*instance).handle_table().remove(&(table, sender_id.rep())) {
+            if !(*instance).handle_table().remove(&(ty, sender_id.rep())) {
                 bail!("invalid handle");
             }
-            let (sender, ty, entry) = match table {
-                TableIndex::Future(ty) => (
-                    cx.concurrent_state().table.delete(sender_id)?,
-                    TransmitStateIndex::Future(types[ty].ty),
-                    None,
-                ),
-                TableIndex::Stream(ty) => (
+            let (sender, entry) = match ty {
+                TableIndex::Future(_) => (cx.concurrent_state().table.delete(sender_id)?, None),
+                TableIndex::Stream(_) => (
                     *cx.concurrent_state().table.get(sender_id)?,
-                    TransmitStateIndex::Stream(types[ty].ty),
-                    Some((table, sender_id.rep())),
+                    Some((ty, sender_id.rep())),
                 ),
             };
             let transmit = cx.concurrent_state().table.get_mut(sender.0)?;
-            if ty != transmit.ty {
-                bail!("transmit type mismatch");
-            }
-            let on_done = || {
-                if let Some(entry) = entry {
-                    (*instance).handle_table().insert(entry);
-                }
-            };
             let new_state = if let ReceiveState::Closed = &transmit.receive {
                 ReceiveState::Closed
             } else {
                 ReceiveState::Open
             };
 
-            match mem::replace(&mut transmit.receive, new_state) {
+            let status = match mem::replace(&mut transmit.receive, new_state) {
                 ReceiveState::GuestReady {
+                    ty: receive_ty,
                     options: receive_options,
                     results: receive_results,
                     instance: _,
                     tx: _receive_tx,
                     entry: receive_entry,
                 } => {
-                    let mut lower =
-                        LowerContext::new(cx.as_context_mut(), &options, types, instance);
-                    Ok::<_, Error>(()).store(
-                        &mut lower,
-                        ty.send_result(types),
-                        usize::try_from(results).unwrap(),
-                    )?;
-
                     copy(
                         cx.as_context_mut(),
-                        ty,
                         types,
                         instance,
+                        ty,
                         &options,
                         params,
+                        receive_ty,
                         &receive_options,
                         receive_results,
                     )?;
@@ -2081,28 +2011,18 @@ fn transmit_send<T: 'static>(
                         (*instance).handle_table().insert(entry);
                     }
 
-                    on_done();
-
-                    Ok(STATUS_DONE)
+                    STATUS_DONE
                 }
 
                 ReceiveState::HostReady { accept } => {
                     let lift = &mut LiftContext::new(cx.0, &options, types, instance);
                     accept(Sender::Guest {
                         lift,
-                        ty: match ty {
-                            TransmitStateIndex::Future(ty) => types[ty].payload,
-                            TransmitStateIndex::Stream(ty) => {
-                                Some(InterfaceType::List(types[ty].list))
-                            }
-                            TransmitStateIndex::Unknown => unreachable!(),
-                        },
+                        ty: payload(ty, types),
                         ptr: params,
                     })?;
 
-                    on_done();
-
-                    Ok(STATUS_DONE)
+                    STATUS_DONE
                 }
 
                 ReceiveState::Open => {
@@ -2125,6 +2045,7 @@ fn transmit_send<T: 'static>(
 
                     let transmit = cx.concurrent_state().table.get_mut(sender.0)?;
                     transmit.send = SendState::GuestReady {
+                        ty,
                         options,
                         params,
                         results,
@@ -2138,31 +2059,38 @@ fn transmit_send<T: 'static>(
                         options.memory_mut(cx.0),
                         &ValRaw::u32(call),
                     )?;
-                    let mut lower = LowerContext::new(cx, &options, types, instance);
+                    let mut lower =
+                        LowerContext::new(cx.as_context_mut(), &options, types, instance);
                     task.rep().store(&mut lower, InterfaceType::U32, ptr)?;
 
-                    Ok(STATUS_NOT_STARTED)
+                    STATUS_NOT_STARTED
                 }
 
                 ReceiveState::Closed => {
-                    if let TransmitStateIndex::Future(_) = ty {
+                    if let TableIndex::Future(_) = ty {
                         cx.concurrent_state().table.delete(sender.0)?;
                     }
 
                     cx.concurrent_state().table.delete(sender.0)?;
 
-                    let mut lower = LowerContext::new(cx, &options, types, instance);
-                    Err::<(), _>(Error { rep: 0 }).store(
-                        &mut lower,
-                        ty.send_result(types),
-                        usize::try_from(results).unwrap(),
-                    )?;
+                    STATUS_DONE
+                }
+            };
 
-                    on_done();
+            if status == STATUS_DONE {
+                let mut lower = LowerContext::new(cx.as_context_mut(), &options, types, instance);
+                Ok::<_, Error>(()).store(
+                    &mut lower,
+                    send_result(ty, types),
+                    usize::try_from(results).unwrap(),
+                )?;
 
-                    Ok(STATUS_DONE)
+                if let Some(entry) = entry {
+                    (*instance).handle_table().insert(entry);
                 }
             }
+
+            Ok(status)
         })
     }
 }
@@ -2172,7 +2100,7 @@ fn transmit_receive<T: 'static>(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     string_encoding: StringEncoding,
-    table: TableIndex,
+    ty: TableIndex,
     params: u32,
     results: u32,
     call: u32,
@@ -2197,41 +2125,26 @@ fn transmit_receive<T: 'static>(
                 InterfaceType::U32,
                 &lift.memory()[usize::try_from(params).unwrap()..][..4],
             )?);
-            if !(*instance)
-                .handle_table()
-                .remove(&(table, receiver_id.rep()))
-            {
+            if !(*instance).handle_table().remove(&(ty, receiver_id.rep())) {
                 bail!("invalid handle");
             }
-            let (receiver, ty, entry) = match table {
-                TableIndex::Future(ty) => (
-                    cx.concurrent_state().table.delete(receiver_id)?,
-                    TransmitStateIndex::Future(types[ty].ty),
-                    None,
-                ),
-                TableIndex::Stream(ty) => (
+            let (receiver, entry) = match ty {
+                TableIndex::Future(_) => (cx.concurrent_state().table.delete(receiver_id)?, None),
+                TableIndex::Stream(_) => (
                     *cx.concurrent_state().table.get(receiver_id)?,
-                    TransmitStateIndex::Stream(types[ty].ty),
-                    Some((table, receiver_id.rep())),
+                    Some((ty, receiver_id.rep())),
                 ),
             };
             let transmit = cx.concurrent_state().table.get_mut(receiver.0)?;
-            if ty != transmit.ty {
-                bail!("transmit type mismatch");
-            }
-            let on_done = || {
-                if let Some(entry) = entry {
-                    (*instance).handle_table().insert(entry);
-                }
-            };
             let new_state = if let SendState::Closed = &transmit.send {
                 SendState::Closed
             } else {
                 SendState::Open
             };
 
-            match mem::replace(&mut transmit.send, new_state) {
+            let status = match mem::replace(&mut transmit.send, new_state) {
                 SendState::GuestReady {
+                    ty: send_ty,
                     options: send_options,
                     params: send_params,
                     instance: _,
@@ -2244,17 +2157,18 @@ fn transmit_receive<T: 'static>(
                         LowerContext::new(cx.as_context_mut(), &send_options, types, instance);
                     Ok::<_, Error>(()).store(
                         &mut lower,
-                        ty.send_result(types),
+                        send_result(send_ty, types),
                         usize::try_from(send_results).unwrap(),
                     )?;
 
                     copy(
                         cx.as_context_mut(),
-                        ty,
                         types,
                         instance,
+                        send_ty,
                         &send_options,
                         send_params,
+                        ty,
                         &options,
                         results,
                     )?;
@@ -2265,9 +2179,7 @@ fn transmit_receive<T: 'static>(
                         (*instance).handle_table().insert(entry);
                     }
 
-                    on_done();
-
-                    Ok(STATUS_DONE)
+                    STATUS_DONE
                 }
 
                 SendState::HostReady { accept, close } => {
@@ -2275,15 +2187,7 @@ fn transmit_receive<T: 'static>(
                         LowerContext::new(cx.as_context_mut(), &options, types, instance);
                     accept(Receiver::Guest {
                         lower: &mut lower,
-                        ty: match ty {
-                            TransmitStateIndex::Future(ty) => {
-                                InterfaceType::Result(types[ty].receive_result)
-                            }
-                            TransmitStateIndex::Stream(ty) => {
-                                InterfaceType::Option(types[ty].receive_option)
-                            }
-                            TransmitStateIndex::Unknown => unreachable!(),
-                        },
+                        ty: receive_result(ty, types),
                         offset: usize::try_from(results).unwrap(),
                     })?;
 
@@ -2291,9 +2195,7 @@ fn transmit_receive<T: 'static>(
                         cx.concurrent_state().table.get_mut(receiver.0)?.send = SendState::Closed;
                     }
 
-                    on_done();
-
-                    Ok(STATUS_DONE)
+                    STATUS_DONE
                 }
 
                 SendState::Open => {
@@ -2316,6 +2218,7 @@ fn transmit_receive<T: 'static>(
 
                     let transmit = cx.concurrent_state().table.get_mut(receiver.0)?;
                     transmit.receive = ReceiveState::GuestReady {
+                        ty,
                         options,
                         results,
                         instance: SendSyncPtr::new(NonNull::new(instance).unwrap()),
@@ -2330,94 +2233,71 @@ fn transmit_receive<T: 'static>(
                     let mut lower = LowerContext::new(cx, &options, types, instance);
                     task.rep().store(&mut lower, InterfaceType::U32, ptr)?;
 
-                    Ok(STATUS_NOT_STARTED)
+                    STATUS_NOT_STARTED
                 }
 
                 SendState::Closed => {
-                    if let TransmitStateIndex::Future(_) = ty {
+                    if let TableIndex::Future(_) = ty {
                         cx.concurrent_state().table.delete(receiver.0)?;
                     }
 
                     let mut lower = LowerContext::new(cx, &options, types, instance);
                     match ty {
-                        TransmitStateIndex::Future(ty) => {
+                        TableIndex::Future(ty) => {
                             Err::<(), _>(Error { rep: 0 }).store(
                                 &mut lower,
                                 InterfaceType::Result(types[ty].receive_result),
                                 usize::try_from(results).unwrap(),
                             )?;
                         }
-                        TransmitStateIndex::Stream(ty) => {
+                        TableIndex::Stream(ty) => {
                             Val::Option(None).store(
                                 &mut lower,
                                 InterfaceType::Option(types[ty].receive_option),
                                 usize::try_from(results).unwrap(),
                             )?;
                         }
-                        TransmitStateIndex::Unknown => unreachable!(),
                     }
 
-                    on_done();
+                    STATUS_DONE
+                }
+            };
 
-                    Ok(STATUS_DONE)
+            if status == STATUS_DONE {
+                if let Some(entry) = entry {
+                    (*instance).handle_table().insert(entry);
                 }
             }
+
+            Ok(status)
         })
     }
 }
 
-fn transmit_drop_sender<T: 'static>(vmctx: *mut VMOpaqueContext, ty: TableIndex, sender_rep: u32) {
+fn transmit_drop_sender<T: 'static>(vmctx: *mut VMOpaqueContext, ty: TableIndex, sender: u32) {
     unsafe {
         handle_result(|| {
             let cx = VMComponentContext::from_opaque(vmctx);
             let instance = (*cx).instance();
-            let types = (*instance).component_types();
-            let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
-            if !(*instance).handle_table().remove(&(ty, sender_rep)) {
+            let cx = StoreContextMut::<T>::from_raw((*instance).store());
+            if !(*instance).handle_table().remove(&(ty, sender)) {
                 bail!("invalid handle");
             }
-            let sender = *cx
-                .concurrent_state()
-                .table
-                .get::<TransmitSender<T>>(TableId::new(sender_rep))?;
-            let ty = match ty {
-                TableIndex::Future(ty) => TransmitStateIndex::Future(types[ty].ty),
-                TableIndex::Stream(ty) => TransmitStateIndex::Stream(types[ty].ty),
-            };
-            if ty != cx.concurrent_state().table.get(sender.0)?.ty {
-                bail!("transmit type mismatch");
-            }
-            close_sender(cx, sender_rep)
+            close_sender(cx, sender)
         })
     }
 }
 
-fn transmit_drop_receiver<T: 'static>(
-    vmctx: *mut VMOpaqueContext,
-    ty: TableIndex,
-    receiver_rep: u32,
-) {
+fn transmit_drop_receiver<T: 'static>(vmctx: *mut VMOpaqueContext, ty: TableIndex, receiver: u32) {
     unsafe {
         handle_result(|| {
             let cx = VMComponentContext::from_opaque(vmctx);
             let instance = (*cx).instance();
-            let types = (*instance).component_types();
-            let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
-            if !(*instance).handle_table().remove(&(ty, receiver_rep)) {
+            let cx = StoreContextMut::<T>::from_raw((*instance).store());
+            if !(*instance).handle_table().remove(&(ty, receiver)) {
                 bail!("invalid handle");
             }
-            let receiver = *cx
-                .concurrent_state()
-                .table
-                .get::<TransmitReceiver<T>>(TableId::new(receiver_rep))?;
-            let ty = match ty {
-                TableIndex::Future(ty) => TransmitStateIndex::Future(types[ty].ty),
-                TableIndex::Stream(ty) => TransmitStateIndex::Stream(types[ty].ty),
-            };
-            if ty != cx.concurrent_state().table.get(receiver.0)?.ty {
-                bail!("transmit type mismatch");
-            }
-            close_receiver(cx, receiver_rep)
+            close_receiver(cx, receiver)
         })
     }
 }

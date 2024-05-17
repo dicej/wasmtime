@@ -416,15 +416,16 @@ pub struct ComponentTypesBuilder {
 macro_rules! intern_and_fill_flat_types {
     ($me:ident, $name:ident, $val:ident) => {{
         if let Some(idx) = $me.$name.get(&$val) {
-            return *idx;
+            *idx
+        } else {
+            let idx = $me.component_types.$name.push($val.clone());
+            let mut info = TypeInformation::new();
+            info.$name($me, &$val);
+            let idx2 = $me.type_info.$name.push(info);
+            assert_eq!(idx, idx2);
+            $me.$name.insert($val, idx);
+            idx
         }
-        let idx = $me.component_types.$name.push($val.clone());
-        let mut info = TypeInformation::new();
-        info.$name($me, &$val);
-        let idx2 = $me.type_info.$name.push(info);
-        assert_eq!(idx, idx2);
-        $me.$name.insert($val, idx);
-        return idx;
     }};
 }
 
@@ -900,51 +901,21 @@ impl ComponentTypesBuilder {
         Ok(self.add_result_type(TypeResult { ok, err, abi, info }))
     }
 
-    fn future_type(
-        &mut self,
-        types: types::TypesRef<'_>,
-        ty: &Option<types::ComponentValType>,
-    ) -> Result<TypeFutureIndex> {
-        let payload = ty.as_ref().map(|ty| self.valtype(types, ty)).transpose()?;
-        let error = Some(InterfaceType::Error(self.error_type()?));
-        let send_result = self.result_type_from_interface_types(None, error)?;
-        let receive_result = self.result_type_from_interface_types(payload, error)?;
-        Ok(self.add_future_type(TypeFuture {
-            payload,
-            send_result,
-            receive_result,
-        }))
-    }
-
     fn future_table_type(
         &mut self,
         types: types::TypesRef<'_>,
         ty: &Option<types::ComponentValType>,
     ) -> Result<TypeFutureTableIndex> {
-        let ty = self.future_type(types, ty)?;
+        let payload = ty.as_ref().map(|ty| self.valtype(types, ty)).transpose()?;
+        let error = Some(InterfaceType::Error(self.error_type()?));
+        let send_result = self.result_type_from_interface_types(None, error)?;
+        let receive_result = self.result_type_from_interface_types(payload, error)?;
+        let ty = self.add_future_type(TypeFuture { payload });
         Ok(self.add_future_table_type(TypeFutureTable {
             ty,
             instance: self.resources.get_current_instance().unwrap(),
-        }))
-    }
-
-    fn stream_type(
-        &mut self,
-        types: types::TypesRef<'_>,
-        ty: &types::ComponentValType,
-    ) -> Result<TypeStreamIndex> {
-        let payload = self.valtype(types, ty)?;
-        let list = self.list_type_from_interface_type(payload)?;
-        let error = Some(InterfaceType::Error(self.error_type()?));
-        let send_result = self.result_type_from_interface_types(None, error)?;
-        let result =
-            self.result_type_from_interface_types(Some(InterfaceType::List(list)), error)?;
-        let receive_option = self.option_type_from_interface_type(InterfaceType::Result(result))?;
-        Ok(self.add_stream_type(TypeStream {
-            payload,
-            list,
             send_result,
-            receive_option,
+            receive_result,
         }))
     }
 
@@ -953,10 +924,19 @@ impl ComponentTypesBuilder {
         types: types::TypesRef<'_>,
         ty: &types::ComponentValType,
     ) -> Result<TypeStreamTableIndex> {
-        let ty = self.stream_type(types, ty)?;
+        let payload = self.valtype(types, ty)?;
+        let list = self.list_type_from_interface_type(payload)?;
+        let error = Some(InterfaceType::Error(self.error_type()?));
+        let send_result = self.result_type_from_interface_types(None, error)?;
+        let result =
+            self.result_type_from_interface_types(Some(InterfaceType::List(list)), error)?;
+        let receive_option = self.option_type_from_interface_type(InterfaceType::Result(result))?;
+        let ty = self.add_stream_type(TypeStream { payload, list });
         Ok(self.add_stream_table_type(TypeStreamTable {
             ty,
             instance: self.resources.get_current_instance().unwrap(),
+            send_result,
+            receive_option,
         }))
     }
 
@@ -1777,10 +1757,6 @@ pub struct TypeResult {
 pub struct TypeFuture {
     /// TODO: docs
     pub payload: Option<InterfaceType>,
-    /// TODO: docs
-    pub send_result: TypeResultIndex,
-    /// TODO: docs
-    pub receive_result: TypeResultIndex,
 }
 
 /// TODO: docs
@@ -1788,9 +1764,12 @@ pub struct TypeFuture {
 pub struct TypeFutureTable {
     /// TODO: docs
     pub ty: TypeFutureIndex,
-
     /// TODO: docs
     pub instance: RuntimeComponentInstanceIndex,
+    /// TODO: docs
+    pub send_result: TypeResultIndex,
+    /// TODO: docs
+    pub receive_result: TypeResultIndex,
 }
 
 /// TODO: docs
@@ -1800,10 +1779,6 @@ pub struct TypeStream {
     pub payload: InterfaceType,
     /// TODO: docs
     pub list: TypeListIndex,
-    /// TODO: docs
-    pub send_result: TypeResultIndex,
-    /// TODO: docs
-    pub receive_option: TypeOptionIndex,
 }
 
 /// TODO: docs
@@ -1811,9 +1786,12 @@ pub struct TypeStream {
 pub struct TypeStreamTable {
     /// TODO: docs
     pub ty: TypeStreamIndex,
-
     /// TODO: docs
     pub instance: RuntimeComponentInstanceIndex,
+    /// TODO: docs
+    pub send_result: TypeResultIndex,
+    /// TODO: docs
+    pub receive_option: TypeOptionIndex,
 }
 
 /// TODO: docs
