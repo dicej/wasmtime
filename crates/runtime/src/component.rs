@@ -213,6 +213,13 @@ pub type VMStreamDropCallback =
 pub type VMErrorDropCallback =
     extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeErrorTableIndex, handle: u32);
 
+/// TODO: docs
+pub type VMTaskWaitCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    payload: u32,
+) -> u32;
+
 /// This is a marker type to represent the underlying allocation of a
 /// `VMComponentContext`.
 ///
@@ -571,6 +578,7 @@ impl ComponentInstance {
         stream_drop_sender: VMStreamDropCallback,
         stream_drop_receiver: VMStreamDropCallback,
         error_drop: VMErrorDropCallback,
+        task_wait: VMTaskWaitCallback,
     ) {
         unsafe {
             *self.vmctx_plus_offset_mut(self.offsets.async_start()) = start;
@@ -588,6 +596,7 @@ impl ComponentInstance {
             *self.vmctx_plus_offset_mut(self.offsets.stream_drop_sender()) = stream_drop_sender;
             *self.vmctx_plus_offset_mut(self.offsets.stream_drop_receiver()) = stream_drop_receiver;
             *self.vmctx_plus_offset_mut(self.offsets.error_drop()) = error_drop;
+            *self.vmctx_plus_offset_mut(self.offsets.task_wait()) = task_wait;
         }
     }
 
@@ -992,6 +1001,7 @@ impl OwnedComponentInstance {
         stream_drop_sender: VMStreamDropCallback,
         stream_drop_receiver: VMStreamDropCallback,
         error_drop: VMErrorDropCallback,
+        task_wait: VMTaskWaitCallback,
     ) {
         unsafe {
             self.instance_mut().set_async_callbacks(
@@ -1010,6 +1020,7 @@ impl OwnedComponentInstance {
                 stream_drop_sender,
                 stream_drop_receiver,
                 error_drop,
+                task_wait,
             )
         }
     }

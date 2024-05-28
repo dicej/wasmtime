@@ -829,6 +829,15 @@ impl<'a> Inliner<'a> {
                     .push((*func, dfg::Trampoline::ErrorDrop { ty }));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
+            TaskWait { func, memory } => {
+                let (memory, _) = self.memory(frame, types, *memory);
+                let memory = self.result.memories.push(memory);
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::TaskWait { memory }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
 
             ModuleStatic(idx) => {
                 frame.modules.push(ModuleDef::Static(*idx));

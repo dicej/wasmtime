@@ -1,11 +1,14 @@
 use {
-    crate::{AsContextMut, Engine, StoreContextMut, ValRaw},
-    anyhow::{anyhow, Result},
+    crate::{
+        component::func::{self, Lower as _, LowerContext, Options},
+        AsContextMut, Engine, StoreContextMut, ValRaw,
+    },
+    anyhow::{anyhow, bail, Result},
     futures::{
         future::{self, Either, FutureExt},
-        stream::{FuturesUnordered, ReadyChunks, StreamExt},
+        stream::{FuturesUnordered, StreamExt},
     },
-    once_cell::sync::Lazy,
+    ready_chunks::ReadyChunks,
     std::{
         any::Any,
         cell::UnsafeCell,
@@ -15,17 +18,16 @@ use {
         panic::{self, AssertUnwindSafe},
         pin::{pin, Pin},
         ptr::{self, NonNull},
-        sync::Arc,
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll},
     },
     table::{Table, TableId},
-    wasmtime_environ::component::{TypeFuncIndex, MAX_FLAT_PARAMS},
+    wasmtime_environ::component::{InterfaceType, StringEncoding, TypeFuncIndex, MAX_FLAT_PARAMS},
     wasmtime_fiber::{Fiber, Suspend},
     wasmtime_runtime::{
         component::VMComponentContext,
         mpk::{self, ProtectionMask},
         AsyncWasmCallState, PreviousAsyncWasmCallState, SendSyncPtr, Store, VMFuncRef,
-        VMOpaqueContext,
+        VMMemoryDefinition, VMOpaqueContext,
     },
 };
 
@@ -36,6 +38,7 @@ pub(crate) use futures_and_streams::{
 pub use futures_and_streams::{future, stream, Error, FutureReceiver, StreamReceiver};
 
 mod futures_and_streams;
+mod ready_chunks;
 mod table;
 
 const STATUS_NOT_STARTED: u32 = 0;
@@ -75,8 +78,23 @@ struct GuestTask<T> {
     lift_result: Option<Lift<T>>,
     result: Option<LiftedResult>,
     callback: Option<(SendSyncPtr<VMFuncRef>, u32)>,
+    events: VecDeque<(u32, u32)>,
     caller: Option<Caller<T>>,
     fiber: Option<StoreFiber>,
+}
+
+impl<T> Default for GuestTask<T> {
+    fn default() -> Self {
+        Self {
+            lower_params: None,
+            lift_result: None,
+            result: None,
+            callback: None,
+            events: VecDeque::new(),
+            caller: None,
+            fiber: None,
+        }
+    }
 }
 
 type Lower<T> = Box<
@@ -145,20 +163,20 @@ impl AsyncCx {
         }
     }
 
+    unsafe fn poll<U>(&self, mut future: Pin<&mut (dyn Future<Output = U> + Send)>) -> Poll<U> {
+        let poll_cx = *self.current_poll_cx;
+        let _reset = Reset(self.current_poll_cx, poll_cx);
+        *self.current_poll_cx = ptr::null_mut();
+        future.as_mut().poll(&mut *poll_cx)
+    }
+
     pub(crate) unsafe fn block_on<'a, T: 'static, U>(
         &self,
         mut future: Pin<&mut (dyn Future<Output = U> + Send)>,
         mut store: Option<StoreContextMut<'a, T>>,
     ) -> Result<(U, Option<StoreContextMut<'a, T>>)> {
         loop {
-            let result = {
-                let poll_cx = *self.current_poll_cx;
-                let _reset = Reset(self.current_poll_cx, poll_cx);
-                *self.current_poll_cx = ptr::null_mut();
-                future.as_mut().poll(&mut *poll_cx)
-            };
-
-            match result {
+            match self.poll(future.as_mut()) {
                 Poll::Ready(v) => break Ok((v, store)),
                 Poll::Pending => {}
             }
@@ -191,7 +209,6 @@ pub struct ConcurrentState<T> {
     futures: ReadyChunks<FuturesUnordered<HostTaskFuture<T>>>,
     table: Table,
     async_state: AsyncState,
-    result: Option<Box<dyn Any + Send + Sync>>,
     sync_task_queue: VecDeque<TableId<GuestTask<T>>>,
 }
 
@@ -200,27 +217,14 @@ impl<T> Default for ConcurrentState<T> {
         Self {
             guest_task: None,
             table: Table::new(),
-            futures: FuturesUnordered::new().ready_chunks(1024),
+            futures: ReadyChunks::new(FuturesUnordered::new(), 1024),
             async_state: AsyncState {
                 current_suspend: UnsafeCell::new(ptr::null()),
                 current_poll_cx: UnsafeCell::new(ptr::null_mut()),
             },
-            result: None,
             sync_task_queue: VecDeque::new(),
         }
     }
-}
-
-fn dummy_waker() -> Waker {
-    struct DummyWaker;
-
-    impl Wake for DummyWaker {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    static WAKER: Lazy<Arc<DummyWaker>> = Lazy::new(|| Arc::new(DummyWaker));
-
-    WAKER.clone().into()
 }
 
 /// TODO: docs
@@ -256,10 +260,7 @@ pub(crate) fn first_poll<T: 'static, R: Send + 'static>(
     })) as HostTaskFuture<T>;
 
     Ok(
-        match future
-            .as_mut()
-            .poll(&mut Context::from_waker(&dummy_waker()))
-        {
+        match unsafe { AsyncCx::new(&mut store).poll(future.as_mut()) } {
             Poll::Ready((_, fun)) => {
                 store.concurrent_state().table.delete(task)?;
                 fun(store)?;
@@ -280,95 +281,115 @@ pub(crate) fn poll_and_block<'a, T: 'static, R: Send + Sync + 'static>(
         + Sync
         + 'static,
 ) -> Result<(R, StoreContextMut<'a, T>)> {
-    let async_cx = AsyncCx::new(&mut store);
-    if let Some(caller) = store.concurrent_state().guest_task {
-        let old_result = store
-            .concurrent_state()
-            .table
-            .get_mut(caller)?
-            .result
-            .take();
-        let task = store
-            .concurrent_state()
-            .table
-            .push_child(HostTask { caller }, caller)?;
-        let mut future = Box::pin(future.map(move |fun| {
-            (
-                task.rep(),
-                Box::new(for_any(move |mut store| {
-                    let result = fun(store.as_context_mut())?;
-                    store.concurrent_state().table.get_mut(caller)?.result =
-                        Some(Box::new(result) as _);
-                    Ok(())
-                })) as Box<dyn FnOnce(StoreContextMut<T>) -> Result<()>>,
-            )
-        })) as HostTaskFuture<T>;
+    let caller = store.concurrent_state().guest_task.unwrap();
+    let old_result = store
+        .concurrent_state()
+        .table
+        .get_mut(caller)?
+        .result
+        .take();
+    let task = store
+        .concurrent_state()
+        .table
+        .push_child(HostTask { caller }, caller)?;
+    let mut future = Box::pin(future.map(move |fun| {
+        (
+            task.rep(),
+            Box::new(for_any(move |mut store| {
+                let result = fun(store.as_context_mut())?;
+                store.concurrent_state().table.get_mut(caller)?.result =
+                    Some(Box::new(result) as _);
+                Ok(())
+            })) as Box<dyn FnOnce(StoreContextMut<T>) -> Result<()>>,
+        )
+    })) as HostTaskFuture<T>;
 
-        Ok(
-            match future
-                .as_mut()
-                .poll(&mut Context::from_waker(&dummy_waker()))
-            {
-                Poll::Ready((_, fun)) => {
-                    store.concurrent_state().table.delete(task)?;
-                    fun(store.as_context_mut())?;
-                    let result = *mem::replace(
-                        &mut store.concurrent_state().table.get_mut(caller)?.result,
-                        old_result,
-                    )
-                    .unwrap()
-                    .downcast()
-                    .unwrap();
-                    (result, store)
-                }
-                Poll::Pending => {
-                    store.concurrent_state().futures.get_mut().push(future);
-                    loop {
-                        if let Some(result) = store
-                            .concurrent_state()
-                            .table
-                            .get_mut(caller)?
-                            .result
-                            .take()
-                        {
-                            store.concurrent_state().table.get_mut(caller)?.result = old_result;
-                            break (*result.downcast().unwrap(), store);
-                        } else {
-                            store = unsafe { async_cx.suspend(Some(store))?.unwrap() };
-                        }
+    Ok(
+        match unsafe { AsyncCx::new(&mut store).poll(future.as_mut()) } {
+            Poll::Ready((_, fun)) => {
+                store.concurrent_state().table.delete(task)?;
+                fun(store.as_context_mut())?;
+                let result = *mem::replace(
+                    &mut store.concurrent_state().table.get_mut(caller)?.result,
+                    old_result,
+                )
+                .unwrap()
+                .downcast()
+                .unwrap();
+                (result, store)
+            }
+            Poll::Pending => {
+                store.concurrent_state().futures.get_mut().push(future);
+                loop {
+                    if let Some(result) = store
+                        .concurrent_state()
+                        .table
+                        .get_mut(caller)?
+                        .result
+                        .take()
+                    {
+                        store.concurrent_state().table.get_mut(caller)?.result = old_result;
+                        break (*result.downcast().unwrap(), store);
+                    } else {
+                        let async_cx = AsyncCx::new(&mut store);
+                        store = unsafe { async_cx.suspend(Some(store))?.unwrap() };
                     }
                 }
-            },
-        )
-    } else {
-        let mut future = pin!(future);
-        let (next, store) = unsafe { async_cx.block_on(future.as_mut(), Some(store))? };
-        let mut store = store.unwrap();
-        let ret = next(store.as_context_mut())?;
-        Ok((ret, store))
-    }
+            }
+        },
+    )
 }
 
 pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: 'static>(
     mut store: StoreContextMut<'a, T>,
     func: impl FnOnce(&mut StoreContextMut<T>) -> R + Send + 'static,
-) -> Result<R> {
+) -> Result<(R, StoreContextMut<'a, T>)> {
+    assert!(store.concurrent_state().guest_task.is_none());
+
+    let guest_task = store.concurrent_state().table.push(GuestTask::default())?;
+    store.concurrent_state().guest_task = Some(guest_task);
+
     let mut fiber = make_fiber(&mut store, move |mut store| {
         let result = func(&mut store);
-        assert!(store.concurrent_state().result.is_none());
-        store.concurrent_state().result = Some(Box::new(result) as _);
+        assert!(store
+            .concurrent_state()
+            .table
+            .get(guest_task)?
+            .result
+            .is_none());
+        store.concurrent_state().table.get_mut(guest_task)?.result = Some(Box::new(result) as _);
         Ok(())
     })?;
 
+    let queue = &mut store.concurrent_state().sync_task_queue;
+    assert!(queue.is_empty());
+    queue.push_back(guest_task);
+
     let poll_cx = store.concurrent_state().async_state.current_poll_cx.get();
-    future::poll_fn({
-        let mut store = Some(store.as_context_mut());
+    let mut store = future::poll_fn({
+        let mut store = Some(store);
 
         move |cx| unsafe {
+            if let Some(mut my_store) = store.take() {
+                if let Poll::Ready(Some(ready)) =
+                    my_store.concurrent_state().futures.poll_next_unpin(cx)
+                {
+                    match handle_ready(my_store, ready) {
+                        Ok(s) => {
+                            my_store = s;
+                        }
+                        Err(e) => {
+                            return Poll::Ready(Err(e));
+                        }
+                    }
+                }
+                store = Some(my_store);
+            }
+
             let _reset = Reset(poll_cx, *poll_cx);
             *poll_cx = mem::transmute::<&mut Context<'_>, *mut Context<'static>>(cx);
             match resume_fiber(&mut fiber, store.take(), Ok(())) {
-                Ok((_, result)) => Poll::Ready(result),
+                Ok((store, result)) => Poll::Ready(result.map(|()| store)),
                 Err(s) => {
                     if let Some(range) = fiber.fiber.stack().range() {
                         AsyncWasmCallState::assert_current_state_not_in_range(range);
@@ -381,13 +402,34 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: 'static>(
     })
     .await?;
 
-    Ok(*store
+    store = resume_next_sync_task(store, guest_task)?;
+
+    if let Some(result) = store
         .concurrent_state()
+        .table
+        .get_mut(guest_task)?
         .result
         .take()
-        .unwrap()
-        .downcast()
-        .unwrap())
+    {
+        if store
+            .concurrent_state()
+            .table
+            .get(guest_task)?
+            .callback
+            .is_none()
+        {
+            // The task is finished -- delete it.
+            //
+            // Note that this isn't always the case -- a task may yield a result without completing, in which case
+            // it should be polled until it's completed using `poll_for_completion`.
+            store.concurrent_state().table.delete(guest_task)?;
+            store.concurrent_state().guest_task = None;
+        }
+        Ok((*result.downcast().unwrap(), store))
+    } else {
+        // All outstanding host tasks completed, but the guest never yielded a result.
+        Err(anyhow!(crate::Trap::NoAsyncResult))
+    }
 }
 
 fn maybe_send_event<'a, T: 'static>(
@@ -430,16 +472,25 @@ fn maybe_send_event<'a, T: 'static>(
         }
         store.concurrent_state().guest_task = old_task;
         Ok(store)
-    } else if let Some(fiber) = store
-        .concurrent_state()
-        .table
-        .get_mut(guest_task)?
-        .fiber
-        .take()
-    {
-        resume(store, guest_task, fiber)
     } else {
-        Ok(store)
+        store
+            .concurrent_state()
+            .table
+            .get_mut(guest_task)?
+            .events
+            .push_back((event, call));
+
+        if let Some(fiber) = store
+            .concurrent_state()
+            .table
+            .get_mut(guest_task)?
+            .fiber
+            .take()
+        {
+            resume(store, guest_task, fiber)
+        } else {
+            Ok(store)
+        }
     }
 }
 
@@ -508,11 +559,7 @@ fn poll_loop<'a, T: 'static>(
         let mut future = pin!(store.concurrent_state().futures.next());
         let (ready, _) = unsafe { cx.block_on::<T, _>(future.as_mut(), None)? };
 
-        if let Some(ready) = ready {
-            store = handle_ready(store, ready)?;
-        } else {
-            break;
-        }
+        store = handle_ready(store, ready.unwrap())?;
     }
 
     Ok(store)
@@ -825,6 +872,7 @@ pub(crate) extern "C" fn async_enter<T: 'static>(
                     call,
                 }),
                 fiber: None,
+                events: VecDeque::new(),
             };
             let guest_task = if let Some(old_task) = old_task {
                 cx.concurrent_state().table.push_child(new_task, old_task)
@@ -900,6 +948,7 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                             &storage[..result_count],
                         ),
                     )?;
+
                     cx.concurrent_state().table.get_mut(guest_task)?.result = result;
 
                     Ok(())
@@ -986,22 +1035,77 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
     }
 }
 
+pub(crate) extern "C" fn task_wait<T: 'static>(
+    cx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    payload: u32,
+) -> u32 {
+    unsafe {
+        handle_result(|| {
+            let cx = VMComponentContext::from_opaque(cx);
+            let instance = (*cx).instance();
+            let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
+
+            let guest_task = cx.concurrent_state().guest_task.unwrap();
+
+            if cx
+                .concurrent_state()
+                .table
+                .get(guest_task)?
+                .callback
+                .is_some()
+            {
+                bail!("cannot call `task.wait` from async-lifted export with callback");
+            }
+
+            let mut cx = poll_loop(cx, move |cx| {
+                Ok::<_, anyhow::Error>(
+                    cx.concurrent_state()
+                        .table
+                        .get(guest_task)?
+                        .events
+                        .is_empty(),
+                )
+            })?;
+
+            let (event, call) = cx
+                .concurrent_state()
+                .table
+                .get_mut(guest_task)?
+                .events
+                .pop_front()
+                .unwrap();
+
+            let options = Options::new(
+                cx.0.id(),
+                NonNull::new(memory),
+                None,
+                StringEncoding::Utf8,
+                true,
+                None,
+            );
+            let types = (*instance).component_types();
+            let ptr = func::validate_inbounds::<(u32, u32)>(
+                options.memory_mut(cx.0),
+                &ValRaw::u32(payload),
+            )?;
+            let mut lower = LowerContext::new(cx, &options, types, instance);
+            call.store(&mut lower, InterfaceType::U32, ptr)?;
+
+            Ok(event)
+        })
+    }
+}
+
 pub(crate) fn enter<T: Send + 'static>(
     mut store: StoreContextMut<T>,
     lower_params: Lower<T>,
     lift_result: Lift<T>,
 ) -> Result<()> {
-    assert!(store.concurrent_state().guest_task.is_none());
-
-    let guest_task = store.concurrent_state().table.push(GuestTask {
-        lower_params: Some(lower_params),
-        lift_result: Some(lift_result),
-        result: None,
-        callback: None,
-        caller: None,
-        fiber: None,
-    })?;
-    store.concurrent_state().guest_task = Some(guest_task);
+    let guest_task = store.concurrent_state().guest_task.unwrap();
+    let task = store.concurrent_state().table.get_mut(guest_task)?;
+    task.lower_params = Some(lower_params);
+    task.lift_result = Some(lift_result);
 
     Ok(())
 }
@@ -1011,15 +1115,14 @@ pub(crate) fn exit<'a, T: Send + 'static, R: 'static>(
     callback: NonNull<VMFuncRef>,
     guest_context: u32,
 ) -> Result<(R, StoreContextMut<'a, T>)> {
+    let guest_task = store.concurrent_state().guest_task.unwrap();
     if guest_context != 0 {
-        let guest_task = store.concurrent_state().guest_task.unwrap();
         store.concurrent_state().table.get_mut(guest_task)?.callback =
             Some((SendSyncPtr::new(callback), guest_context));
 
         store = poll_for_result(store)?;
     }
 
-    let guest_task = store.concurrent_state().guest_task.unwrap();
     if let Some(result) = store
         .concurrent_state()
         .table
@@ -1027,20 +1130,6 @@ pub(crate) fn exit<'a, T: Send + 'static, R: 'static>(
         .result
         .take()
     {
-        if store
-            .concurrent_state()
-            .table
-            .get(guest_task)?
-            .callback
-            .is_none()
-        {
-            // The task is finished -- delete it.
-            //
-            // Note that this isn't always the case -- a task may yield a result without completing, in which case
-            // it should be polled until it's completed using `poll_for_completion`.
-            store.concurrent_state().table.delete(guest_task)?;
-            store.concurrent_state().guest_task = None;
-        }
         Ok((*result.downcast().unwrap(), store))
     } else {
         // All outstanding host tasks completed, but the guest never yielded a result.
@@ -1059,11 +1148,8 @@ pub(crate) async fn poll<'a, T: Send + 'static>(
         .callback
         .is_some()
     {
-        if let Some(ready) = store.concurrent_state().futures.next().await {
-            store = handle_ready(store, ready)?;
-        } else {
-            break;
-        }
+        let ready = store.concurrent_state().futures.next().await.unwrap();
+        store = handle_ready(store, ready)?;
     }
 
     Ok(store)
@@ -1078,7 +1164,7 @@ pub(crate) async fn poll_until<'a, T: Send + 'static, U>(
         let ready = pin!(store.concurrent_state().futures.next());
 
         match future::select(ready, future).await {
-            Either::Left((None, future)) => break Ok((store, future.await)),
+            Either::Left((None, _)) => unreachable!(),
             Either::Left((Some(ready), future_again)) => {
                 store = handle_ready(store, ready)?;
                 future = future_again;

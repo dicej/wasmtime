@@ -194,7 +194,10 @@ where
             store.0.async_support(),
             "cannot use `call_async` when async support is not enabled on the config"
         );
-        concurrent::on_fiber(store, move |store| self.call_impl(store, params)).await?
+        // TODO: do we need to return the store here do to the possible invalidation of the reference we were passed?
+        let (result, _) =
+            concurrent::on_fiber(store, move |store| self.call_impl(store, params)).await?;
+        result
     }
 
     fn call_impl<T: Send + 'static>(
@@ -206,7 +209,7 @@ where
         Params: Send + Sync + 'static,
         Return: Send + Sync + 'static,
     {
-        let mut store = store.as_context_mut();
+        let store = store.as_context_mut();
 
         if store.0[self.func.0].options.async_() {
             return Ok(if Params::flatten_count() <= MAX_FLAT_RESULTS {
@@ -258,14 +261,14 @@ where
         if Params::flatten_count() <= MAX_FLAT_PARAMS {
             if Return::flatten_count() <= MAX_FLAT_RESULTS {
                 self.func.call_raw(
-                    &mut store,
+                    store,
                     &params,
                     Self::lower_stack_args,
                     Self::lift_stack_result,
                 )
             } else {
                 self.func.call_raw(
-                    &mut store,
+                    store,
                     &params,
                     Self::lower_stack_args,
                     Self::lift_heap_result,
@@ -274,14 +277,14 @@ where
         } else {
             if Return::flatten_count() <= MAX_FLAT_RESULTS {
                 self.func.call_raw(
-                    &mut store,
+                    store,
                     &params,
                     Self::lower_heap_args,
                     Self::lift_stack_result,
                 )
             } else {
                 self.func.call_raw(
-                    &mut store,
+                    store,
                     &params,
                     Self::lower_heap_args,
                     Self::lift_heap_result,

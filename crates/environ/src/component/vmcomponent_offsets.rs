@@ -19,6 +19,7 @@
 //      stream_drop_sender: VMStreamDropCallback,
 //      stream_drop_receiver: VMStreamDropCallback,
 //      error_drop: VMErrorDropCallback,
+//      task_wait: VMTaskWaitCallback,
 //      limits: *const VMRuntimeLimits,
 //      flags: [VMGlobalDefinition; component.num_runtime_component_instances],
 //      trampoline_func_refs: [VMFuncRef; component.num_trampolines],
@@ -93,6 +94,7 @@ pub struct VMComponentOffsets<P> {
     stream_drop_sender: u32,
     stream_drop_receiver: u32,
     error_drop: u32,
+    task_wait: u32,
     limits: u32,
     flags: u32,
     trampoline_func_refs: u32,
@@ -156,6 +158,7 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             stream_drop_sender: 0,
             stream_drop_receiver: 0,
             error_drop: 0,
+            task_wait: 0,
         };
 
         // Convenience functions for checked addition and multiplication.
@@ -203,6 +206,7 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             size(stream_drop_sender) = ret.ptr.size(),
             size(stream_drop_receiver) = ret.ptr.size(),
             size(error_drop) = ret.ptr.size(),
+            size(task_wait) = ret.ptr.size(),
             align(16),
             size(flags) = cmul(ret.num_runtime_component_instances, ret.ptr.size_of_vmglobal_definition()),
             align(u32::from(ret.ptr.size())),
@@ -354,6 +358,11 @@ impl<P: PtrSize> VMComponentOffsets<P> {
     /// TODO: docs
     pub fn error_drop(&self) -> u32 {
         self.error_drop
+    }
+
+    /// TODO: docs
+    pub fn task_wait(&self) -> u32 {
+        self.task_wait
     }
 
     /// The offset of the `VMLowering` for the `index` specified.

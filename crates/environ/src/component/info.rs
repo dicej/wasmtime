@@ -639,6 +639,11 @@ pub enum Trampoline {
         /// TODO: docs
         ty: TypeErrorTableIndex,
     },
+    /// TODO: docs
+    TaskWait {
+        /// TODO: docs
+        memory: RuntimeMemoryIndex,
+    },
 
     /// An intrinsic used by FACT-generated modules which will transfer an owned
     /// resource from one table to another. Used in component-to-component
@@ -706,6 +711,7 @@ impl Trampoline {
             StreamDropSender { .. } => format!("stream-drop-sender"),
             StreamDropReceiver { .. } => format!("stream-drop-receiver"),
             ErrorDrop { .. } => format!("error-drop"),
+            TaskWait { .. } => format!("task-wait"),
             ResourceTransferOwn => format!("component-resource-transfer-own"),
             ResourceTransferBorrow => format!("component-resource-transfer-borrow"),
             ResourceEnterCall => format!("component-resource-enter-call"),

@@ -308,6 +308,9 @@ pub enum Trampoline {
     ErrorDrop {
         ty: TypeErrorTableIndex,
     },
+    TaskWait {
+        memory: MemoryId,
+    },
     ResourceTransferOwn,
     ResourceTransferBorrow,
     ResourceEnterCall,
@@ -713,6 +716,9 @@ impl LinearizeDfg<'_> {
                 info::Trampoline::StreamDropReceiver { ty: *ty }
             }
             Trampoline::ErrorDrop { ty } => info::Trampoline::ErrorDrop { ty: *ty },
+            Trampoline::TaskWait { memory } => info::Trampoline::TaskWait {
+                memory: self.runtime_memory(*memory),
+            },
             Trampoline::ResourceTransferOwn => info::Trampoline::ResourceTransferOwn,
             Trampoline::ResourceTransferBorrow => info::Trampoline::ResourceTransferBorrow,
             Trampoline::ResourceEnterCall => info::Trampoline::ResourceEnterCall,

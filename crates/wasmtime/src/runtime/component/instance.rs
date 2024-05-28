@@ -314,6 +314,7 @@ impl<'a> Instantiator<'a> {
             concurrent::stream_drop_sender::<T>,
             concurrent::stream_drop_receiver::<T>,
             concurrent::error_drop::<T>,
+            concurrent::task_wait::<T>,
         );
 
         // Before all initializers are processed configure all destructors for

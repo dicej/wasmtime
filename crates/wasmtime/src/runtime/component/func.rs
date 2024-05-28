@@ -397,7 +397,7 @@ impl Func {
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
-        let store = &mut store.as_context_mut();
+        let store = store.as_context_mut();
 
         let param_tys = self.params(&store);
         let result_tys = self.results(&store);
@@ -576,7 +576,7 @@ impl Func {
     /// happening.
     fn call_raw<T, Params: ?Sized, Return, LowerParams, LowerReturn>(
         &self,
-        store: &mut StoreContextMut<'_, T>,
+        mut store: StoreContextMut<'_, T>,
         params: &Params,
         lower: impl FnOnce(
             &mut LowerContext<'_, T>,
@@ -655,7 +655,7 @@ impl Func {
             // on the correctness of this module and `ComponentType`
             // implementations, hence `ComponentType` being an `unsafe` trait.
             crate::Func::call_unchecked_raw(
-                store,
+                &mut store,
                 export.func_ref,
                 space.as_mut_ptr().cast(),
                 mem::size_of_val(space) / mem::size_of::<ValRaw>(),

@@ -202,6 +202,7 @@ impl<'a> TrampolineCompiler<'a> {
                 Vec::new(),
             ),
             Trampoline::ErrorDrop { ty } => self.translate_error_drop_call(*ty),
+            Trampoline::TaskWait { memory } => self.translate_task_wait_call(*memory),
             Trampoline::ResourceTransferOwn => {
                 self.translate_host_libcall(host::resource_transfer_own)
             }
@@ -952,6 +953,60 @@ impl<'a> TrampolineCompiler<'a> {
         // Load host function pointer from the vmcontext and then call that
         // indirect function pointer with the list of arguments.
         let offset = self.offsets.error_drop();
+        let host_fn = self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(offset).unwrap(),
+        );
+        let host_sig = self.builder.import_signature(host_sig);
+        let call = self
+            .builder
+            .ins()
+            .call_indirect(host_sig, host_fn, &host_args);
+
+        let results = self.builder.func.dfg.inst_results(call).to_vec();
+        self.builder.ins().return_(&results);
+    }
+
+    fn translate_task_wait_call(&mut self, memory: RuntimeMemoryIndex) {
+        match self.abi {
+            Abi::Wasm => {}
+
+            // These trampolines can only actually be called by Wasm, so
+            // let's assert that here.
+            Abi::Native | Abi::Array => {
+                self.builder
+                    .ins()
+                    .trap(ir::TrapCode::User(crate::DEBUG_ASSERT_TRAP_CODE));
+                return;
+            }
+        }
+
+        let pointer_type = self.isa.pointer_type();
+        let args = self.builder.func.dfg.block_params(self.block0).to_vec();
+        let vmctx = args[0];
+        let mut host_args = vec![vmctx];
+        let mut host_sig = ir::Signature::new(CallConv::triple_default(self.isa.triple()));
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+
+        // memory: *mut VMMemoryDefinition
+        host_sig.params.push(ir::AbiParam::new(pointer_type));
+        host_args.push(self.builder.ins().load(
+            pointer_type,
+            MemFlags::trusted(),
+            vmctx,
+            i32::try_from(self.offsets.runtime_memory(memory)).unwrap(),
+        ));
+
+        host_sig.params.push(ir::AbiParam::new(ir::types::I32));
+        host_args.extend(args[2..].iter().copied());
+
+        host_sig.returns.push(ir::AbiParam::new(ir::types::I32));
+
+        // Load host function pointer from the vmcontext and then call that
+        // indirect function pointer with the list of arguments.
+        let offset = self.offsets.task_wait();
         let host_fn = self.builder.ins().load(
             pointer_type,
             MemFlags::trusted(),

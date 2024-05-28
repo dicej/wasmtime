@@ -238,6 +238,10 @@ enum LocalInitializer<'data> {
     ErrorDrop {
         func: ModuleInternedTypeIndex,
     },
+    TaskWait {
+        func: ModuleInternedTypeIndex,
+        memory: MemoryIndex,
+    },
 
     // core wasm modules
     ModuleStatic(StaticModuleIndex),
@@ -667,6 +671,14 @@ impl<'a, 'data> Translator<'a, 'data> {
                             let func = self.core_func_signature(core_func_index);
                             core_func_index += 1;
                             LocalInitializer::ErrorDrop { func }
+                        }
+                        wasmparser::CanonicalFunction::TaskWait { memory } => {
+                            let func = self.core_func_signature(core_func_index);
+                            core_func_index += 1;
+                            LocalInitializer::TaskWait {
+                                func,
+                                memory: MemoryIndex::from_u32(memory),
+                            }
                         }
                     };
                     self.result.initializers.push(init);
