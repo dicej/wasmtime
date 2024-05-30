@@ -39,6 +39,10 @@ use {
 // types (i.e. those whith no pointers or handles) which crates/cranelift/compiler/component.rs can select when
 // appropriate, only falling back to the slow path for non-flat types.
 
+// TODO: Improve the host APIs for sending to and receiving from streams.  Currently, they require explicitly
+// interleaving calls to `send` or `receive` and `StoreContextMut::wait_until`; we should abstract that away and
+// present a public API in the form of e.g. `futures::Stream` and `futures::Sink`.
+
 fn receive_result(ty: TableIndex, types: &Arc<ComponentTypes>) -> InterfaceType {
     match ty {
         TableIndex::Future(ty) => InterfaceType::Result(types[ty].receive_result),
