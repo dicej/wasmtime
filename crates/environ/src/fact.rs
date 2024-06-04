@@ -21,7 +21,7 @@
 use crate::component::dfg::CoreDef;
 use crate::component::{
     Adapter, AdapterOptions as AdapterOptionsDfg, ComponentTypesBuilder, FlatType, InterfaceType,
-    StringEncoding, TypeFuncIndex,
+    RuntimeComponentInstanceIndex, StringEncoding, TypeFuncIndex,
 };
 use crate::fact::transcode::Transcoder;
 use crate::{EntityRef, FuncIndex, GlobalIndex, MemoryIndex, PrimaryMap};
@@ -106,6 +106,7 @@ struct AdapterData {
 /// These options are typically unique per-adapter and generally aren't needed
 /// when translating recursive types within an adapter.
 struct AdapterOptions {
+    instance: RuntimeComponentInstanceIndex,
     /// The ascribed type of this adapter.
     ty: TypeFuncIndex,
     /// The global that represents the instance flags for where this adapter
@@ -349,6 +350,7 @@ impl<'a> Module<'a> {
         });
 
         AdapterOptions {
+            instance: *instance,
             ty,
             flags,
             post_return: None,
@@ -485,6 +487,7 @@ impl<'a> Module<'a> {
             &[
                 ValType::I32,
                 ValType::FUNCREF,
+                ValType::I32,
                 ValType::I32,
                 ValType::I32,
                 ValType::I32,

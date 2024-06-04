@@ -477,6 +477,7 @@ impl Compiler<'_, '_> {
         self.module.funcs[self.result]
             .body
             .push(Body::RefFunc(dummy_callee));
+        self.instruction(I32Const(0)); // dummy instance
         self.instruction(I32Const(0)); // dummy param count
         self.instruction(I32Const(0)); // dummy result count
         self.instruction(I32Const(EXIT_FLAG_ASYNC_CALLER | EXIT_FLAG_ASYNC_CALLEE));
@@ -545,6 +546,7 @@ impl Compiler<'_, '_> {
         self.module.funcs[self.result]
             .body
             .push(Body::RefFunc(dummy_callee));
+        self.instruction(I32Const(0)); // dummy instance
         self.instruction(I32Const(0)); // dummy param count
         self.instruction(I32Const(0)); // dummy result count
         self.instruction(I32Const(EXIT_FLAG_ASYNC_CALLEE));
@@ -601,6 +603,9 @@ impl Compiler<'_, '_> {
             format!("[adapter-callee]{}", adapter.name),
         ));
         self.instruction(RefFunc(adapter.callee.as_u32()));
+        self.instruction(I32Const(
+            i32::try_from(adapter.lift.instance.as_u32()).unwrap(),
+        ));
         self.instruction(I32Const(param_count));
         self.instruction(I32Const(result_count));
         self.instruction(I32Const(EXIT_FLAG_ASYNC_CALLER));

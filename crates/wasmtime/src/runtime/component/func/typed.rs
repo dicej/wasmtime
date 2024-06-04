@@ -196,7 +196,8 @@ where
         );
         // TODO: do we need to return the store here do to the possible invalidation of the reference we were passed?
         let (result, _) =
-            concurrent::on_fiber(store, move |store| self.call_impl(store, params)).await?;
+            concurrent::on_fiber(store, self.func, move |store| self.call_impl(store, params))
+                .await?;
         result
     }
 

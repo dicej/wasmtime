@@ -1,6 +1,6 @@
 use {
     crate::{
-        component::func::{self, Lower as _, LowerContext, Options},
+        component::func::{self, Func, Lower as _, LowerContext, Options},
         AsContextMut, Engine, StoreContextMut, ValRaw,
     },
     anyhow::{anyhow, bail, Result},
@@ -8,20 +8,25 @@ use {
         future::{self, Either, FutureExt},
         stream::{FuturesUnordered, StreamExt},
     },
+    once_cell::sync::Lazy,
     ready_chunks::ReadyChunks,
     std::{
         any::Any,
         cell::UnsafeCell,
-        collections::VecDeque,
+        collections::{HashMap, VecDeque},
         future::Future,
         mem::{self, MaybeUninit},
         panic::{self, AssertUnwindSafe},
         pin::{pin, Pin},
         ptr::{self, NonNull},
-        task::{Context, Poll},
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
     },
     table::{Table, TableId},
-    wasmtime_environ::component::{InterfaceType, StringEncoding, TypeFuncIndex, MAX_FLAT_PARAMS},
+    wasmtime_environ::component::{
+        InterfaceType, RuntimeComponentInstanceIndex, StringEncoding, TypeFuncIndex,
+        MAX_FLAT_PARAMS,
+    },
     wasmtime_fiber::{Fiber, Suspend},
     wasmtime_runtime::{
         component::VMComponentContext,
@@ -167,6 +172,7 @@ impl AsyncCx {
         let poll_cx = *self.current_poll_cx;
         let _reset = Reset(self.current_poll_cx, poll_cx);
         *self.current_poll_cx = ptr::null_mut();
+        assert!(!poll_cx.is_null());
         future.as_mut().poll(&mut *poll_cx)
     }
 
@@ -209,7 +215,7 @@ pub struct ConcurrentState<T> {
     futures: ReadyChunks<FuturesUnordered<HostTaskFuture<T>>>,
     table: Table,
     async_state: AsyncState,
-    sync_task_queue: VecDeque<TableId<GuestTask<T>>>,
+    sync_task_queues: HashMap<RuntimeComponentInstanceIndex, VecDeque<TableId<GuestTask<T>>>>,
 }
 
 impl<T> Default for ConcurrentState<T> {
@@ -222,9 +228,21 @@ impl<T> Default for ConcurrentState<T> {
                 current_suspend: UnsafeCell::new(ptr::null()),
                 current_poll_cx: UnsafeCell::new(ptr::null_mut()),
             },
-            sync_task_queue: VecDeque::new(),
+            sync_task_queues: HashMap::new(),
         }
     }
+}
+
+fn dummy_waker() -> Waker {
+    struct DummyWaker;
+
+    impl Wake for DummyWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    static WAKER: Lazy<Arc<DummyWaker>> = Lazy::new(|| Arc::new(DummyWaker));
+
+    WAKER.clone().into()
 }
 
 /// TODO: docs
@@ -260,7 +278,10 @@ pub(crate) fn first_poll<T: 'static, R: Send + 'static>(
     })) as HostTaskFuture<T>;
 
     Ok(
-        match unsafe { AsyncCx::new(&mut store).poll(future.as_mut()) } {
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(&dummy_waker()))
+        {
             Poll::Ready((_, fun)) => {
                 store.concurrent_state().table.delete(task)?;
                 fun(store)?;
@@ -342,6 +363,7 @@ pub(crate) fn poll_and_block<'a, T: 'static, R: Send + Sync + 'static>(
 
 pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: 'static>(
     mut store: StoreContextMut<'a, T>,
+    handle: Func,
     func: impl FnOnce(&mut StoreContextMut<T>) -> R + Send + 'static,
 ) -> Result<(R, StoreContextMut<'a, T>)> {
     assert!(store.concurrent_state().guest_task.is_none());
@@ -349,7 +371,10 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: 'static>(
     let guest_task = store.concurrent_state().table.push(GuestTask::default())?;
     store.concurrent_state().guest_task = Some(guest_task);
 
-    let mut fiber = make_fiber(&mut store, move |mut store| {
+    let is_concurrent = store.0[handle.0].options.async_();
+    let instance = store.0[handle.0].component_instance;
+
+    let mut fiber = make_fiber(&mut store, instance, move |mut store| {
         let result = func(&mut store);
         assert!(store
             .concurrent_state()
@@ -361,9 +386,15 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: 'static>(
         Ok(())
     })?;
 
-    let queue = &mut store.concurrent_state().sync_task_queue;
-    assert!(queue.is_empty());
-    queue.push_back(guest_task);
+    if !is_concurrent {
+        let queue = &mut store
+            .concurrent_state()
+            .sync_task_queues
+            .entry(instance)
+            .or_default();
+        assert!(queue.is_empty());
+        queue.push_back(guest_task);
+    }
 
     let poll_cx = store.concurrent_state().async_state.current_poll_cx.get();
     let mut store = future::poll_fn({
@@ -402,15 +433,32 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: 'static>(
     })
     .await?;
 
-    store = resume_next_sync_task(store, guest_task)?;
-
-    if let Some(result) = store
+    let result = store
         .concurrent_state()
         .table
         .get_mut(guest_task)?
         .result
-        .take()
-    {
+        .take();
+
+    if !is_concurrent {
+        store = future::poll_fn({
+            let mut store = Some(store);
+
+            move |cx| unsafe {
+                let _reset = Reset(poll_cx, *poll_cx);
+                *poll_cx = mem::transmute::<&mut Context<'_>, *mut Context<'static>>(cx);
+
+                Poll::Ready(resume_next_sync_task(
+                    store.take().unwrap(),
+                    guest_task,
+                    instance,
+                ))
+            }
+        })
+        .await?;
+    }
+
+    if let Some(result) = result {
         if store
             .concurrent_state()
             .table
@@ -502,7 +550,7 @@ fn resume<'a, T: 'static>(
     match unsafe { resume_fiber(&mut fiber, Some(store), Ok(())) } {
         Ok((mut store, result)) => {
             result?;
-            store = resume_next_sync_task(store, guest_task)?;
+            store = resume_next_sync_task(store, guest_task, fiber.instance)?;
             if let Some(next) = store
                 .concurrent_state()
                 .table
@@ -559,7 +607,11 @@ fn poll_loop<'a, T: 'static>(
         let mut future = pin!(store.concurrent_state().futures.next());
         let (ready, _) = unsafe { cx.block_on::<T, _>(future.as_mut(), None)? };
 
-        store = handle_ready(store, ready.unwrap())?;
+        if let Some(ready) = ready {
+            store = handle_ready(store, ready)?;
+        } else {
+            break;
+        }
     }
 
     Ok(store)
@@ -568,18 +620,27 @@ fn poll_loop<'a, T: 'static>(
 fn resume_next_sync_task<'a, T: 'static>(
     mut store: StoreContextMut<'a, T>,
     current_task: TableId<GuestTask<T>>,
+    instance: RuntimeComponentInstanceIndex,
 ) -> Result<StoreContextMut<'a, T>> {
     assert_eq!(
         current_task.rep(),
         store
             .concurrent_state()
-            .sync_task_queue
+            .sync_task_queues
+            .get_mut(&instance)
+            .unwrap()
             .pop_front()
             .unwrap()
             .rep()
     );
 
-    if let Some(next) = store.concurrent_state().sync_task_queue.pop_front() {
+    if let Some(next) = store
+        .concurrent_state()
+        .sync_task_queues
+        .get_mut(&instance)
+        .unwrap()
+        .pop_front()
+    {
         let fiber = store
             .concurrent_state()
             .table
@@ -592,6 +653,7 @@ fn resume_next_sync_task<'a, T: 'static>(
         // the number of waiters.  Flatten this into an iteration instead.
         resume(store, next, fiber)
     } else {
+        store.concurrent_state().sync_task_queues.remove(&instance);
         Ok(store)
     }
 }
@@ -611,6 +673,7 @@ struct StoreFiber {
         (Option<*mut dyn Store>, Result<()>),
     >,
     stack_limit: *mut usize,
+    instance: RuntimeComponentInstanceIndex,
 }
 
 impl Drop for StoreFiber {
@@ -635,6 +698,7 @@ unsafe impl Sync for StoreFiber {}
 
 fn make_fiber<T>(
     store: &mut StoreContextMut<T>,
+    instance: RuntimeComponentInstanceIndex,
     fun: impl FnOnce(StoreContextMut<T>) -> Result<()> + 'static,
 ) -> Result<StoreFiber> {
     let engine = store.engine().clone();
@@ -662,6 +726,7 @@ fn make_fiber<T>(
         engine,
         suspend: store.concurrent_state().async_state.current_suspend.get(),
         stack_limit: store.0.runtime_limits().stack_limit.get(),
+        instance,
     })
 }
 
@@ -891,6 +956,7 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
     callback: *mut VMFuncRef,
     guest_context: u32,
     callee: *mut VMFuncRef,
+    callee_instance: RuntimeComponentInstanceIndex,
     param_count: u32,
     result_count: u32,
     flags: u32,
@@ -909,7 +975,7 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                 assert!(param_count <= MAX_FLAT_PARAMS);
                 assert!(result_count <= MAX_FLAT_PARAMS);
 
-                let mut fiber = make_fiber(&mut cx, move |mut cx| {
+                let mut fiber = make_fiber(&mut cx, callee_instance, move |mut cx| {
                     let mut storage = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
                     let lower = cx
                         .concurrent_state()
@@ -954,7 +1020,11 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                     Ok(())
                 })?;
 
-                let queue = &mut cx.concurrent_state().sync_task_queue;
+                let queue = &mut cx
+                    .concurrent_state()
+                    .sync_task_queues
+                    .entry(callee_instance)
+                    .or_default();
                 let first_in_queue = queue.is_empty();
                 queue.push_back(guest_task);
 
@@ -964,7 +1034,7 @@ pub(crate) extern "C" fn async_exit<T: 'static>(
                         match resume_fiber(&mut fiber, cx.take(), Ok(())) {
                             Ok((cx, result)) => {
                                 result?;
-                                break resume_next_sync_task(cx, guest_task)?;
+                                break resume_next_sync_task(cx, guest_task, callee_instance)?;
                             }
                             Err(cx) => {
                                 if let Some(mut cx) = cx {
@@ -1164,7 +1234,7 @@ pub(crate) async fn poll_until<'a, T: Send + 'static, U>(
         let ready = pin!(store.concurrent_state().futures.next());
 
         match future::select(ready, future).await {
-            Either::Left((None, _)) => unreachable!(),
+            Either::Left((None, future_again)) => break Ok((store, future_again.await)),
             Either::Left((Some(ready), future_again)) => {
                 store = handle_ready(store, ready)?;
                 future = future_again;

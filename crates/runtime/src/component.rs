@@ -156,6 +156,7 @@ pub type VMAsyncExitCallback = extern "C" fn(
     callback: *mut VMFuncRef,
     guest_context: u32,
     callee: *mut VMFuncRef,
+    callee_instance: RuntimeComponentInstanceIndex,
     param_count: u32,
     result_count: u32,
     flags: u32,

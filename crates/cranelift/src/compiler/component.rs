@@ -239,6 +239,7 @@ impl<'a> TrampolineCompiler<'a> {
                         ir::AbiParam::new(ir::types::I32),
                         ir::AbiParam::new(ir::types::I32),
                         ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
                     ],
                     vec![ir::AbiParam::new(ir::types::I32)],
                 )

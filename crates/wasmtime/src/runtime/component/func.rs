@@ -95,7 +95,7 @@ union ParamsAndResults<Params: Copy, Return: Copy> {
 /// [`wasmtime::Func`](crate::Func) it's possible to call functions either
 /// synchronously or asynchronously and either typed or untyped.
 #[derive(Copy, Clone, Debug)]
-pub struct Func(Stored<FuncData>);
+pub struct Func(pub(crate) Stored<FuncData>);
 
 #[doc(hidden)]
 pub struct FuncData {
@@ -104,7 +104,7 @@ pub struct FuncData {
     types: Arc<ComponentTypes>,
     pub(crate) options: Options,
     instance: Instance,
-    component_instance: RuntimeComponentInstanceIndex,
+    pub(crate) component_instance: RuntimeComponentInstanceIndex,
     post_return: Option<ExportFunction>,
     post_return_arg: Option<ValRaw>,
 }
