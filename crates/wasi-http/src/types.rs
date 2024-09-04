@@ -14,6 +14,7 @@ use http_body_util::BodyExt;
 use hyper::body::Body;
 use hyper::header::HeaderName;
 use std::any::Any;
+use std::future::Future;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -237,20 +238,22 @@ impl<T: WasiHttpView> WasiHttpView for WasiHttpImpl<T> {
 
 /// Returns `true` when the header is forbidden according to this [`WasiHttpView`] implementation.
 pub(crate) fn is_forbidden_header(view: &mut dyn WasiHttpView, name: &HeaderName) -> bool {
-    static FORBIDDEN_HEADERS: [HeaderName; 10] = [
-        hyper::header::CONNECTION,
-        HeaderName::from_static("keep-alive"),
-        hyper::header::PROXY_AUTHENTICATE,
-        hyper::header::PROXY_AUTHORIZATION,
-        HeaderName::from_static("proxy-connection"),
-        hyper::header::TE,
-        hyper::header::TRANSFER_ENCODING,
-        hyper::header::UPGRADE,
-        hyper::header::HOST,
-        HeaderName::from_static("http2-settings"),
-    ];
+    // static FORBIDDEN_HEADERS: [HeaderName; 10] = [
+    //     hyper::header::CONNECTION,
+    //     HeaderName::from_static("keep-alive"),
+    //     hyper::header::PROXY_AUTHENTICATE,
+    //     hyper::header::PROXY_AUTHORIZATION,
+    //     HeaderName::from_static("proxy-connection"),
+    //     hyper::header::TE,
+    //     hyper::header::TRANSFER_ENCODING,
+    //     hyper::header::UPGRADE,
+    //     hyper::header::HOST,
+    //     HeaderName::from_static("http2-settings"),
+    // ];
 
-    FORBIDDEN_HEADERS.contains(name) || view.is_forbidden_header(name)
+    // FORBIDDEN_HEADERS.contains(name) || view.is_forbidden_header(name)
+    _ = (view, name);
+    false
 }
 
 /// Removes forbidden headers from a [`hyper::HeaderMap`].
@@ -375,7 +378,7 @@ pub async fn default_send_request_handler(
 
             let (sender, conn) = timeout(
                 connect_timeout,
-                hyper::client::conn::http1::handshake(stream),
+                hyper::client::conn::http2::handshake(TokioExec, stream),
             )
             .await
             .map_err(|_| types::ErrorCode::ConnectionTimeout)?
@@ -397,7 +400,7 @@ pub async fn default_send_request_handler(
         let (sender, conn) = timeout(
             connect_timeout,
             // TODO: we should plumb the builder through the http context, and use it here
-            hyper::client::conn::http1::handshake(tcp_stream),
+            hyper::client::conn::http2::handshake(TokioExec, tcp_stream),
         )
         .await
         .map_err(|_| types::ErrorCode::ConnectionTimeout)?
@@ -687,5 +690,18 @@ impl Subscribe for HostFutureIncomingResponse {
         if let Self::Pending(handle) = self {
             *self = Self::Ready(handle.await);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TokioExec;
+
+impl<F> hyper::rt::Executor<F> for TokioExec
+where
+    F: Future + Send + 'static,
+    F::Output: Send,
+{
+    fn execute(&self, fut: F) {
+        tokio::task::spawn(fut);
     }
 }
