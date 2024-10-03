@@ -113,6 +113,7 @@ mod store;
 pub mod types;
 mod values;
 pub use self::component::{Component, ComponentExportIndex};
+pub use self::concurrent::{for_any, future, stream, Error, FutureReceiver, StreamReceiver};
 pub use self::func::{
     ComponentNamedList, ComponentType, Func, Lift, Lower, TypedFunc, WasmList, WasmStr,
 };

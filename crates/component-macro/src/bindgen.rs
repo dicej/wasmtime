@@ -146,7 +146,7 @@ impl Parse for Config {
                                 "cannot specify a world with `interfaces`",
                             ));
                         }
-                        world = Some("interfaces".to_string());
+                        world = Some("wasmtime:component-macro-synthesized/interfaces".to_string());
 
                         opts.only_interfaces = true;
                     }

@@ -64,7 +64,7 @@ fn payload(ty: TableIndex, types: &Arc<ComponentTypes>) -> Option<InterfaceType>
 fn host_send<
     T: func::Lower + Send + Sync + 'static,
     W: func::Lower + Send + Sync + 'static,
-    U: 'static,
+    U,
     S: AsContextMut<Data = U>,
 >(
     mut store: S,
@@ -76,7 +76,7 @@ fn host_send<
     let transmit = store
         .concurrent_state()
         .table
-        .get(TableId::<TransmitSender<U>>::new(rep))?
+        .get(TableId::<TransmitSender>::new(rep))?
         .0;
     let transmit = store.concurrent_state().table.get_mut(transmit)?;
     let new_state = if let ReceiveState::Closed = &transmit.receive {
@@ -92,7 +92,25 @@ fn host_send<
             transmit.send = SendState::HostReady {
                 accept: Box::new(move |receiver| {
                     match receiver {
-                        Receiver::Guest { lower, ty, offset } => {
+                        Receiver::Guest {
+                            lower:
+                                RawLowerContext {
+                                    store,
+                                    options,
+                                    types,
+                                    instance,
+                                },
+                            ty,
+                            offset,
+                        } => {
+                            let lower = &mut unsafe {
+                                LowerContext::new(
+                                    StoreContextMut::<U>::from_raw(store),
+                                    options,
+                                    types,
+                                    instance,
+                                )
+                            };
                             wrap(value).store(lower, ty, offset)?;
                         }
                         Receiver::Host { accept } => accept(Box::new(value))?,
@@ -140,11 +158,7 @@ fn host_send<
     Ok(())
 }
 
-pub fn host_receive<
-    T: func::Lift + Sync + Send + 'static,
-    U: 'static,
-    S: AsContextMut<Data = U>,
->(
+pub fn host_receive<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data = U>>(
     mut store: S,
     rep: u32,
 ) -> Result<oneshot::Receiver<Option<T>>> {
@@ -153,7 +167,7 @@ pub fn host_receive<
     let transmit_id = store
         .concurrent_state()
         .table
-        .get(TableId::<TransmitReceiver<U>>::new(rep))?
+        .get(TableId::<TransmitReceiver>::new(rep))?
         .0;
     let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
     let new_state = if let SendState::Closed = &transmit.send {
@@ -258,12 +272,12 @@ pub fn host_receive<
     Ok(rx)
 }
 
-fn host_close_sender<U: 'static, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Result<()> {
+fn host_close_sender<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Result<()> {
     let mut store = store.as_context_mut();
     let sender = store
         .concurrent_state()
         .table
-        .delete::<TransmitSender<U>>(TableId::new(rep))?;
+        .delete::<TransmitSender>(TableId::new(rep))?;
     let transmit = store.concurrent_state().table.get_mut(sender.0)?;
 
     match &mut transmit.send {
@@ -337,15 +351,12 @@ fn host_close_sender<U: 'static, S: AsContextMut<Data = U>>(mut store: S, rep: u
     Ok(())
 }
 
-fn host_close_receiver<U: 'static, S: AsContextMut<Data = U>>(
-    mut store: S,
-    rep: u32,
-) -> Result<()> {
+fn host_close_receiver<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Result<()> {
     let mut store = store.as_context_mut();
     let receiver = store
         .concurrent_state()
         .table
-        .delete::<TransmitReceiver<U>>(TableId::new(rep))?;
+        .delete::<TransmitReceiver>(TableId::new(rep))?;
     let transmit = store.concurrent_state().table.get_mut(receiver.0)?;
 
     transmit.receive = ReceiveState::Closed;
@@ -415,14 +426,14 @@ pub struct FutureSender<T> {
 
 impl<T> FutureSender<T> {
     /// TODO: docs
-    pub fn send<U: 'static, S: AsContextMut<Data = U>>(self, store: S, value: T) -> Result<()>
+    pub fn send<U, S: AsContextMut<Data = U>>(self, store: S, value: T) -> Result<()>
     where
         T: func::Lower + Send + Sync + 'static,
     {
         host_send(store, self.rep, value, |v| Ok::<_, Error>(v))
     }
 
-    pub fn close<U: 'static, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
+    pub fn close<U, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
         host_close_sender(store, self.rep)
     }
 }
@@ -435,7 +446,7 @@ pub struct FutureReceiver<T> {
 
 impl<T> FutureReceiver<T> {
     /// TODO: docs
-    pub fn receive<U: 'static, S: AsContextMut<Data = U>>(
+    pub fn receive<U, S: AsContextMut<Data = U>>(
         self,
         store: S,
     ) -> Result<oneshot::Receiver<Option<T>>>
@@ -482,7 +493,7 @@ impl<T> FutureReceiver<T> {
     }
 
     /// TODO: docs
-    pub fn close<U: 'static, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
+    pub fn close<U, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
         host_close_receiver(store, self.rep)
     }
 }
@@ -535,11 +546,11 @@ unsafe impl<T> func::Lift for FutureReceiver<T> {
 }
 
 /// TODO: docs
-pub fn future<T, U: 'static, S: AsContextMut<Data = U>>(
+pub fn future<T, U, S: AsContextMut<Data = U>>(
     mut store: S,
 ) -> Result<(FutureSender<T>, FutureReceiver<T>)> {
     let mut store = store.as_context_mut();
-    let transmit = store.concurrent_state().table.push(TransmitState::<U> {
+    let transmit = store.concurrent_state().table.push(TransmitState {
         receive: ReceiveState::Open,
         send: SendState::Open,
     })?;
@@ -572,18 +583,14 @@ pub struct StreamSender<T> {
 
 impl<T> StreamSender<T> {
     /// TODO: docs
-    pub fn send<U: 'static, S: AsContextMut<Data = U>>(
-        &mut self,
-        store: S,
-        values: Vec<T>,
-    ) -> Result<()>
+    pub fn send<U, S: AsContextMut<Data = U>>(&mut self, store: S, values: Vec<T>) -> Result<()>
     where
         T: func::Lower + Send + Sync + 'static,
     {
         host_send(store, self.rep, values, |v| Some(Ok::<_, Error>(v)))
     }
 
-    pub fn close<U: 'static, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
+    pub fn close<U, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
         host_close_sender(store, self.rep)
     }
 }
@@ -596,7 +603,7 @@ pub struct StreamReceiver<T> {
 
 impl<T> StreamReceiver<T> {
     /// TODO: docs
-    pub fn receive<U: 'static, S: AsContextMut<Data = U>>(
+    pub fn receive<U, S: AsContextMut<Data = U>>(
         &mut self,
         store: S,
     ) -> Result<oneshot::Receiver<Option<Vec<T>>>>
@@ -643,7 +650,7 @@ impl<T> StreamReceiver<T> {
     }
 
     /// TODO: docs
-    pub fn close<U: 'static, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
+    pub fn close<U, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
         host_close_receiver(store, self.rep)
     }
 }
@@ -696,11 +703,11 @@ unsafe impl<T> func::Lift for StreamReceiver<T> {
 }
 
 /// TODO: docs
-pub fn stream<T, U: 'static, S: AsContextMut<Data = U>>(
+pub fn stream<T, U, S: AsContextMut<Data = U>>(
     mut store: S,
 ) -> Result<(StreamSender<T>, StreamReceiver<T>)> {
     let mut store = store.as_context_mut();
-    let transmit = store.concurrent_state().table.push(TransmitState::<U> {
+    let transmit = store.concurrent_state().table.push(TransmitState {
         receive: ReceiveState::Open,
         send: SendState::Open,
     })?;
@@ -806,32 +813,32 @@ unsafe impl func::Lift for Error {
     }
 }
 
-struct TransmitState<T> {
-    send: SendState<T>,
+struct TransmitState {
+    send: SendState,
     receive: ReceiveState,
 }
 
-struct TransmitSender<T>(TableId<TransmitState<T>>);
+struct TransmitSender(TableId<TransmitState>);
 
-impl<T> Clone for TransmitSender<T> {
+impl Clone for TransmitSender {
     fn clone(&self) -> Self {
         Self(self.0)
     }
 }
 
-impl<T> Copy for TransmitSender<T> {}
+impl Copy for TransmitSender {}
 
-struct TransmitReceiver<T>(TableId<TransmitState<T>>);
+struct TransmitReceiver(TableId<TransmitState>);
 
-impl<T> Clone for TransmitReceiver<T> {
+impl Clone for TransmitReceiver {
     fn clone(&self) -> Self {
         Self(self.0)
     }
 }
 
-impl<T> Copy for TransmitReceiver<T> {}
+impl Copy for TransmitReceiver {}
 
-enum SendState<T> {
+enum SendState {
     Open,
     GuestReady {
         ty: TableIndex,
@@ -845,7 +852,7 @@ enum SendState<T> {
         close: bool,
     },
     HostReady {
-        accept: Box<dyn FnOnce(Receiver<'_, T>) -> Result<()> + Send + Sync>,
+        accept: Box<dyn FnOnce(Receiver) -> Result<()> + Send + Sync>,
         close: bool,
     },
     Closed,
@@ -880,9 +887,16 @@ enum Sender<'a> {
     None,
 }
 
-enum Receiver<'a, T> {
+struct RawLowerContext<'a> {
+    store: *mut dyn VMStore,
+    options: &'a Options,
+    types: &'a ComponentTypes,
+    instance: *mut ComponentInstance,
+}
+
+enum Receiver<'a> {
     Guest {
-        lower: &'a mut LowerContext<'a, T>,
+        lower: RawLowerContext<'a>,
         ty: InterfaceType,
         offset: usize,
     },
@@ -892,7 +906,7 @@ enum Receiver<'a, T> {
     None,
 }
 
-fn guest_new<T: 'static>(
+fn guest_new<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     ty: TableIndex,
@@ -912,7 +926,7 @@ fn guest_new<T: 'static>(
                 None,
             );
             let types = (*instance).component_types();
-            let transmit = cx.concurrent_state().table.push(TransmitState::<T> {
+            let transmit = cx.concurrent_state().table.push(TransmitState {
                 receive: ReceiveState::Open,
                 send: SendState::Open,
             })?;
@@ -940,7 +954,7 @@ fn guest_new<T: 'static>(
     }
 }
 
-unsafe fn copy<T: 'static>(
+unsafe fn copy<T>(
     mut cx: StoreContextMut<'_, T>,
     types: &Arc<ComponentTypes>,
     instance: *mut ComponentInstance,
@@ -1030,7 +1044,7 @@ unsafe fn copy<T: 'static>(
     Ok(())
 }
 
-fn guest_send<T: 'static>(
+fn guest_send<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
@@ -1056,7 +1070,7 @@ fn guest_send<T: 'static>(
             );
             let types = (*instance).component_types();
             let lift = &mut LiftContext::new(cx.0, &options, types, instance);
-            let sender_id = TableId::<TransmitSender<T>>::new(u32::load(
+            let sender_id = TableId::<TransmitSender>::new(u32::load(
                 lift,
                 InterfaceType::U32,
                 &lift.memory()[usize::try_from(params).unwrap()..][..4],
@@ -1193,7 +1207,7 @@ fn guest_send<T: 'static>(
     }
 }
 
-fn guest_receive<T: 'static>(
+fn guest_receive<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
@@ -1219,7 +1233,7 @@ fn guest_receive<T: 'static>(
             );
             let types = (*instance).component_types();
             let lift = &mut LiftContext::new(cx.0, &options, types, instance);
-            let receiver_id = TableId::<TransmitReceiver<T>>::new(u32::load(
+            let receiver_id = TableId::<TransmitReceiver>::new(u32::load(
                 lift,
                 InterfaceType::U32,
                 &lift.memory()[usize::try_from(params).unwrap()..][..4],
@@ -1286,10 +1300,13 @@ fn guest_receive<T: 'static>(
                 }
 
                 SendState::HostReady { accept, close } => {
-                    let mut lower =
-                        LowerContext::new(cx.as_context_mut(), &options, types, instance);
                     accept(Receiver::Guest {
-                        lower: &mut lower,
+                        lower: RawLowerContext {
+                            store: cx.0.traitobj(),
+                            options: &options,
+                            types,
+                            instance,
+                        },
                         ty: receive_result(ty, types),
                         offset: usize::try_from(results).unwrap(),
                     })?;
@@ -1378,7 +1395,7 @@ fn guest_receive<T: 'static>(
     }
 }
 
-fn guest_drop_sender<T: 'static>(vmctx: *mut VMOpaqueContext, ty: TableIndex, sender: u32) {
+fn guest_drop_sender<T>(vmctx: *mut VMOpaqueContext, ty: TableIndex, sender: u32) {
     unsafe {
         handle_result(|| {
             let cx = VMComponentContext::from_opaque(vmctx);
@@ -1392,7 +1409,7 @@ fn guest_drop_sender<T: 'static>(vmctx: *mut VMOpaqueContext, ty: TableIndex, se
     }
 }
 
-fn guest_drop_receiver<T: 'static>(vmctx: *mut VMOpaqueContext, ty: TableIndex, receiver: u32) {
+fn guest_drop_receiver<T>(vmctx: *mut VMOpaqueContext, ty: TableIndex, receiver: u32) {
     unsafe {
         handle_result(|| {
             let cx = VMComponentContext::from_opaque(vmctx);
@@ -1406,7 +1423,7 @@ fn guest_drop_receiver<T: 'static>(vmctx: *mut VMOpaqueContext, ty: TableIndex, 
     }
 }
 
-pub(crate) extern "C" fn future_new<T: 'static>(
+pub(crate) extern "C" fn future_new<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     ty: TypeFutureTableIndex,
@@ -1415,7 +1432,7 @@ pub(crate) extern "C" fn future_new<T: 'static>(
     guest_new::<T>(vmctx, memory, TableIndex::Future(ty), results)
 }
 
-pub(crate) extern "C" fn future_send<T: 'static>(
+pub(crate) extern "C" fn future_send<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
@@ -1438,7 +1455,7 @@ pub(crate) extern "C" fn future_send<T: 'static>(
     )
 }
 
-pub(crate) extern "C" fn future_receive<T: 'static>(
+pub(crate) extern "C" fn future_receive<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
@@ -1461,7 +1478,7 @@ pub(crate) extern "C" fn future_receive<T: 'static>(
     )
 }
 
-pub(crate) extern "C" fn future_drop_sender<T: 'static>(
+pub(crate) extern "C" fn future_drop_sender<T>(
     vmctx: *mut VMOpaqueContext,
     ty: TypeFutureTableIndex,
     sender: u32,
@@ -1469,7 +1486,7 @@ pub(crate) extern "C" fn future_drop_sender<T: 'static>(
     guest_drop_sender::<T>(vmctx, TableIndex::Future(ty), sender)
 }
 
-pub(crate) extern "C" fn future_drop_receiver<T: 'static>(
+pub(crate) extern "C" fn future_drop_receiver<T>(
     vmctx: *mut VMOpaqueContext,
     ty: TypeFutureTableIndex,
     receiver: u32,
@@ -1477,7 +1494,7 @@ pub(crate) extern "C" fn future_drop_receiver<T: 'static>(
     guest_drop_receiver::<T>(vmctx, TableIndex::Future(ty), receiver)
 }
 
-pub(crate) extern "C" fn stream_new<T: 'static>(
+pub(crate) extern "C" fn stream_new<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     ty: TypeStreamTableIndex,
@@ -1486,7 +1503,7 @@ pub(crate) extern "C" fn stream_new<T: 'static>(
     guest_new::<T>(vmctx, memory, TableIndex::Stream(ty), results)
 }
 
-pub(crate) extern "C" fn stream_send<T: 'static>(
+pub(crate) extern "C" fn stream_send<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
@@ -1509,7 +1526,7 @@ pub(crate) extern "C" fn stream_send<T: 'static>(
     )
 }
 
-pub(crate) extern "C" fn stream_receive<T: 'static>(
+pub(crate) extern "C" fn stream_receive<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
@@ -1532,7 +1549,7 @@ pub(crate) extern "C" fn stream_receive<T: 'static>(
     )
 }
 
-pub(crate) extern "C" fn stream_drop_sender<T: 'static>(
+pub(crate) extern "C" fn stream_drop_sender<T>(
     vmctx: *mut VMOpaqueContext,
     ty: TypeStreamTableIndex,
     sender: u32,
@@ -1540,7 +1557,7 @@ pub(crate) extern "C" fn stream_drop_sender<T: 'static>(
     guest_drop_sender::<T>(vmctx, TableIndex::Stream(ty), sender)
 }
 
-pub(crate) extern "C" fn stream_drop_receiver<T: 'static>(
+pub(crate) extern "C" fn stream_drop_receiver<T>(
     vmctx: *mut VMOpaqueContext,
     ty: TypeStreamTableIndex,
     receiver: u32,
@@ -1548,7 +1565,7 @@ pub(crate) extern "C" fn stream_drop_receiver<T: 'static>(
     guest_drop_receiver::<T>(vmctx, TableIndex::Stream(ty), receiver)
 }
 
-pub(crate) extern "C" fn flat_stream_send<T: 'static>(
+pub(crate) extern "C" fn flat_stream_send<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
@@ -1575,7 +1592,7 @@ pub(crate) extern "C" fn flat_stream_send<T: 'static>(
     )
 }
 
-pub(crate) extern "C" fn flat_stream_receive<T: 'static>(
+pub(crate) extern "C" fn flat_stream_receive<T>(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
