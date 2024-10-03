@@ -472,7 +472,7 @@ impl Wasmtime {
                 // resource-related functions get their trait signatures
                 // during `type_resource`.
                 let sig = if let FunctionKind::Freestanding = func.kind {
-                    gen.generate_function_trait_sig(func);
+                    gen.generate_function_trait_sig(func, "Data");
                     Some(mem::take(&mut gen.src).into())
                 } else {
                     None
@@ -1758,11 +1758,11 @@ impl<'a> InterfaceGenerator<'a> {
             });
 
             if has_concurrent_function {
-                self.push_str("type Data;\n");
+                uwriteln!(self.src, "type {camel}Data;");
             }
 
             for func in &functions {
-                self.generate_function_trait_sig(func);
+                self.generate_function_trait_sig(func, &format!("{camel}Data"));
                 self.push_str(";\n");
             }
 
@@ -1802,7 +1802,7 @@ impl<'a> InterfaceGenerator<'a> {
                     "{async_trait}impl <_T: Host{camel} {maybe_maybe_sized} {maybe_send}> Host{camel} for &mut _T {{"
                 );
                 if has_concurrent_function {
-                    self.src.push_str("type Data = _T::Data;\n");
+                    uwriteln!(self.src, "type {camel}Data = _T::{camel}Data;");
                 }
                 for func in &functions {
                     let call_style = self
@@ -1810,7 +1810,7 @@ impl<'a> InterfaceGenerator<'a> {
                         .opts
                         .async_
                         .import_call_style(self.qualifier().as_deref(), &func.name);
-                    self.generate_function_trait_sig(func);
+                    self.generate_function_trait_sig(func, &format!("{camel}Data"));
                     if let CallStyle::Concurrent = call_style {
                         uwrite!(
                             self.src,
@@ -2503,7 +2503,7 @@ impl<'a> InterfaceGenerator<'a> {
                 FunctionKind::Freestanding => {}
                 _ => continue,
             }
-            self.generate_function_trait_sig(func);
+            self.generate_function_trait_sig(func, "Data");
             self.push_str(";\n");
         }
 
@@ -2554,16 +2554,63 @@ impl<'a> InterfaceGenerator<'a> {
         let (data_bounds, mut host_bounds, mut get_host_bounds) =
             match self.gen.opts.async_.call_style() {
                 CallStyle::Async => (
-                    "T: Send,",
+                    "T: Send,".to_string(),
                     "Host + Send".to_string(),
                     "Host + Send".to_string(),
                 ),
-                CallStyle::Concurrent => (
-                    "T: Host<Data = T> + Send + 'static",
-                    "Host<Data = T> + Send".to_string(),
-                    "Host<Data = D> + Send".to_string(),
-                ),
-                CallStyle::Sync => ("", "Host".to_string(), "Host".to_string()),
+                CallStyle::Concurrent => {
+                    let concurrent_traits = self.resolve.interfaces[id]
+                        .types
+                        .iter()
+                        .filter_map(|(name, ty)| match self.resolve.types[*ty].kind {
+                            TypeDefKind::Resource
+                                if self.resolve.interfaces[id].functions.values().any(|func| {
+                                    match func.kind {
+                                        FunctionKind::Freestanding => false,
+                                        FunctionKind::Method(resource)
+                                        | FunctionKind::Static(resource)
+                                        | FunctionKind::Constructor(resource) => {
+                                            *ty == resource
+                                                && matches!(
+                                                    self.gen.opts.async_.import_call_style(
+                                                        self.qualifier().as_deref(),
+                                                        &func.name
+                                                    ),
+                                                    CallStyle::Concurrent
+                                                )
+                                        }
+                                    }
+                                }) =>
+                            {
+                                Some(format!("{}Data", name.to_upper_camel_case()))
+                            }
+                            _ => None,
+                        })
+                        .chain(has_concurrent_function.then_some("Data".to_string()))
+                        .collect::<Vec<_>>();
+
+                    let constraints = |v| {
+                        if concurrent_traits.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "<{}>",
+                                concurrent_traits
+                                    .iter()
+                                    .map(|s| format!("{s} = {v}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    };
+
+                    (
+                        format!("T: Host{} + Send + 'static,", constraints("T")),
+                        format!("Host{} + Send", constraints("T")),
+                        format!("Host{} + Send", constraints("D")),
+                    )
+                }
+                CallStyle::Sync => (String::new(), "Host".to_string(), "Host".to_string()),
             };
 
         for ty in required_conversion_traits {
@@ -2672,7 +2719,7 @@ impl<'a> InterfaceGenerator<'a> {
                     .opts
                     .async_
                     .import_call_style(self.qualifier().as_deref(), &func.name);
-                self.generate_function_trait_sig(func);
+                self.generate_function_trait_sig(func, "Data");
                 if let CallStyle::Concurrent = call_style {
                     uwrite!(
                         self.src,
@@ -2934,7 +2981,7 @@ impl<'a> InterfaceGenerator<'a> {
         self.src.push_str("}\n");
     }
 
-    fn generate_function_trait_sig(&mut self, func: &Function) {
+    fn generate_function_trait_sig(&mut self, func: &Function, data: &str) {
         let wt = self.gen.wasmtime_path();
         self.rustdoc(&func.docs);
 
@@ -2948,10 +2995,10 @@ impl<'a> InterfaceGenerator<'a> {
         }
         self.push_str("fn ");
         self.push_str(&rust_function_name(func));
-        self.push_str(if let CallStyle::Concurrent = &style {
-            "(store: wasmtime::StoreContextMut<'_, Self::Data>, "
+        self.push_str(&if let CallStyle::Concurrent = &style {
+            format!("(store: wasmtime::StoreContextMut<'_, Self::{data}>, ")
         } else {
-            "(&mut self, "
+            "(&mut self, ".to_string()
         });
         for (name, param) in func.params.iter() {
             let name = to_rust_ident(name);
@@ -2964,7 +3011,7 @@ impl<'a> InterfaceGenerator<'a> {
         self.push_str(" -> ");
 
         if let CallStyle::Concurrent = &style {
-            self.push_str("impl ::std::future::Future<Output = impl FnOnce(wasmtime::StoreContextMut<'_, Self::Data>) -> ");
+            uwrite!(self.src, "impl ::std::future::Future<Output = impl FnOnce(wasmtime::StoreContextMut<'_, Self::{data}>) -> ");
         }
 
         if !self.gen.opts.trappable_imports.can_trap(func) {
