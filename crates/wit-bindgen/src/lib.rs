@@ -59,10 +59,10 @@ struct Wasmtime {
     opts: Opts,
     /// A list of all interfaces which were imported by this world.
     ///
-    /// The first value here is the contents of the module that this interface
-    /// generated. The second value is the name of the interface as also present
-    /// in `self.interface_names`.
-    import_interfaces: Vec<(String, InterfaceName)>,
+    /// The first two values identify the interface; the third is the contents of the
+    /// module that this interface generated. The fourth value is the name of the
+    /// interface as also present in `self.interface_names`.
+    import_interfaces: Vec<(WorldKey, InterfaceId, String, InterfaceName)>,
     import_functions: Vec<ImportFunction>,
     exports: Exports,
     types: Types,
@@ -539,8 +539,12 @@ impl Wasmtime {
                         "
                     )
                 };
-                self.import_interfaces
-                    .push((module, self.interface_names[id].clone()));
+                self.import_interfaces.push((
+                    name.clone(),
+                    *id,
+                    module,
+                    self.interface_names[id].clone(),
+                ));
             }
             WorldItem::Type(ty) => {
                 let name = match name {
@@ -1102,7 +1106,12 @@ impl<_T{bounds}> {camel}Pre<_T> {{
         }
 
         let imports = mem::take(&mut self.import_interfaces);
-        self.emit_modules(imports);
+        self.emit_modules(
+            imports
+                .into_iter()
+                .map(|(.., module, path)| (module, path))
+                .collect(),
+        );
 
         let exports = mem::take(&mut self.exports.modules);
         self.emit_modules(exports);
@@ -1471,7 +1480,7 @@ impl Wasmtime {
     fn import_interface_paths(&self) -> Vec<String> {
         self.import_interfaces
             .iter()
-            .map(|(_, name)| match name {
+            .map(|(.., name)| match name {
                 InterfaceName::Path(path) => path.join("::"),
                 InterfaceName::Remapped { name_at_root, .. } => name_at_root.clone(),
             })
@@ -1537,32 +1546,47 @@ impl Wasmtime {
             uwriteln!(self.src, "Ok(())\n}}");
         }
 
-        let (host_bounds, data_bounds) =
-            if let CallStyle::Concurrent = self.opts.async_.call_style() {
-                (
+        let (host_bounds, data_bounds) = if let CallStyle::Concurrent =
+            self.opts.async_.call_style()
+        {
+            // TODO: include world imports trait if applicable
+            let bounds = self
+                .import_interfaces
+                .iter()
+                .map(|(key, id, _, name)| {
+                    (
+                        key,
+                        id,
+                        match name {
+                            InterfaceName::Path(path) => path.join("::"),
+                            InterfaceName::Remapped { name_at_root, .. } => name_at_root.clone(),
+                        },
+                    )
+                })
+                .map(|(key, id, path)| {
                     format!(
-                        "U: Send{}",
-                        self.world_host_traits(resolve, world)
-                            .into_iter()
-                            .map(|s| format!(" + {s}<Data = T>"))
-                            .collect::<Vec<_>>()
-                            .concat()
-                    ),
-                    format!(
-                        "T: Send{} + 'static,",
-                        self.world_host_traits(resolve, world)
-                            .into_iter()
-                            .map(|s| format!(" + {s}<Data = T>"))
-                            .collect::<Vec<_>>()
-                            .concat()
-                    ),
-                )
-            } else {
-                (
-                    format!("U: {}", self.world_host_traits(resolve, world).join(" + ")),
-                    data_bounds.to_string(),
-                )
-            };
+                        " + {path}::Host{}",
+                        concurrent_constraints(
+                            resolve,
+                            &self.opts,
+                            Some(&resolve.name_world_key(key)),
+                            *id
+                        )("T")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .concat();
+
+            (
+                format!("U: Send{bounds}"),
+                format!("T: Send{bounds} + 'static,"),
+            )
+        } else {
+            (
+                format!("U: {}", self.world_host_traits(resolve, world).join(" + ")),
+                data_bounds.to_string(),
+            )
+        };
 
         if !self.opts.skip_mut_forwarding_impls {
             uwriteln!(
@@ -2559,53 +2583,15 @@ impl<'a> InterfaceGenerator<'a> {
                     "Host + Send".to_string(),
                 ),
                 CallStyle::Concurrent => {
-                    let concurrent_traits = self.resolve.interfaces[id]
-                        .types
-                        .iter()
-                        .filter_map(|(name, ty)| match self.resolve.types[*ty].kind {
-                            TypeDefKind::Resource
-                                if self.resolve.interfaces[id].functions.values().any(|func| {
-                                    match func.kind {
-                                        FunctionKind::Freestanding => false,
-                                        FunctionKind::Method(resource)
-                                        | FunctionKind::Static(resource)
-                                        | FunctionKind::Constructor(resource) => {
-                                            *ty == resource
-                                                && matches!(
-                                                    self.gen.opts.async_.import_call_style(
-                                                        self.qualifier().as_deref(),
-                                                        &func.name
-                                                    ),
-                                                    CallStyle::Concurrent
-                                                )
-                                        }
-                                    }
-                                }) =>
-                            {
-                                Some(format!("{}Data", name.to_upper_camel_case()))
-                            }
-                            _ => None,
-                        })
-                        .chain(has_concurrent_function.then_some("Data".to_string()))
-                        .collect::<Vec<_>>();
-
-                    let constraints = |v| {
-                        if concurrent_traits.is_empty() {
-                            String::new()
-                        } else {
-                            format!(
-                                "<{}>",
-                                concurrent_traits
-                                    .iter()
-                                    .map(|s| format!("{s} = {v}"))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        }
-                    };
+                    let constraints = concurrent_constraints(
+                        self.resolve,
+                        &self.gen.opts,
+                        self.qualifier().as_deref(),
+                        id,
+                    );
 
                     (
-                        format!("T: Host{} + Send + 'static,", constraints("T")),
+                        "T: Send + 'static,".to_string(),
                         format!("Host{} + Send", constraints("T")),
                         format!("Host{} + Send", constraints("D")),
                     )
@@ -2639,9 +2625,9 @@ impl<'a> InterfaceGenerator<'a> {
                     type Host = O;
                 }}
 
-                pub fn add_to_linker_get_host<T>(
+                pub fn add_to_linker_get_host<T, G: for<'a> GetHost<&'a mut T, T, Host: {host_bounds}>>(
                     linker: &mut {wt}::component::Linker<T>,
-                    host_getter: impl for<'a> GetHost<&'a mut T, T>,
+                    host_getter: G,
                 ) -> {wt}::Result<()>
                     where {data_bounds}
                 {{
@@ -2890,7 +2876,10 @@ impl<'a> InterfaceGenerator<'a> {
         };
 
         if let CallStyle::Concurrent = &style {
-            uwrite!(self.src, "let r = <T as {host_trait}>::{func_name}(host, ");
+            uwrite!(
+                self.src,
+                "let r = <G::Host as {host_trait}>::{func_name}(host, "
+            );
         } else {
             uwrite!(self.src, "let r = {host_trait}::{func_name}(host, ");
         }
@@ -3430,4 +3419,62 @@ fn get_world_resources<'a>(
             },
             _ => None,
         })
+}
+
+fn concurrent_constraints<'a>(
+    resolve: &'a Resolve,
+    opts: &Opts,
+    qualifier: Option<&str>,
+    id: InterfaceId,
+) -> impl Fn(&str) -> String + 'a {
+    let has_concurrent_function = resolve.interfaces[id].functions.iter().any(|(_, func)| {
+        matches!(func.kind, FunctionKind::Freestanding)
+            && matches!(
+                opts.async_.import_call_style(qualifier, &func.name),
+                CallStyle::Concurrent
+            )
+    });
+
+    let types = resolve.interfaces[id]
+        .types
+        .iter()
+        .filter_map(|(name, ty)| match resolve.types[*ty].kind {
+            TypeDefKind::Resource
+                if resolve.interfaces[id]
+                    .functions
+                    .values()
+                    .any(|func| match func.kind {
+                        FunctionKind::Freestanding => false,
+                        FunctionKind::Method(resource)
+                        | FunctionKind::Static(resource)
+                        | FunctionKind::Constructor(resource) => {
+                            *ty == resource
+                                && matches!(
+                                    opts.async_.import_call_style(qualifier, &func.name),
+                                    CallStyle::Concurrent
+                                )
+                        }
+                    }) =>
+            {
+                Some(format!("{}Data", name.to_upper_camel_case()))
+            }
+            _ => None,
+        })
+        .chain(has_concurrent_function.then_some("Data".to_string()))
+        .collect::<Vec<_>>();
+
+    move |v| {
+        if types.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<{}>",
+                types
+                    .iter()
+                    .map(|s| format!("{s} = {v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
 }
