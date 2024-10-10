@@ -297,6 +297,8 @@ wasmtime_option_group! {
         pub cli: Option<bool>,
         /// Enable WASI APIs marked as: @unstable(feature = cli-exit-with-code)
         pub cli_exit_with_code: Option<bool>,
+        /// Enable WASI APIs marked as: @unstable(feature = http-body-append)
+        pub http_body_append: Option<bool>,
         /// Deprecated alias for `cli`
         pub common: Option<bool>,
         /// Enable support for WASI neural network API (experimental)

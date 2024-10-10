@@ -6,12 +6,15 @@ use bytes::Bytes;
 use http_body::{Body, Frame};
 use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::mem;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use wasmtime_wasi::{
+    bindings::io::streams::{InputStream, OutputStream},
     runtime::{poll_noop, AbortOnDropJoinHandle},
     HostInputStream, HostOutputStream, StreamError, Subscribe,
 };
@@ -412,13 +415,39 @@ impl WrittenState {
     }
 }
 
-/// The concrete type behind a `wasi:http/types/outgoing-body` resource.
-pub struct HostOutgoingBody {
+/// TODO: docs
+pub struct HostOutgoingBodyStreaming {
     /// The output stream that the body is written to.
     body_output_stream: Option<Box<dyn HostOutputStream>>,
     context: StreamContext,
     written: Option<WrittenState>,
     finish_sender: Option<tokio::sync::oneshot::Sender<FinishMessage>>,
+}
+
+/// TODO: docs
+struct AppendState {
+    stream: Option<OutputStream>,
+    appended: VecDeque<(InputStream, Option<u64>)>,
+    finish_sender: Option<tokio::sync::oneshot::Sender<FinishMessage>>,
+    trailers: Option<FieldMap>,
+}
+
+/// TODO: docs
+#[derive(Clone)]
+pub struct HostOutgoingBodyAppending {
+    context: StreamContext,
+    written: Option<WrittenState>,
+    state: Arc<Mutex<AppendState>>,
+}
+
+/// The concrete type behind a `wasi:http/types/outgoing-body` resource.
+pub enum HostOutgoingBody {
+    /// TODO: docs
+    Streaming(HostOutgoingBodyStreaming),
+    /// TODO: docs
+    Appending(HostOutgoingBodyAppending),
+    /// TODO: docs
+    Invalid,
 }
 
 impl HostOutgoingBody {
@@ -482,62 +511,162 @@ impl HostOutgoingBody {
             BodyWriteStream::new(context, 1024 * 1024, body_sender, written.clone());
 
         (
-            Self {
+            Self::Streaming(HostOutgoingBodyStreaming {
                 body_output_stream: Some(Box::new(output_stream)),
                 context,
                 written,
                 finish_sender: Some(finish_sender),
-            },
+            }),
             body_impl,
         )
     }
 
     /// Take the output stream, if it's available.
     pub fn take_output_stream(&mut self) -> Option<Box<dyn HostOutputStream>> {
-        self.body_output_stream.take()
+        match self {
+            Self::Streaming(state) => state.body_output_stream.take(),
+            Self::Appending(_) => None,
+            Self::Invalid => unreachable!(),
+        }
+    }
+
+    /// TODO: docs
+    pub fn append(
+        &mut self,
+        src: InputStream,
+        len: Option<u64>,
+        stream: Option<OutputStream>,
+    ) -> Option<HostOutgoingBodyAppending> {
+        let inner = match self {
+            Self::Streaming(_) => {
+                let Self::Streaming(inner) = mem::replace(self, HostOutgoingBody::Invalid) else {
+                    unreachable!()
+                };
+                let stream = if let Some(stream) = stream {
+                    if inner.body_output_stream.is_some() {
+                        panic!("redundant reclaimed stream for `HostOutgoingBody`");
+                    } else {
+                        stream
+                    }
+                } else if let Some(stream) = inner.body_output_stream {
+                    stream
+                } else {
+                    panic!(
+                        "can't append to a `HostOutgoingBody` without first reclaiming the output stream"
+                    );
+                };
+                let inner = HostOutgoingBodyAppending {
+                    context: inner.context,
+                    written: inner.written,
+                    state: Arc::new(Mutex::new(AppendState {
+                        stream: Some(stream),
+                        appended: VecDeque::new(),
+                        finish_sender: inner.finish_sender,
+                        trailers: None,
+                    })),
+                };
+                *self = HostOutgoingBody::Appending(inner.clone());
+                inner
+            }
+            Self::Appending(inner) => {
+                if stream.is_some() {
+                    panic!("redundant reclaimed stream for `HostOutgoingBody`");
+                }
+                inner.clone()
+            }
+            Self::Invalid => unreachable!(),
+        };
+
+        {
+            let mut state = inner.state.lock().unwrap();
+            state.appended.push_back((src, len));
+            state.appended.len() == 1
+        }
+        .then(|| inner.clone())
     }
 
     /// Finish the body, optionally with trailers.
-    pub fn finish(mut self, trailers: Option<FieldMap>) -> Result<(), types::ErrorCode> {
-        // Make sure that the output stream has been dropped, so that the BodyImpl poll function
-        // will immediately pick up the finish sender.
-        drop(self.body_output_stream);
+    pub fn finish(self, trailers: Option<FieldMap>) -> Result<(), types::ErrorCode> {
+        match self {
+            Self::Streaming(mut inner) => {
+                // Make sure that the output stream has been dropped, so that the
+                // BodyImpl poll function will immediately pick up the finish
+                // sender.
+                drop(inner.body_output_stream);
 
-        let sender = self
-            .finish_sender
-            .take()
-            .expect("outgoing-body trailer_sender consumed by a non-owning function");
+                let sender = inner
+                    .finish_sender
+                    .take()
+                    .expect("outgoing-body trailer_sender consumed by a non-owning function");
 
-        if let Some(w) = self.written {
-            let written = w.written();
-            if written != w.expected {
-                let _ = sender.send(FinishMessage::Abort);
-                return Err(self.context.as_body_size_error(written));
+                if let Some(w) = inner.written {
+                    let written = w.written();
+                    if written != w.expected {
+                        let _ = sender.send(FinishMessage::Abort);
+                        return Err(inner.context.as_body_size_error(Some(written)));
+                    }
+                }
+
+                let message = if let Some(ts) = trailers {
+                    FinishMessage::Trailers(ts)
+                } else {
+                    FinishMessage::Finished
+                };
+
+                // Ignoring failure: receiver died sending body, but we can't report that here.
+                let _ = sender.send(message.into());
             }
+            Self::Appending(inner) => {
+                if let Some(w) = inner.written {
+                    let mut state = inner.state.lock().unwrap();
+                    let mut written = Some(w.written());
+                    for (_, len) in &state.appended {
+                        if let Some(len) = len {
+                            written = written.map(|v| v + len);
+                        } else {
+                            written = None;
+                            break;
+                        }
+                    }
+                    if written != Some(w.expected) {
+                        state.stream = None;
+                        _ = state
+                            .finish_sender
+                            .take()
+                            .expect(
+                                "outgoing-body trailer_sender consumed by a non-owning function",
+                            )
+                            .send(FinishMessage::Abort);
+                        return Err(inner.context.as_body_size_error(written));
+                    }
+                }
+                inner.state.lock().unwrap().trailers = trailers;
+            }
+            Self::Invalid => unreachable!(),
         }
-
-        let message = if let Some(ts) = trailers {
-            FinishMessage::Trailers(ts)
-        } else {
-            FinishMessage::Finished
-        };
-
-        // Ignoring failure: receiver died sending body, but we can't report that here.
-        let _ = sender.send(message.into());
 
         Ok(())
     }
 
     /// Abort the body.
-    pub fn abort(mut self) {
-        // Make sure that the output stream has been dropped, so that the BodyImpl poll function
-        // will immediately pick up the finish sender.
-        drop(self.body_output_stream);
+    pub fn abort(self) {
+        let sender = match self {
+            Self::Streaming(mut inner) => {
+                // Make sure that the output stream has been dropped, so that
+                // the BodyImpl poll function will immediately pick up the
+                // finish sender.
+                drop(inner.body_output_stream);
 
-        let sender = self
-            .finish_sender
-            .take()
-            .expect("outgoing-body trailer_sender consumed by a non-owning function");
+                inner.finish_sender.take()
+            }
+            Self::Appending(inner) => {
+                let mut state = inner.state.lock().unwrap();
+                state.stream = None;
+                state.finish_sender.take()
+            }
+            Self::Invalid => unreachable!(),
+        }
+        .expect("outgoing-body trailer_sender consumed by a non-owning function");
 
         let _ = sender.send(FinishMessage::Abort);
     }
@@ -562,10 +691,10 @@ pub enum StreamContext {
 
 impl StreamContext {
     /// Construct the correct [`types::ErrorCode`] body size error.
-    pub fn as_body_size_error(&self, size: u64) -> types::ErrorCode {
+    pub fn as_body_size_error(&self, size: Option<u64>) -> types::ErrorCode {
         match self {
-            StreamContext::Request => types::ErrorCode::HttpRequestBodySize(Some(size)),
-            StreamContext::Response => types::ErrorCode::HttpResponseBodySize(Some(size)),
+            StreamContext::Request => types::ErrorCode::HttpRequestBodySize(size),
+            StreamContext::Response => types::ErrorCode::HttpResponseBodySize(size),
         }
     }
 }
@@ -611,7 +740,7 @@ impl HostOutputStream for BodyWriteStream {
                         let total = written.written();
                         return Err(StreamError::LastOperationFailed(anyhow!(self
                             .context
-                            .as_body_size_error(total))));
+                            .as_body_size_error(Some(total)))));
                     }
                 }
 

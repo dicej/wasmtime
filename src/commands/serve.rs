@@ -236,7 +236,7 @@ impl ServeCommand {
         if let Some(common) = self.run.common.wasi.common {
             if cli.is_some() {
                 bail!(
-                    "The -Scommon option should not be use with -Scli as it is a deprecated alias"
+                    "The -Scommon option should not be used with -Scli as it is a deprecated alias"
                 );
             } else {
                 // In the future, we may add a warning here to tell users to use
@@ -253,12 +253,16 @@ impl ServeCommand {
         // If `-Scli` isn't passed then use the `add_to_linker_async`
         // bindings which adds just those interfaces that the proxy interface
         // uses.
+        let wasi_http_link_options = self.run.compute_wasi_http_features();
         if cli == Some(true) {
-            let link_options = self.run.compute_wasi_features();
-            wasmtime_wasi::add_to_linker_with_options_async(linker, &link_options)?;
-            wasmtime_wasi_http::add_only_http_to_linker_async(linker)?;
+            let wasi_link_options = self.run.compute_wasi_features();
+            wasmtime_wasi::add_to_linker_with_options_async(linker, &wasi_link_options)?;
+            wasmtime_wasi_http::add_only_http_to_linker_with_options_async(
+                linker,
+                &wasi_http_link_options,
+            )?;
         } else {
-            wasmtime_wasi_http::add_to_linker_async(linker)?;
+            wasmtime_wasi_http::add_to_linker_with_options_async(linker, &wasi_http_link_options)?;
         }
 
         if self.run.common.wasi.nn == Some(true) {

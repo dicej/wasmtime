@@ -12,10 +12,12 @@ use crate::{
 };
 use anyhow::Context;
 use std::any::Any;
+use std::mem;
 use std::str::FromStr;
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::{
     bindings::io::streams::{InputStream, OutputStream},
+    pipe::ClosedOutputStream,
     Pollable, ResourceTableError,
 };
 
@@ -897,6 +899,48 @@ where
         } else {
             Ok(Err(()))
         }
+    }
+
+    fn append(
+        &mut self,
+        this: Resource<HostOutgoingBody>,
+        src: Resource<InputStream>,
+        len: Option<u64>,
+    ) -> wasmtime::Result<Result<(), Resource<types::IoError>>> {
+        // First, reclaim the child output stream, if any:
+        let mut first = true;
+        let mut dst = None;
+        let children = self.table().iter_child_reps(&this)?.collect::<Vec<_>>();
+        for child in children {
+            let child = self.table().get_any_mut(child)?;
+            // A HostOutgoingBody should have at most one child, and that child
+            // should be of type `OutputStream`:
+            if first {
+                first = false;
+                if let Some(child) = child.downcast_mut::<OutputStream>() {
+                    let child = mem::replace(child, Box::new(ClosedOutputStream));
+                    if !child.is_closed() {
+                        dst = Some(child);
+                    } else {
+                        // no problem; presumably we've already reclaimed the
+                        // stream in an earlier call to `append`
+                    }
+                } else {
+                    panic!("unexpected child type for `HostOutgoingBody`");
+                }
+            } else {
+                panic!("more than one child found for `HostOutgoingBody`")
+            }
+        }
+
+        let src = self.table().delete(src)?;
+        let appending = self.table().get_mut(&this)?.append(src, len, dst);
+
+        if let Some(appending) = appending {
+            self.push_appending(appending)?;
+        }
+
+        Ok(Ok(()))
     }
 
     fn finish(
