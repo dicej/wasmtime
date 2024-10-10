@@ -623,7 +623,34 @@ interface types {
     /// will return error.
     @since(version = 0.2.0)
     write: func() -> result<output-stream>;
-
+    
+    /// Append an `input-stream` to an `outgoing-body`, without blocking.
+    ///
+    /// This is related to `output-stream.splice`, but instead of reading a
+    /// range of bytes from the `input-stream` it takes ownership and
+    /// asynchronously appends the entire `input-stream` to the `outgoing-body`.
+    ///
+    /// Can be called multiple times without waiting for previous `append`
+    /// operations to complete. In this case, `append` operations are queued
+    /// up and start appending at the position in the `outgoing-body` that's
+    /// current when the operation starts.
+    ///
+    /// Calling `write` will fail after calling `append`, so it's not possible
+    /// to mix writes to the underlying `output-stream` with `append` operations.
+    ///
+    /// If a `len` value is provided, the implementation should read exactly that
+    /// number of bytes from the `input-stream`. If the `input-stream` is shorter,
+    /// the implementation should treat the body as corrupted and abort sending it,
+    /// even if additional `append` operations are pending.
+    @unstable(feature = http-body-append)
+    append: func(
+        /// The stream to append
+        src: input-stream,
+        /// The number of bytes to read from the `input-stream`. If not provided,
+        /// the entire stream will be read.
+        len: option<u64>
+    ) -> result<_, io-error>;
+    
     /// Finalize an outgoing body, optionally providing trailers. This must be
     /// called to signal that the response is complete. If the `outgoing-body`
     /// is dropped without calling `outgoing-body.finalize`, the implementation
@@ -631,8 +658,9 @@ interface types {
     ///
     /// Fails if the body's `outgoing-request` or `outgoing-response` was
     /// constructed with a Content-Length header, and the contents written
-    /// to the body (via `write`) does not match the value given in the
-    /// Content-Length.
+    /// to the body (via `write` or the `append` operation) does not match the
+    /// value given in the Content-Length. In case of the `append` operation,
+    /// the sum of the `len` values passed to `append` must match the Content-Length.
     @since(version = 0.2.0)
     finish: static func(
       this: outgoing-body,

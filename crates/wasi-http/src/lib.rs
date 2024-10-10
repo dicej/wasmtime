@@ -281,6 +281,17 @@ pub fn add_to_linker_async<T>(l: &mut wasmtime::component::Linker<T>) -> anyhow:
 where
     T: WasiHttpView + wasmtime_wasi::WasiView,
 {
+    add_to_linker_with_options_async(l, &crate::bindings::LinkOptions::default())
+}
+
+/// TODO: docs
+pub fn add_to_linker_with_options_async<T>(
+    l: &mut wasmtime::component::Linker<T>,
+    options: &crate::bindings::LinkOptions,
+) -> anyhow::Result<()>
+where
+    T: WasiHttpView + wasmtime_wasi::WasiView,
+{
     let closure = type_annotate_wasi::<T, _>(|t| wasmtime_wasi::WasiImpl(t));
     wasmtime_wasi::bindings::clocks::wall_clock::add_to_linker_get_host(l, closure)?;
     wasmtime_wasi::bindings::clocks::monotonic_clock::add_to_linker_get_host(l, closure)?;
@@ -292,7 +303,7 @@ where
     wasmtime_wasi::bindings::cli::stderr::add_to_linker_get_host(l, closure)?;
     wasmtime_wasi::bindings::random::random::add_to_linker_get_host(l, closure)?;
 
-    add_only_http_to_linker_async(l)
+    add_only_http_to_linker_with_options_async(l, options)
 }
 
 // NB: workaround some rustc inference - a future refactoring may make this
@@ -321,9 +332,20 @@ pub fn add_only_http_to_linker_async<T>(
 where
     T: WasiHttpView,
 {
+    add_only_http_to_linker_with_options_async(l, &crate::bindings::LinkOptions::default())
+}
+
+/// TODO: docs
+pub fn add_only_http_to_linker_with_options_async<T>(
+    l: &mut wasmtime::component::Linker<T>,
+    options: &crate::bindings::LinkOptions,
+) -> anyhow::Result<()>
+where
+    T: WasiHttpView,
+{
     let closure = type_annotate_http::<T, _>(|t| WasiHttpImpl(t));
     crate::bindings::http::outgoing_handler::add_to_linker_get_host(l, closure)?;
-    crate::bindings::http::types::add_to_linker_get_host(l, closure)?;
+    crate::bindings::http::types::add_to_linker_get_host(l, &options.into(), closure)?;
 
     Ok(())
 }
@@ -372,6 +394,17 @@ pub fn add_to_linker_sync<T>(l: &mut wasmtime::component::Linker<T>) -> anyhow::
 where
     T: WasiHttpView + wasmtime_wasi::WasiView,
 {
+    add_to_linker_with_options_sync(l, &crate::bindings::LinkOptions::default())
+}
+
+/// TODO: docs
+pub fn add_to_linker_with_options_sync<T>(
+    l: &mut wasmtime::component::Linker<T>,
+    options: &crate::bindings::LinkOptions,
+) -> anyhow::Result<()>
+where
+    T: WasiHttpView + wasmtime_wasi::WasiView,
+{
     let closure = type_annotate_wasi::<T, _>(|t| wasmtime_wasi::WasiImpl(t));
 
     wasmtime_wasi::bindings::clocks::wall_clock::add_to_linker_get_host(l, closure)?;
@@ -384,7 +417,7 @@ where
     wasmtime_wasi::bindings::cli::stderr::add_to_linker_get_host(l, closure)?;
     wasmtime_wasi::bindings::random::random::add_to_linker_get_host(l, closure)?;
 
-    add_only_http_to_linker_sync(l)?;
+    add_only_http_to_linker_with_options_sync(l, options)?;
 
     Ok(())
 }
@@ -398,10 +431,21 @@ pub fn add_only_http_to_linker_sync<T>(l: &mut wasmtime::component::Linker<T>) -
 where
     T: WasiHttpView,
 {
+    add_only_http_to_linker_with_options_sync(l, &crate::bindings::LinkOptions::default())
+}
+
+/// TODO: docs
+pub fn add_only_http_to_linker_with_options_sync<T>(
+    l: &mut wasmtime::component::Linker<T>,
+    options: &crate::bindings::LinkOptions,
+) -> anyhow::Result<()>
+where
+    T: WasiHttpView,
+{
     let closure = type_annotate_http::<T, _>(|t| WasiHttpImpl(t));
 
     crate::bindings::http::outgoing_handler::add_to_linker_get_host(l, closure)?;
-    crate::bindings::http::types::add_to_linker_get_host(l, closure)?;
+    crate::bindings::http::types::add_to_linker_get_host(l, &options.into(), closure)?;
 
     Ok(())
 }

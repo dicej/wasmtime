@@ -13,7 +13,7 @@ mod generated {
         // generated as async, but none of the imports here are async since
         // all the blocking-ness happens in wasi:io
         async: {
-            only_imports: ["nonexistent"],
+            only_imports: [],
         },
         trappable_imports: true,
         require_store_data_send: true,
@@ -47,7 +47,7 @@ pub use self::generated::wasi::*;
 pub use self::generated::exports;
 
 /// Bindings to the `wasi:http/proxy` world.
-pub use self::generated::{Proxy, ProxyIndices, ProxyPre};
+pub use self::generated::{LinkOptions, Proxy, ProxyIndices, ProxyPre};
 
 /// Sync implementation of the `wasi:http/proxy` world.
 pub mod sync {

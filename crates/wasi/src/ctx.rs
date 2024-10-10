@@ -12,6 +12,7 @@ use crate::{
 use anyhow::Result;
 use cap_rand::{Rng, RngCore, SeedableRng};
 use cap_std::ambient_authority;
+use futures::future;
 use std::path::Path;
 use std::sync::Arc;
 use std::{future::Future, pin::Pin};
@@ -583,6 +584,11 @@ pub trait WasiView: Send {
     ///
     /// The returned type is created through [`WasiCtxBuilder`].
     fn ctx(&mut self) -> &mut WasiCtx;
+
+    /// TODO: docs
+    fn on_idle(&mut self) -> impl Future<Output = ()> + Send + 'static {
+        future::pending()
+    }
 }
 
 impl<T: ?Sized + WasiView> WasiView for &mut T {

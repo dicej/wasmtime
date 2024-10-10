@@ -316,6 +316,18 @@ impl ResourceTable {
             child.entry.as_ref()
         }))
     }
+
+    /// Iterate over all children belonging to the provided parent
+    pub fn iter_child_reps<'a, T>(
+        &'a mut self,
+        parent: &Resource<T>,
+    ) -> Result<impl Iterator<Item = u32> + 'a, ResourceTableError>
+    where
+        T: 'static,
+    {
+        let parent_entry = self.occupied(parent.rep())?;
+        Ok(parent_entry.children.iter().copied())
+    }
 }
 
 impl Default for ResourceTable {

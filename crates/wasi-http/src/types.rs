@@ -4,11 +4,11 @@
 use crate::io::TokioIo;
 use crate::{
     bindings::http::types::{self, Method, Scheme},
-    body::{HostIncomingBody, HyperIncomingBody, HyperOutgoingBody},
+    body::{HostIncomingBody, HostOutgoingBodyAppending, HyperIncomingBody, HyperOutgoingBody},
     error::dns_error,
     hyper_request_error,
 };
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Body;
@@ -124,6 +124,11 @@ pub trait WasiHttpView: Send {
     /// Whether a given header should be considered forbidden and not allowed.
     fn is_forbidden_header(&mut self, _name: &HeaderName) -> bool {
         false
+    }
+
+    /// TODO: docs
+    fn push_appending(&mut self, _appending: HostOutgoingBodyAppending) -> wasmtime::Result<()> {
+        Err(anyhow!("WasiHttpView::push_appending not implemented"))
     }
 }
 

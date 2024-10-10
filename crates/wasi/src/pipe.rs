@@ -268,6 +268,11 @@ impl HostOutputStream for ClosedOutputStream {
     fn check_write(&mut self) -> Result<usize, StreamError> {
         Err(StreamError::Closed)
     }
+
+    /// TODO: docs
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait::async_trait]
