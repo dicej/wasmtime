@@ -4,11 +4,11 @@
 use crate::io::TokioIo;
 use crate::{
     bindings::http::types::{self, Method, Scheme},
-    body::{HostIncomingBody, HostOutgoingBodyAppending, HyperIncomingBody, HyperOutgoingBody},
+    body::{HostIncomingBody, HyperIncomingBody, HyperOutgoingBody},
     error::dns_error,
     hyper_request_error,
 };
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Body;
@@ -127,8 +127,12 @@ pub trait WasiHttpView: Send {
     }
 
     /// TODO: docs
-    fn push_appending(&mut self, _appending: HostOutgoingBodyAppending) -> wasmtime::Result<()> {
-        Err(anyhow!("WasiHttpView::push_appending not implemented"))
+    fn push_append_error_rx(&mut self, error_rx: tokio::sync::oneshot::Receiver<anyhow::Error>) {
+        tokio::task::spawn(async move {
+            if let Ok(error) = error_rx.await {
+                tracing::error!("error during outgoing body append: {error:?}")
+            }
+        });
     }
 }
 

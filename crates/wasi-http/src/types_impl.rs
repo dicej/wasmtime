@@ -918,13 +918,7 @@ where
             if first {
                 first = false;
                 if let Some(child) = child.downcast_mut::<OutputStream>() {
-                    let child = mem::replace(child, Box::new(ClosedOutputStream));
-                    if !child.is_closed() {
-                        dst = Some(child);
-                    } else {
-                        // no problem; presumably we've already reclaimed the
-                        // stream in an earlier call to `append`
-                    }
+                    dst = Some(mem::replace(child, Box::new(ClosedOutputStream)));
                 } else {
                     panic!("unexpected child type for `HostOutgoingBody`");
                 }
@@ -934,10 +928,13 @@ where
         }
 
         let src = self.table().delete(src)?;
-        let appending = self.table().get_mut(&this)?.append(src, len, dst);
+        let error_rx = match self.table().get_mut(&this)?.append(src, len, dst) {
+            Ok(rx) => rx,
+            Err(e) => return Ok(Err(self.table().push(e)?)),
+        };
 
-        if let Some(appending) = appending {
-            self.push_appending(appending)?;
+        if let Some(error_rx) = error_rx {
+            self.push_append_error_rx(error_rx);
         }
 
         Ok(Ok(()))

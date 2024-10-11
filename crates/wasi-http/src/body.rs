@@ -1,15 +1,14 @@
 //! Implementation of the `wasi:http/types` interface's various body types.
 
 use crate::{bindings::http::types, types::FieldMap};
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use bytes::Bytes;
+use futures::FutureExt;
 use http_body::{Body, Frame};
 use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
-use std::collections::VecDeque;
 use std::future::Future;
 use std::mem;
-use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
@@ -416,6 +415,16 @@ impl WrittenState {
 }
 
 /// TODO: docs
+pub enum AppendEvent {
+    /// TODO: docs
+    Append(InputStream, Option<u64>),
+    /// TODO: docs
+    Finish(Option<FieldMap>),
+    /// TODO: docs
+    Abort,
+}
+
+/// TODO: docs
 pub struct HostOutgoingBodyStreaming {
     /// The output stream that the body is written to.
     body_output_stream: Option<Box<dyn HostOutputStream>>,
@@ -424,30 +433,14 @@ pub struct HostOutgoingBodyStreaming {
     finish_sender: Option<tokio::sync::oneshot::Sender<FinishMessage>>,
 }
 
-/// TODO: docs
-struct AppendState {
-    stream: Option<OutputStream>,
-    appended: VecDeque<(InputStream, Option<u64>)>,
-    finish_sender: Option<tokio::sync::oneshot::Sender<FinishMessage>>,
-    trailers: Option<FieldMap>,
-}
-
-/// TODO: docs
-#[derive(Clone)]
-pub struct HostOutgoingBodyAppending {
-    context: StreamContext,
-    written: Option<WrittenState>,
-    state: Arc<Mutex<AppendState>>,
-}
-
 /// The concrete type behind a `wasi:http/types/outgoing-body` resource.
 pub enum HostOutgoingBody {
     /// TODO: docs
     Streaming(HostOutgoingBodyStreaming),
     /// TODO: docs
-    Appending(HostOutgoingBodyAppending),
+    Appending(mpsc::Sender<AppendEvent>),
     /// TODO: docs
-    Invalid,
+    Poisoned,
 }
 
 impl HostOutgoingBody {
@@ -526,7 +519,7 @@ impl HostOutgoingBody {
         match self {
             Self::Streaming(state) => state.body_output_stream.take(),
             Self::Appending(_) => None,
-            Self::Invalid => unreachable!(),
+            Self::Poisoned => unreachable!(),
         }
     }
 
@@ -536,53 +529,116 @@ impl HostOutgoingBody {
         src: InputStream,
         len: Option<u64>,
         stream: Option<OutputStream>,
-    ) -> Option<HostOutgoingBodyAppending> {
-        let inner = match self {
+    ) -> Result<Option<oneshot::Receiver<anyhow::Error>>, anyhow::Error> {
+        Ok(match self {
             Self::Streaming(_) => {
-                let Self::Streaming(inner) = mem::replace(self, HostOutgoingBody::Invalid) else {
+                let Self::Streaming(mut inner) = mem::replace(self, HostOutgoingBody::Poisoned)
+                else {
                     unreachable!()
                 };
-                let stream = if let Some(stream) = stream {
-                    if inner.body_output_stream.is_some() {
-                        panic!("redundant reclaimed stream for `HostOutgoingBody`");
-                    } else {
-                        stream
-                    }
-                } else if let Some(stream) = inner.body_output_stream {
-                    stream
-                } else {
-                    panic!(
-                        "can't append to a `HostOutgoingBody` without first reclaiming the output stream"
-                    );
-                };
-                let inner = HostOutgoingBodyAppending {
-                    context: inner.context,
-                    written: inner.written,
-                    state: Arc::new(Mutex::new(AppendState {
-                        stream: Some(stream),
-                        appended: VecDeque::new(),
-                        finish_sender: inner.finish_sender,
-                        trailers: None,
-                    })),
-                };
-                *self = HostOutgoingBody::Appending(inner.clone());
-                inner
-            }
-            Self::Appending(inner) => {
-                if stream.is_some() {
-                    panic!("redundant reclaimed stream for `HostOutgoingBody`");
-                }
-                inner.clone()
-            }
-            Self::Invalid => unreachable!(),
-        };
+                let mut dst = inner
+                    .body_output_stream
+                    .or(stream)
+                    .expect("can't append to a `HostOutgoingBody` without first reclaiming the output stream");
 
-        {
-            let mut state = inner.state.lock().unwrap();
-            state.appended.push_back((src, len));
-            state.appended.len() == 1
-        }
-        .then(|| inner.clone())
+                let max_appends = 256;
+                let (tx, mut rx) = mpsc::channel(max_appends + 2);
+                let (error_tx, error_rx) = oneshot::channel();
+                let (mut actual_length, expected_length) = if let Some(w) = inner.written {
+                    (Some(w.written()), Some(w.expected))
+                } else {
+                    (None, None)
+                };
+                let finish_sender = inner
+                    .finish_sender
+                    .take()
+                    .expect("outgoing-body trailer_sender consumed by a non-owning function");
+
+                tokio::task::spawn(
+                    async move {
+                        let mut append_count = 0;
+                        while let Some(event) = rx.recv().await {
+                            match event {
+                                AppendEvent::Append(mut src, len) => {
+                                    append_count += 1;
+                                    if append_count > max_appends {
+                                        bail!(
+                                            "too many append operations on a single outgoing body \
+                                             (maximum is {max_appends})"
+                                        );
+                                    }
+                                    actual_length = actual_length.zip(len).map(|(a, b)| a + b);
+                                    let max_read = 1024 * 1024;
+                                    let mut remaining = len;
+                                    while remaining.map(|v| v > 0).unwrap_or(true) {
+                                        let length = usize::try_from(
+                                            max_read.min(remaining.unwrap_or(u64::MAX)),
+                                        )
+                                        .unwrap_or(usize::MAX)
+                                        .min(dst.write_ready().await?);
+
+                                        if length == 0 {
+                                            if remaining.map(|v| v > 0).unwrap_or(false) {
+                                                bail!("append output stream closed unexpectedly")
+                                            }
+                                        } else {
+                                            let bytes = src.blocking_read(length).await?;
+                                            let length = bytes.len();
+                                            if length > 0 {
+                                                dst.blocking_write_and_flush(bytes).await?;
+                                                remaining = remaining
+                                                    .map(|v| v - u64::try_from(length).unwrap());
+                                            }
+                                        }
+                                    }
+                                }
+                                AppendEvent::Finish(trailers) => {
+                                    return if expected_length.is_none()
+                                        || actual_length == expected_length
+                                    {
+                                        Ok(if let Some(trailers) = trailers {
+                                            FinishMessage::Trailers(trailers)
+                                        } else {
+                                            FinishMessage::Finished
+                                        })
+                                    } else {
+                                        Err(anyhow!(
+                                            "body length mismatch: \
+                                             expected {expected_length:?}; \
+                                             got {actual_length:?}"
+                                        ))
+                                    };
+                                }
+                                AppendEvent::Abort => {
+                                    return Ok(FinishMessage::Abort);
+                                }
+                            }
+                        }
+
+                        Err(anyhow!("unexpected end of append stream"))
+                    }
+                    .map(move |result| {
+                        _ = finish_sender.send(match result {
+                            Ok(message) => message,
+                            Err(error) => {
+                                _ = error_tx.send(error);
+                                FinishMessage::Abort
+                            }
+                        });
+                    }),
+                );
+
+                *self = HostOutgoingBody::Appending(tx);
+
+                Some(error_rx)
+            }
+            Self::Appending(tx) => {
+                tx.try_send(AppendEvent::Append(src, len))
+                    .map_err(|_| anyhow!("append failed"))?;
+                None
+            }
+            Self::Poisoned => unreachable!(),
+        })
     }
 
     /// Finish the body, optionally with trailers.
@@ -616,33 +672,12 @@ impl HostOutgoingBody {
                 // Ignoring failure: receiver died sending body, but we can't report that here.
                 let _ = sender.send(message.into());
             }
-            Self::Appending(inner) => {
-                if let Some(w) = inner.written {
-                    let mut state = inner.state.lock().unwrap();
-                    let mut written = Some(w.written());
-                    for (_, len) in &state.appended {
-                        if let Some(len) = len {
-                            written = written.map(|v| v + len);
-                        } else {
-                            written = None;
-                            break;
-                        }
-                    }
-                    if written != Some(w.expected) {
-                        state.stream = None;
-                        _ = state
-                            .finish_sender
-                            .take()
-                            .expect(
-                                "outgoing-body trailer_sender consumed by a non-owning function",
-                            )
-                            .send(FinishMessage::Abort);
-                        return Err(inner.context.as_body_size_error(written));
-                    }
-                }
-                inner.state.lock().unwrap().trailers = trailers;
+            Self::Appending(tx) => {
+                tx.try_send(AppendEvent::Finish(trailers)).map_err(|_| {
+                    types::ErrorCode::InternalError(Some("append failed".to_string()))
+                })?;
             }
-            Self::Invalid => unreachable!(),
+            Self::Poisoned => unreachable!(),
         }
 
         Ok(())
@@ -650,25 +685,24 @@ impl HostOutgoingBody {
 
     /// Abort the body.
     pub fn abort(self) {
-        let sender = match self {
+        match self {
             Self::Streaming(mut inner) => {
                 // Make sure that the output stream has been dropped, so that
                 // the BodyImpl poll function will immediately pick up the
                 // finish sender.
                 drop(inner.body_output_stream);
 
-                inner.finish_sender.take()
+                _ = inner
+                    .finish_sender
+                    .take()
+                    .expect("outgoing-body trailer_sender consumed by a non-owning function")
+                    .send(FinishMessage::Abort)
             }
-            Self::Appending(inner) => {
-                let mut state = inner.state.lock().unwrap();
-                state.stream = None;
-                state.finish_sender.take()
+            Self::Appending(tx) => {
+                _ = tx.try_send(AppendEvent::Abort);
             }
-            Self::Invalid => unreachable!(),
+            Self::Poisoned => unreachable!(),
         }
-        .expect("outgoing-body trailer_sender consumed by a non-owning function");
-
-        let _ = sender.send(FinishMessage::Abort);
     }
 }
 

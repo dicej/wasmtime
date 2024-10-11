@@ -128,8 +128,6 @@ where
             return Err(anyhow!("empty poll list"));
         }
 
-        let idle = Some(Box::pin(self.on_idle()) as Pin<Box<dyn Future<Output = ()> + Send>>);
-
         let table = self.table();
 
         let mut table_futures: HashMap<u32, (MakeFuture, Vec<ReadylistIndex>)> = HashMap::new();
@@ -152,7 +150,6 @@ where
 
         struct PollList<'a> {
             futures: Vec<(PollableFuture<'a>, Vec<ReadylistIndex>)>,
-            idle: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
         }
         impl<'a> Future for PollList<'a> {
             type Output = Vec<u32>;
@@ -169,14 +166,6 @@ where
                         Poll::Pending => {}
                     }
                 }
-                if let Some(idle) = self.idle.as_mut() {
-                    match idle.as_mut().poll(cx) {
-                        Poll::Ready(()) => {
-                            self.idle = None;
-                        }
-                        Poll::Pending => {}
-                    }
-                }
                 if any_ready {
                     Poll::Ready(results)
                 } else {
@@ -185,7 +174,7 @@ where
             }
         }
 
-        Ok(PollList { futures, idle }.await)
+        Ok(PollList { futures }.await)
     }
 }
 

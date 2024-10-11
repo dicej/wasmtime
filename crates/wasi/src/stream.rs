@@ -244,11 +244,6 @@ pub trait HostOutputStream: Subscribe {
 
     /// Cancel any asynchronous work and wait for it to wrap up.
     async fn cancel(&mut self) {}
-
-    /// TODO: docs
-    fn is_closed(&self) -> bool {
-        false
-    }
 }
 
 #[async_trait::async_trait]
