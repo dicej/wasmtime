@@ -554,6 +554,9 @@ impl HostOutgoingBody {
                     .take()
                     .expect("outgoing-body trailer_sender consumed by a non-owning function");
 
+                tx.try_send(AppendEvent::Append(src, len))
+                    .map_err(|_| anyhow!("append failed"))?;
+
                 tokio::task::spawn(
                     async move {
                         let mut append_count = 0;

@@ -946,7 +946,6 @@ where
         ts: Option<Resource<Trailers>>,
     ) -> crate::HttpResult<()> {
         let body = self.table().delete(id)?;
-
         let ts = if let Some(ts) = ts {
             Some(move_fields(self.table(), ts)?)
         } else {
@@ -954,6 +953,7 @@ where
         };
 
         body.finish(ts)?;
+
         Ok(())
     }
 
