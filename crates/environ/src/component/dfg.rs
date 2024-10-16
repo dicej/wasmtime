@@ -272,8 +272,18 @@ pub enum Trampoline {
     ResourceNew(TypeResourceTableIndex),
     ResourceRep(TypeResourceTableIndex),
     ResourceDrop(TypeResourceTableIndex),
-    AsyncStart(TypeFuncIndex),
-    AsyncReturn(TypeFuncIndex),
+    TaskBackpressure {
+        instance: RuntimeComponentInstanceIndex,
+    },
+    TaskReturn,
+    TaskWait {
+        memory: MemoryId,
+    },
+    TaskPoll {
+        memory: MemoryId,
+    },
+    TaskYield,
+    SubtaskDrop,
     FutureNew {
         ty: TypeFutureTableIndex,
         memory: MemoryId,
@@ -312,9 +322,6 @@ pub enum Trampoline {
     },
     ErrorDrop {
         ty: TypeErrorTableIndex,
-    },
-    TaskWait {
-        memory: MemoryId,
     },
     ResourceTransferOwn,
     ResourceTransferBorrow,
@@ -708,8 +715,18 @@ impl LinearizeDfg<'_> {
             Trampoline::ResourceNew(ty) => info::Trampoline::ResourceNew(*ty),
             Trampoline::ResourceDrop(ty) => info::Trampoline::ResourceDrop(*ty),
             Trampoline::ResourceRep(ty) => info::Trampoline::ResourceRep(*ty),
-            Trampoline::AsyncStart(ty) => info::Trampoline::AsyncStart(*ty),
-            Trampoline::AsyncReturn(ty) => info::Trampoline::AsyncReturn(*ty),
+            Trampoline::TaskBackpressure { instance } => info::Trampoline::TaskBackpressure {
+                instance: *instance,
+            },
+            Trampoline::TaskReturn => info::Trampoline::TaskReturn,
+            Trampoline::TaskWait { memory } => info::Trampoline::TaskWait {
+                memory: self.runtime_memory(*memory),
+            },
+            Trampoline::TaskPoll { memory } => info::Trampoline::TaskPoll {
+                memory: self.runtime_memory(*memory),
+            },
+            Trampoline::TaskYield => info::Trampoline::TaskYield,
+            Trampoline::SubtaskDrop => info::Trampoline::SubtaskDrop,
             Trampoline::FutureNew { ty, memory, .. } => info::Trampoline::FutureNew {
                 ty: *ty,
                 memory: self.runtime_memory(*memory),
@@ -743,9 +760,6 @@ impl LinearizeDfg<'_> {
                 info::Trampoline::StreamDropReceiver { ty: *ty }
             }
             Trampoline::ErrorDrop { ty } => info::Trampoline::ErrorDrop { ty: *ty },
-            Trampoline::TaskWait { memory } => info::Trampoline::TaskWait {
-                memory: self.runtime_memory(*memory),
-            },
             Trampoline::ResourceTransferOwn => info::Trampoline::ResourceTransferOwn,
             Trampoline::ResourceTransferBorrow => info::Trampoline::ResourceTransferBorrow,
             Trampoline::ResourceEnterCall => info::Trampoline::ResourceEnterCall,

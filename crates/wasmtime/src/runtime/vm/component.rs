@@ -133,22 +133,39 @@ pub struct VMLowering {
 }
 
 /// TODO: docs
-pub type VMAsyncCallback = extern "C" fn(
+pub type VMTaskBackpressureCallback = extern "C" fn(
     vmctx: *mut VMOpaqueContext,
-    ty: TypeFuncIndex,
+    caller_instance: RuntimeComponentInstanceIndex,
+    arg: u32,
+);
+
+/// TODO: docs
+pub type VMTaskReturnCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
     args_and_results: *mut mem::MaybeUninit<ValRaw>,
     nargs_and_results: usize,
 );
+
+/// TODO: docs
+pub type VMTaskWaitOrPollCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    payload: u32,
+) -> u32;
+
+/// TODO: docs
+pub type VMTaskYieldCallback = extern "C" fn(vmctx: *mut VMOpaqueContext);
+
+/// TODO: docs
+pub type VMSubtaskDropCallback = extern "C" fn(vmctx: *mut VMOpaqueContext, arg: u32);
 
 /// TODO: docs
 pub type VMAsyncEnterCallback = extern "C" fn(
     vmctx: *mut VMOpaqueContext,
     start: *mut VMFuncRef,
     return_: *mut VMFuncRef,
-    store_call: *mut VMFuncRef,
     params: u32,
     results: u32,
-    call: u32,
     flags: u32,
 );
 
@@ -156,7 +173,6 @@ pub type VMAsyncEnterCallback = extern "C" fn(
 pub type VMAsyncExitCallback = extern "C" fn(
     vmctx: *mut VMOpaqueContext,
     callback: *mut VMFuncRef,
-    guest_context: u32,
     callee: *mut VMFuncRef,
     callee_instance: RuntimeComponentInstanceIndex,
     param_count: u32,
@@ -228,13 +244,6 @@ pub type VMStreamDropCallback =
 /// TODO: docs
 pub type VMErrorDropCallback =
     extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeErrorTableIndex, handle: u32);
-
-/// TODO: docs
-pub type VMTaskWaitCallback = extern "C" fn(
-    vmctx: *mut VMOpaqueContext,
-    memory: *mut VMMemoryDefinition,
-    payload: u32,
-) -> u32;
 
 /// This is a marker type to represent the underlying allocation of a
 /// `VMComponentContext`.
@@ -577,10 +586,14 @@ impl ComponentInstance {
     /// TODO: docs
     pub fn set_async_callbacks(
         &mut self,
-        start: VMAsyncCallback,
-        return_: VMAsyncCallback,
-        enter: VMAsyncEnterCallback,
-        exit: VMAsyncExitCallback,
+        task_backpressure: VMTaskBackpressureCallback,
+        task_return: VMTaskReturnCallback,
+        task_wait: VMTaskWaitOrPollCallback,
+        task_poll: VMTaskWaitOrPollCallback,
+        task_yield: VMTaskYieldCallback,
+        subtask_drop: VMSubtaskDropCallback,
+        async_enter: VMAsyncEnterCallback,
+        async_exit: VMAsyncExitCallback,
         future_new: VMFutureNewCallback,
         future_send: VMFutureTransmitCallback,
         future_receive: VMFutureTransmitCallback,
@@ -594,13 +607,16 @@ impl ComponentInstance {
         flat_stream_send: VMFlatStreamTransmitCallback,
         flat_stream_receive: VMFlatStreamTransmitCallback,
         error_drop: VMErrorDropCallback,
-        task_wait: VMTaskWaitCallback,
     ) {
         unsafe {
-            *self.vmctx_plus_offset_mut(self.offsets.async_start()) = start;
-            *self.vmctx_plus_offset_mut(self.offsets.async_return()) = return_;
-            *self.vmctx_plus_offset_mut(self.offsets.async_enter()) = enter;
-            *self.vmctx_plus_offset_mut(self.offsets.async_exit()) = exit;
+            *self.vmctx_plus_offset_mut(self.offsets.task_backpressure()) = task_backpressure;
+            *self.vmctx_plus_offset_mut(self.offsets.task_return()) = task_return;
+            *self.vmctx_plus_offset_mut(self.offsets.task_wait()) = task_wait;
+            *self.vmctx_plus_offset_mut(self.offsets.task_poll()) = task_poll;
+            *self.vmctx_plus_offset_mut(self.offsets.task_yield()) = task_yield;
+            *self.vmctx_plus_offset_mut(self.offsets.subtask_drop()) = subtask_drop;
+            *self.vmctx_plus_offset_mut(self.offsets.async_enter()) = async_enter;
+            *self.vmctx_plus_offset_mut(self.offsets.async_exit()) = async_exit;
             *self.vmctx_plus_offset_mut(self.offsets.future_new()) = future_new;
             *self.vmctx_plus_offset_mut(self.offsets.future_send()) = future_send;
             *self.vmctx_plus_offset_mut(self.offsets.future_receive()) = future_receive;
@@ -614,7 +630,6 @@ impl ComponentInstance {
             *self.vmctx_plus_offset_mut(self.offsets.flat_stream_send()) = flat_stream_send;
             *self.vmctx_plus_offset_mut(self.offsets.flat_stream_receive()) = flat_stream_receive;
             *self.vmctx_plus_offset_mut(self.offsets.error_drop()) = error_drop;
-            *self.vmctx_plus_offset_mut(self.offsets.task_wait()) = task_wait;
         }
     }
 
@@ -1003,10 +1018,14 @@ impl OwnedComponentInstance {
     /// TODO: docs
     pub fn set_async_callbacks(
         &mut self,
-        start: VMAsyncCallback,
-        return_: VMAsyncCallback,
-        enter: VMAsyncEnterCallback,
-        exit: VMAsyncExitCallback,
+        task_backpressure: VMTaskBackpressureCallback,
+        task_return: VMTaskReturnCallback,
+        task_wait: VMTaskWaitOrPollCallback,
+        task_poll: VMTaskWaitOrPollCallback,
+        task_yield: VMTaskYieldCallback,
+        subtask_drop: VMSubtaskDropCallback,
+        async_enter: VMAsyncEnterCallback,
+        async_exit: VMAsyncExitCallback,
         future_new: VMFutureNewCallback,
         future_send: VMFutureTransmitCallback,
         future_receive: VMFutureTransmitCallback,
@@ -1020,14 +1039,17 @@ impl OwnedComponentInstance {
         flat_stream_send: VMFlatStreamTransmitCallback,
         flat_stream_receive: VMFlatStreamTransmitCallback,
         error_drop: VMErrorDropCallback,
-        task_wait: VMTaskWaitCallback,
     ) {
         unsafe {
             self.instance_mut().set_async_callbacks(
-                start,
-                return_,
-                enter,
-                exit,
+                task_backpressure,
+                task_return,
+                task_wait,
+                task_poll,
+                task_yield,
+                subtask_drop,
+                async_enter,
+                async_exit,
                 future_new,
                 future_send,
                 future_receive,
@@ -1041,7 +1063,6 @@ impl OwnedComponentInstance {
                 flat_stream_send,
                 flat_stream_receive,
                 error_drop,
-                task_wait,
             )
         }
     }

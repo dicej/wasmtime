@@ -4,8 +4,12 @@
 //      magic: u32,
 //      libcalls: &'static VMComponentLibcalls,
 //      store: *mut dyn Store,
-//      async_start: VMAsyncCallback,
-//      async_return: VMAsyncCallback,
+//      task_backpressure: VMTaskBackpressureCallback,
+//      task_return: VMTaskReturnCallback,
+//      task_wait: VMTaskWaitOrPollCallback,
+//      task_poll: VMTaskWaitOrPollCallback,
+//      task_yield: VMTaskYieldCallback,
+//      subtask_drop: VMSubtaskDropCallback,
 //      async_enter: VMAsyncEnterCallback,
 //      async_exit: VMAsyncExitCallback,
 //      future_new: VMFutureNewCallback,
@@ -21,7 +25,6 @@
 //      flat_stream_send: VMFlatStreamTransmitCallback,
 //      flat_stream_receive: VMFlatStreamTransmitCallback,
 //      error_drop: VMErrorDropCallback,
-//      task_wait: VMTaskWaitCallback,
 //      limits: *const VMRuntimeLimits,
 //      flags: [VMGlobalDefinition; component.num_runtime_component_instances],
 //      trampoline_func_refs: [VMFuncRef; component.num_trampolines],
@@ -81,8 +84,12 @@ pub struct VMComponentOffsets<P> {
     magic: u32,
     libcalls: u32,
     store: u32,
-    async_start: u32,
-    async_return: u32,
+    task_backpressure: u32,
+    task_return: u32,
+    task_wait: u32,
+    task_poll: u32,
+    task_yield: u32,
+    subtask_drop: u32,
     async_enter: u32,
     async_exit: u32,
     future_new: u32,
@@ -98,7 +105,6 @@ pub struct VMComponentOffsets<P> {
     flat_stream_send: u32,
     flat_stream_receive: u32,
     error_drop: u32,
-    task_wait: u32,
     limits: u32,
     flags: u32,
     trampoline_func_refs: u32,
@@ -147,8 +153,12 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             post_returns: 0,
             resource_destructors: 0,
             size: 0,
-            async_start: 0,
-            async_return: 0,
+            task_backpressure: 0,
+            task_return: 0,
+            task_wait: 0,
+            task_poll: 0,
+            task_yield: 0,
+            subtask_drop: 0,
             async_enter: 0,
             async_exit: 0,
             future_new: 0,
@@ -164,7 +174,6 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             flat_stream_send: 0,
             flat_stream_receive: 0,
             error_drop: 0,
-            task_wait: 0,
         };
 
         // Convenience functions for checked addition and multiplication.
@@ -197,8 +206,12 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             size(libcalls) = ret.ptr.size(),
             size(store) = cmul(2, ret.ptr.size()),
             size(limits) = ret.ptr.size(),
-            size(async_start) = ret.ptr.size(),
-            size(async_return) = ret.ptr.size(),
+            size(task_backpressure) = ret.ptr.size(),
+            size(task_return) = ret.ptr.size(),
+            size(task_wait) = ret.ptr.size(),
+            size(task_poll) = ret.ptr.size(),
+            size(task_yield) = ret.ptr.size(),
+            size(subtask_drop) = ret.ptr.size(),
             size(async_enter) = ret.ptr.size(),
             size(async_exit) = ret.ptr.size(),
             size(future_new) = ret.ptr.size(),
@@ -214,7 +227,6 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             size(flat_stream_send) = ret.ptr.size(),
             size(flat_stream_receive) = ret.ptr.size(),
             size(error_drop) = ret.ptr.size(),
-            size(task_wait) = ret.ptr.size(),
             align(16),
             size(flags) = cmul(ret.num_runtime_component_instances, ret.ptr.size_of_vmglobal_definition()),
             align(u32::from(ret.ptr.size())),
@@ -294,13 +306,33 @@ impl<P: PtrSize> VMComponentOffsets<P> {
     }
 
     /// TODO: docs
-    pub fn async_start(&self) -> u32 {
-        self.async_start
+    pub fn task_backpressure(&self) -> u32 {
+        self.task_backpressure
     }
 
     /// TODO: docs
-    pub fn async_return(&self) -> u32 {
-        self.async_return
+    pub fn task_return(&self) -> u32 {
+        self.task_return
+    }
+
+    /// TODO: docs
+    pub fn task_wait(&self) -> u32 {
+        self.task_wait
+    }
+
+    /// TODO: docs
+    pub fn task_poll(&self) -> u32 {
+        self.task_poll
+    }
+
+    /// TODO: docs
+    pub fn task_yield(&self) -> u32 {
+        self.task_yield
+    }
+
+    /// TODO: docs
+    pub fn subtask_drop(&self) -> u32 {
+        self.subtask_drop
     }
 
     /// TODO: docs
@@ -376,11 +408,6 @@ impl<P: PtrSize> VMComponentOffsets<P> {
     /// TODO: docs
     pub fn error_drop(&self) -> u32 {
         self.error_drop
-    }
-
-    /// TODO: docs
-    pub fn task_wait(&self) -> u32 {
-        self.task_wait
     }
 
     /// The offset of the `VMLowering` for the `index` specified.

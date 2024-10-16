@@ -189,8 +189,26 @@ enum LocalInitializer<'data> {
     ResourceRep(AliasableResourceId, ModuleInternedTypeIndex),
     ResourceDrop(AliasableResourceId, ModuleInternedTypeIndex),
 
-    AsyncStart(ComponentFuncTypeId, ModuleInternedTypeIndex),
-    AsyncReturn(ComponentFuncTypeId, ModuleInternedTypeIndex),
+    TaskBackpressure {
+        func: ModuleInternedTypeIndex,
+    },
+    TaskReturn {
+        func: ModuleInternedTypeIndex,
+    },
+    TaskWait {
+        func: ModuleInternedTypeIndex,
+        memory: MemoryIndex,
+    },
+    TaskPoll {
+        func: ModuleInternedTypeIndex,
+        memory: MemoryIndex,
+    },
+    TaskYield {
+        func: ModuleInternedTypeIndex,
+    },
+    SubtaskDrop {
+        func: ModuleInternedTypeIndex,
+    },
 
     FutureNew {
         ty: ComponentDefinedTypeId,
@@ -240,10 +258,6 @@ enum LocalInitializer<'data> {
     },
     ErrorDrop {
         func: ModuleInternedTypeIndex,
-    },
-    TaskWait {
-        func: ModuleInternedTypeIndex,
-        memory: MemoryIndex,
     },
 
     // core wasm modules
@@ -586,25 +600,41 @@ impl<'a, 'data> Translator<'a, 'data> {
                         | wasmparser::CanonicalFunction::ThreadHwConcurrency => {
                             bail!("unsupported intrinsic")
                         }
-                        wasmparser::CanonicalFunction::AsyncStart {
-                            component_type_index,
-                        } => {
-                            let component_type = types
-                                .component_any_type_at(component_type_index)
-                                .unwrap_func();
+                        wasmparser::CanonicalFunction::TaskBackpressure => {
                             let core_type = self.core_func_signature(core_func_index)?;
                             core_func_index += 1;
-                            LocalInitializer::AsyncStart(component_type, core_type)
+                            LocalInitializer::TaskBackpressure { func: core_type }
                         }
-                        wasmparser::CanonicalFunction::AsyncReturn {
-                            component_type_index,
-                        } => {
-                            let component_type = types
-                                .component_any_type_at(component_type_index)
-                                .unwrap_func();
+                        wasmparser::CanonicalFunction::TaskReturn { .. } => {
                             let core_type = self.core_func_signature(core_func_index)?;
                             core_func_index += 1;
-                            LocalInitializer::AsyncReturn(component_type, core_type)
+                            LocalInitializer::TaskReturn { func: core_type }
+                        }
+                        wasmparser::CanonicalFunction::TaskWait { memory } => {
+                            let func = self.core_func_signature(core_func_index)?;
+                            core_func_index += 1;
+                            LocalInitializer::TaskWait {
+                                func,
+                                memory: MemoryIndex::from_u32(memory),
+                            }
+                        }
+                        wasmparser::CanonicalFunction::TaskPoll { memory } => {
+                            let func = self.core_func_signature(core_func_index)?;
+                            core_func_index += 1;
+                            LocalInitializer::TaskPoll {
+                                func,
+                                memory: MemoryIndex::from_u32(memory),
+                            }
+                        }
+                        wasmparser::CanonicalFunction::TaskYield => {
+                            let func = self.core_func_signature(core_func_index)?;
+                            core_func_index += 1;
+                            LocalInitializer::TaskYield { func }
+                        }
+                        wasmparser::CanonicalFunction::SubtaskDrop => {
+                            let func = self.core_func_signature(core_func_index)?;
+                            core_func_index += 1;
+                            LocalInitializer::SubtaskDrop { func }
                         }
                         wasmparser::CanonicalFunction::FutureNew { ty, memory } => {
                             let ty = types.component_defined_type_at(ty);
@@ -682,14 +712,6 @@ impl<'a, 'data> Translator<'a, 'data> {
                             let func = self.core_func_signature(core_func_index)?;
                             core_func_index += 1;
                             LocalInitializer::ErrorDrop { func }
-                        }
-                        wasmparser::CanonicalFunction::TaskWait { memory } => {
-                            let func = self.core_func_signature(core_func_index)?;
-                            core_func_index += 1;
-                            LocalInitializer::TaskWait {
-                                func,
-                                memory: MemoryIndex::from_u32(memory),
-                            }
                         }
                     };
                     self.result.initializers.push(init);

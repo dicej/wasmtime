@@ -517,8 +517,12 @@ impl<'a> Instantiator<'a> {
         let env_component = self.component.env_component();
 
         self.data.state.set_async_callbacks(
-            concurrent::async_start::<T>,
-            concurrent::async_return::<T>,
+            concurrent::task_backpressure::<T>,
+            concurrent::task_return::<T>,
+            concurrent::task_wait::<T>,
+            concurrent::task_poll::<T>,
+            concurrent::task_yield::<T>,
+            concurrent::subtask_drop::<T>,
             concurrent::async_enter::<T>,
             concurrent::async_exit::<T>,
             concurrent::future_new::<T>,
@@ -534,7 +538,6 @@ impl<'a> Instantiator<'a> {
             concurrent::flat_stream_send::<T>,
             concurrent::flat_stream_receive::<T>,
             concurrent::error_drop::<T>,
-            concurrent::task_wait::<T>,
         );
 
         // Before all initializers are processed configure all destructors for

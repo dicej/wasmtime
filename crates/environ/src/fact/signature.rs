@@ -158,17 +158,6 @@ impl ComponentTypesBuilder {
         }
     }
 
-    pub(super) fn async_store_call_signature(&self, options: &AdapterOptions) -> Signature {
-        let ptr_ty = options.options.ptr();
-
-        Signature {
-            params: vec![ptr_ty, ValType::I32],
-            results: Vec::new(),
-            params_indirect: false,
-            results_indirect: false,
-        }
-    }
-
     /// Pushes the flat version of a list of component types into a final result
     /// list.
     pub(super) fn flatten_types(

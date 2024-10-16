@@ -655,10 +655,26 @@ pub enum Trampoline {
     ResourceDrop(TypeResourceTableIndex),
 
     /// TODO: docs
-    AsyncStart(TypeFuncIndex),
-
+    TaskBackpressure {
+        /// TODO: docs
+        instance: RuntimeComponentInstanceIndex,
+    },
     /// TODO: docs
-    AsyncReturn(TypeFuncIndex),
+    TaskReturn,
+    /// TODO: docs
+    TaskWait {
+        /// TODO: docs
+        memory: RuntimeMemoryIndex,
+    },
+    /// TODO: docs
+    TaskPoll {
+        /// TODO: docs
+        memory: RuntimeMemoryIndex,
+    },
+    /// TODO: docs
+    TaskYield,
+    /// TODO: docs
+    SubtaskDrop,
 
     /// TODO: docs
     FutureNew {
@@ -727,11 +743,6 @@ pub enum Trampoline {
         /// TODO: docs
         ty: TypeErrorTableIndex,
     },
-    /// TODO: docs
-    TaskWait {
-        /// TODO: docs
-        memory: RuntimeMemoryIndex,
-    },
 
     /// An intrinsic used by FACT-generated modules which will transfer an owned
     /// resource from one table to another. Used in component-to-component
@@ -786,8 +797,12 @@ impl Trampoline {
             ResourceNew(i) => format!("component-resource-new[{}]", i.as_u32()),
             ResourceRep(i) => format!("component-resource-rep[{}]", i.as_u32()),
             ResourceDrop(i) => format!("component-resource-drop[{}]", i.as_u32()),
-            AsyncStart(i) => format!("async-start[{}]", i.as_u32()),
-            AsyncReturn(i) => format!("async-return[{}]", i.as_u32()),
+            TaskBackpressure { .. } => format!("task-backpressure"),
+            TaskReturn => format!("task-return"),
+            TaskWait { .. } => format!("task-wait"),
+            TaskPoll { .. } => format!("task-poll"),
+            TaskYield => format!("task-yield"),
+            SubtaskDrop => format!("subtask-drop"),
             FutureNew { .. } => format!("future-new"),
             FutureSend { .. } => format!("future-send"),
             FutureReceive { .. } => format!("future-receive"),
@@ -799,7 +814,6 @@ impl Trampoline {
             StreamDropSender { .. } => format!("stream-drop-sender"),
             StreamDropReceiver { .. } => format!("stream-drop-receiver"),
             ErrorDrop { .. } => format!("error-drop"),
-            TaskWait { .. } => format!("task-wait"),
             ResourceTransferOwn => format!("component-resource-transfer-own"),
             ResourceTransferBorrow => format!("component-resource-transfer-borrow"),
             ResourceEnterCall => format!("component-resource-enter-call"),

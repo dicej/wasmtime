@@ -174,54 +174,6 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
         result
     };
 
-    let store_call_adapter = |module: &mut Module, unreachable| {
-        let sig = module.types.async_store_call_signature(&adapter.lower);
-        let ty = module.core_types.function(&sig.params, &sig.results);
-        let result = module.funcs.push(Function::new(
-            Some(format!("[async-store-call]{}", adapter.name)),
-            ty,
-        ));
-
-        Compiler {
-            types: module.types,
-            module,
-            code: Vec::new(),
-            nlocals: sig.params.len() as u32,
-            free_locals: HashMap::new(),
-            traps: Vec::new(),
-            result,
-            fuel: INITIAL_FUEL,
-            emit_resource_call: false,
-        }
-        .compile_async_store_call_adapter(adapter, unreachable);
-
-        result
-    };
-
-    let dummy_callee = |module: &mut Module| {
-        let sig = module.types.signature(&adapter.lift, Context::Lift);
-        let ty = module.core_types.function(&sig.params, &sig.results);
-        let result = module.funcs.push(Function::new(
-            Some(format!("[async-dummy-callee]{}", adapter.name)),
-            ty,
-        ));
-
-        Compiler {
-            types: module.types,
-            module,
-            code: Vec::new(),
-            nlocals: sig.params.len() as u32,
-            free_locals: HashMap::new(),
-            traps: Vec::new(),
-            result,
-            fuel: INITIAL_FUEL,
-            emit_resource_call: false,
-        }
-        .compile_async_dummy_callee();
-
-        result
-    };
-
     match (adapter.lower.options.async_, adapter.lift.options.async_) {
         (false, false) => {
             let (compiler, lower_sig, lift_sig) = compiler(module, adapter);
@@ -230,15 +182,12 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
         (true, true) => {
             let (start, expect_retptr) = start_adapter(module, None);
             let return_ = return_adapter(module, None);
-            let store_call = store_call_adapter(module, false);
-            let dummy_callee = dummy_callee(module);
-            let (compiler, ..) = compiler(module, adapter);
+            let (compiler, _, lift_sig) = compiler(module, adapter);
             compiler.compile_async_to_async_adapter(
                 adapter,
                 start,
                 return_,
-                store_call,
-                dummy_callee,
+                i32::try_from(lift_sig.params.len()).unwrap(),
                 expect_retptr,
             );
         }
@@ -276,33 +225,28 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
 
             let (start, expect_retptr) = start_adapter(module, param_globals.as_deref());
             let return_ = return_adapter(module, result_globals.as_deref());
-            let dummy_store_call = store_call_adapter(module, true);
-            let dummy_callee = dummy_callee(module);
-            let (compiler, ..) = compiler(module, adapter);
+            let (compiler, _, lift_sig) = compiler(module, adapter);
             compiler.compile_sync_to_async_adapter(
                 adapter,
                 start,
                 return_,
-                dummy_store_call,
-                dummy_callee,
+                i32::try_from(lift_sig.params.len()).unwrap(),
                 expect_retptr,
                 param_globals.as_deref(),
                 result_globals.as_deref(),
             );
         }
         (true, false) => {
-            let sig = module.types.signature(&adapter.lift, Context::Lift);
+            let lift_sig = module.types.signature(&adapter.lift, Context::Lift);
             let (start, expect_retptr) = start_adapter(module, None);
             let return_ = return_adapter(module, None);
-            let store_call = store_call_adapter(module, false);
             let (compiler, ..) = compiler(module, adapter);
             compiler.compile_async_to_sync_adapter(
                 adapter,
                 start,
                 return_,
-                store_call,
-                i32::try_from(sig.params.len()).unwrap(),
-                i32::try_from(sig.results.len()).unwrap(),
+                i32::try_from(lift_sig.params.len()).unwrap(),
+                i32::try_from(lift_sig.results.len()).unwrap(),
                 expect_retptr,
             );
         }
@@ -445,8 +389,7 @@ impl Compiler<'_, '_> {
         adapter: &AdapterData,
         start: FunctionId,
         return_: FunctionId,
-        store_call: FunctionId,
-        dummy_callee: FunctionId,
+        param_count: i32,
         expect_retptr: bool,
     ) {
         let enter = self.module.import_async_enter_call();
@@ -461,26 +404,29 @@ impl Compiler<'_, '_> {
         self.module.funcs[self.result]
             .body
             .push(Body::RefFunc(return_));
-        self.module.funcs[self.result]
-            .body
-            .push(Body::RefFunc(store_call));
         self.instruction(LocalGet(0));
         self.instruction(LocalGet(1));
-        self.instruction(LocalGet(2));
         self.instruction(I32Const(if expect_retptr {
             ENTER_FLAG_EXPECT_RETPTR
         } else {
             0
         }));
         self.instruction(Call(enter.as_u32()));
-        self.instruction(Call(adapter.callee.as_u32()));
-        self.flush_code();
-        self.module.funcs[self.result]
-            .body
-            .push(Body::RefFunc(dummy_callee));
-        self.instruction(I32Const(0)); // dummy instance
-        self.instruction(I32Const(0)); // dummy param count
-        self.instruction(I32Const(0)); // dummy result count
+
+        // TODO: As an optimization, consider checking the backpressure flag on the callee instance and, if it's
+        // unset, translate the params and call the callee function directly here (and make sure `exit` knows _not_
+        // to call it in that case).
+
+        self.module.exports.push((
+            adapter.callee.as_u32(),
+            format!("[adapter-callee]{}", adapter.name),
+        ));
+        self.instruction(RefFunc(adapter.callee.as_u32()));
+        self.instruction(I32Const(
+            i32::try_from(adapter.lift.instance.as_u32()).unwrap(),
+        ));
+        self.instruction(I32Const(param_count));
+        self.instruction(I32Const(1)); // leave room for the guest context result
         self.instruction(I32Const(EXIT_FLAG_ASYNC_CALLER | EXIT_FLAG_ASYNC_CALLEE));
         self.instruction(Call(exit.as_u32()));
 
@@ -492,8 +438,7 @@ impl Compiler<'_, '_> {
         adapter: &AdapterData,
         start: FunctionId,
         return_: FunctionId,
-        dummy_store_call: FunctionId,
-        dummy_callee: FunctionId,
+        param_count: i32,
         expect_retptr: bool,
         param_globals: Option<&[u32]>,
         result_globals: Option<&[u32]>,
@@ -510,9 +455,6 @@ impl Compiler<'_, '_> {
         self.module.funcs[self.result]
             .body
             .push(Body::RefFunc(return_));
-        self.module.funcs[self.result]
-            .body
-            .push(Body::RefFunc(dummy_store_call));
 
         let results_local = if let Some(globals) = param_globals {
             for (local, global) in globals.iter().enumerate() {
@@ -535,21 +477,28 @@ impl Compiler<'_, '_> {
             self.instruction(LocalGet(results_local));
         }
 
-        self.instruction(I32Const(0)); // dummy call pointer
         self.instruction(I32Const(if expect_retptr {
             ENTER_FLAG_EXPECT_RETPTR
         } else {
             0
         }));
         self.instruction(Call(enter.as_u32()));
+
+        // TODO: As an optimization, consider checking the backpressure flag on the callee instance and, if it's
+        // unset, translate the params and call the callee function directly here (and make sure `exit` knows _not_
+        // to call it in that case).
+
         self.instruction(Call(adapter.callee.as_u32()));
-        self.flush_code();
-        self.module.funcs[self.result]
-            .body
-            .push(Body::RefFunc(dummy_callee));
-        self.instruction(I32Const(0)); // dummy instance
-        self.instruction(I32Const(0)); // dummy param count
-        self.instruction(I32Const(0)); // dummy result count
+        self.module.exports.push((
+            adapter.callee.as_u32(),
+            format!("[adapter-callee]{}", adapter.name),
+        ));
+        self.instruction(RefFunc(adapter.callee.as_u32()));
+        self.instruction(I32Const(
+            i32::try_from(adapter.lift.instance.as_u32()).unwrap(),
+        ));
+        self.instruction(I32Const(param_count));
+        self.instruction(I32Const(1)); // leave room for the guest context result
         self.instruction(I32Const(EXIT_FLAG_ASYNC_CALLEE));
         self.instruction(Call(exit.as_u32()));
         self.instruction(Drop);
@@ -571,7 +520,6 @@ impl Compiler<'_, '_> {
         adapter: &AdapterData,
         start: FunctionId,
         return_: FunctionId,
-        store_call: FunctionId,
         param_count: i32,
         result_count: i32,
         expect_retptr: bool,
@@ -586,12 +534,8 @@ impl Compiler<'_, '_> {
         self.module.funcs[self.result]
             .body
             .push(Body::RefFunc(return_));
-        self.module.funcs[self.result]
-            .body
-            .push(Body::RefFunc(store_call));
         self.instruction(LocalGet(0));
         self.instruction(LocalGet(1));
-        self.instruction(LocalGet(2));
         self.instruction(I32Const(if expect_retptr {
             ENTER_FLAG_EXPECT_RETPTR
         } else {
@@ -692,27 +636,6 @@ impl Compiler<'_, '_> {
             }
         }
 
-        self.finish()
-    }
-
-    fn compile_async_store_call_adapter(mut self, adapter: &AdapterData, unreachable: bool) {
-        if unreachable {
-            self.instruction(Unreachable);
-        } else {
-            self.instruction(LocalGet(0));
-            self.instruction(LocalGet(1));
-            self.instruction(I32Store(MemArg {
-                offset: 0,
-                align: 2,
-                memory_index: adapter.lower.options.memory.unwrap().as_u32(),
-            }));
-        }
-
-        self.finish()
-    }
-
-    fn compile_async_dummy_callee(mut self) {
-        self.instruction(Unreachable);
         self.finish()
     }
 

@@ -667,22 +667,52 @@ impl<'a> Inliner<'a> {
                     .push((*ty, dfg::Trampoline::ResourceDrop(id)));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
-            AsyncStart(component_type, core_type) => {
-                let component_type = types
-                    .convert_component_func_type(frame.translation.types_ref(), *component_type)?;
-                let index = self
-                    .result
-                    .trampolines
-                    .push((*core_type, dfg::Trampoline::AsyncStart(component_type)));
+            TaskBackpressure { func } => {
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::TaskBackpressure {
+                        instance: frame.instance,
+                    },
+                ));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
-            AsyncReturn(component_type, core_type) => {
-                let component_type = types
-                    .convert_component_func_type(frame.translation.types_ref(), *component_type)?;
+            TaskReturn { func } => {
                 let index = self
                     .result
                     .trampolines
-                    .push((*core_type, dfg::Trampoline::AsyncReturn(component_type)));
+                    .push((*func, dfg::Trampoline::TaskReturn));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            TaskWait { func, memory } => {
+                let (memory, _) = self.memory(frame, types, *memory);
+                let memory = self.result.memories.push(memory);
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::TaskWait { memory }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            TaskPoll { func, memory } => {
+                let (memory, _) = self.memory(frame, types, *memory);
+                let memory = self.result.memories.push(memory);
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::TaskPoll { memory }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            TaskYield { func } => {
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::TaskYield));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            SubtaskDrop { func } => {
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::SubtaskDrop));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
             FutureNew { ty, func, memory } => {
@@ -823,15 +853,6 @@ impl<'a> Inliner<'a> {
                     .result
                     .trampolines
                     .push((*func, dfg::Trampoline::ErrorDrop { ty }));
-                frame.funcs.push(dfg::CoreDef::Trampoline(index));
-            }
-            TaskWait { func, memory } => {
-                let (memory, _) = self.memory(frame, types, *memory);
-                let memory = self.result.memories.push(memory);
-                let index = self
-                    .result
-                    .trampolines
-                    .push((*func, dfg::Trampoline::TaskWait { memory }));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
 
@@ -1122,30 +1143,30 @@ impl<'a> Inliner<'a> {
         memory: MemoryIndex,
     ) -> (dfg::CoreExport<MemoryIndex>, bool) {
         let memory = frame.memories[memory].clone().map_index(|i| match i {
-                EntityIndex::Memory(i) => i,
-                _ => unreachable!(),
+            EntityIndex::Memory(i) => i,
+            _ => unreachable!(),
         });
         let memory64 = match &self.runtime_instances[memory.instance] {
-                InstanceModule::Static(idx) => match &memory.item {
-                    ExportItem::Index(i) => {
-                        let plan = &self.nested_modules[*idx].module.memory_plans[*i];
-                        match plan.memory.idx_type {
-                            IndexType::I32 => false,
-                            IndexType::I64 => true,
-                        }
+            InstanceModule::Static(idx) => match &memory.item {
+                ExportItem::Index(i) => {
+                    let plan = &self.nested_modules[*idx].module.memory_plans[*i];
+                    match plan.memory.idx_type {
+                        IndexType::I32 => false,
+                        IndexType::I64 => true,
                     }
-                    ExportItem::Name(_) => unreachable!(),
-                },
-                InstanceModule::Import(ty) => match &memory.item {
-                    ExportItem::Name(name) => match types[*ty].exports[name] {
-                        EntityType::Memory(m) => match m.idx_type {
-                            IndexType::I32 => false,
-                            IndexType::I64 => true,
-                        },
-                        _ => unreachable!(),
+                }
+                ExportItem::Name(_) => unreachable!(),
+            },
+            InstanceModule::Import(ty) => match &memory.item {
+                ExportItem::Name(name) => match types[*ty].exports[name] {
+                    EntityType::Memory(m) => match m.idx_type {
+                        IndexType::I32 => false,
+                        IndexType::I64 => true,
                     },
-                    ExportItem::Index(_) => unreachable!(),
+                    _ => unreachable!(),
                 },
+                ExportItem::Index(_) => unreachable!(),
+            },
         };
         (memory, memory64)
     }
