@@ -338,10 +338,9 @@ impl<'a> Module<'a> {
             } else {
                 ValType::I32
             };
-            let ty = self.core_types.function(
-                &[ptr, ValType::I32, ValType::I32, ValType::I32],
-                &[ValType::I32],
-            );
+            let ty = self
+                .core_types
+                .function(&[ptr, ValType::I32, ValType::I32], &[ValType::I32]);
             self.import_func(
                 "callback",
                 &format!("f{}", self.imported_funcs.len()),
@@ -469,9 +468,6 @@ impl<'a> Module<'a> {
             &[
                 ValType::FUNCREF,
                 ValType::FUNCREF,
-                ValType::FUNCREF,
-                ValType::I32,
-                ValType::I32,
                 ValType::I32,
                 ValType::I32,
             ],
@@ -486,7 +482,6 @@ impl<'a> Module<'a> {
             "async",
             "exit-call",
             &[
-                ValType::I32,
                 ValType::FUNCREF,
                 ValType::I32,
                 ValType::I32,

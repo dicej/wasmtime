@@ -59,7 +59,6 @@ const EVENT_CALL_STARTED: u32 = 0;
 const EVENT_CALL_RETURNED: u32 = 1;
 const EVENT_CALL_DONE: u32 = 2;
 
-const ENTER_FLAG_EXPECT_RETPTR: u32 = 1 << 0;
 const EXIT_FLAG_ASYNC_CALLER: u32 = 1 << 0;
 const EXIT_FLAG_ASYNC_CALLEE: u32 = 1 << 1;
 
@@ -137,10 +136,25 @@ impl EitherTask {
         }
     }
 
-    fn delete_from(&self, table: &mut Table) -> Result<()> {
+    fn delete_all_from<T>(&self, mut store: StoreContextMut<T>) -> Result<()> {
         match self {
-            Self::Host(task) => table.delete(*task).map(drop),
-            Self::Guest(task) => table.delete(*task).map(drop),
+            Self::Host(task) => store.concurrent_state().table.delete(*task).map(drop),
+            Self::Guest(task) => {
+                let finished = store
+                    .concurrent_state()
+                    .table
+                    .get(*task)?
+                    .events
+                    .iter()
+                    .filter_map(|(event, call)| (*event == EVENT_CALL_DONE).then_some(*call))
+                    .collect::<Vec<_>>();
+
+                for call in finished {
+                    call.delete_all_from(store.as_context_mut())?;
+                }
+
+                store.concurrent_state().table.delete(*task).map(drop)
+            }
         }?;
 
         Ok(())
@@ -421,7 +435,7 @@ pub(crate) fn poll_and_block<'a, T, R: Send + Sync + 'static>(
                         break (*result.downcast().unwrap(), store);
                     } else {
                         let async_cx = AsyncCx::new(&mut store);
-                        store = unsafe { async_cx.suspend(Some(store))?.unwrap() };
+                        store = unsafe { async_cx.suspend(Some(store)) }?.unwrap();
                     }
                 }
             }
@@ -464,49 +478,30 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: Send>(
         state.task_queue.push_back(guest_task);
     }
 
-    #[derive(Clone, Copy)]
-    struct PollCx(*mut *mut Context<'static>);
-
-    unsafe impl Send for PollCx {}
-
-    fn my_poll_fn<T, F: FnMut(&mut Context) -> Poll<T> + Send>(f: F) -> future::PollFn<F> {
-        future::poll_fn(f)
-    }
-
-    let poll_cx = PollCx(store.concurrent_state().async_state.current_poll_cx.get());
-    let mut store = my_poll_fn({
-        let mut store = Some(store);
-
-        move |cx| unsafe {
-            if let Some(mut my_store) = store.take() {
-                if let Poll::Ready(Some(ready)) =
-                    my_store.concurrent_state().futures.poll_next_unpin(cx)
-                {
-                    match handle_ready(my_store, ready) {
-                        Ok(s) => {
-                            my_store = s;
-                        }
-                        Err(e) => {
-                            return Poll::Ready(Err(e));
-                        }
+    let mut store = poll_fn(store, move |cx, mut store| {
+        if let Some(mut my_store) = store.take() {
+            if let Poll::Ready(Some(ready)) =
+                my_store.concurrent_state().futures.poll_next_unpin(cx)
+            {
+                match handle_ready(my_store, ready) {
+                    Ok(s) => {
+                        my_store = s;
+                    }
+                    Err(e) => {
+                        return Ok(Err(e));
                     }
                 }
-                store = Some(my_store);
             }
+            store = Some(my_store);
+        }
 
-            let _reset = Reset(poll_cx.0, *poll_cx.0);
-            *poll_cx.0 = mem::transmute::<&mut Context<'_>, *mut Context<'static>>(cx);
-            #[allow(dropping_copy_types)]
-            drop(poll_cx);
-            match resume_fiber(&mut fiber, store.take(), Ok(())) {
-                Ok((store, result)) => Poll::Ready(result.map(|()| store)),
-                Err(s) => {
-                    if let Some(range) = fiber.fiber.as_ref().unwrap().stack().range() {
-                        AsyncWasmCallState::assert_current_state_not_in_range(range);
-                    }
-                    store = s;
-                    Poll::Pending
+        match unsafe { resume_fiber(&mut fiber, store.take(), Ok(())) } {
+            Ok((store, result)) => Ok(result.map(|()| store)),
+            Err(s) => {
+                if let Some(range) = fiber.fiber.as_ref().unwrap().stack().range() {
+                    AsyncWasmCallState::assert_current_state_not_in_range(range);
                 }
+                Err(s)
             }
         }
     })
@@ -520,20 +515,12 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: Send>(
         .take();
 
     if !is_concurrent {
-        store = future::poll_fn({
-            let mut store = Some(store);
-
-            move |cx| unsafe {
-                let _reset = Reset(poll_cx.0, *poll_cx.0);
-                *poll_cx.0 = mem::transmute::<&mut Context<'_>, *mut Context<'static>>(cx);
-                #[allow(dropping_copy_types)]
-                drop(poll_cx);
-                Poll::Ready(maybe_resume_next_task(
-                    store.take().unwrap(),
-                    guest_task,
-                    instance,
-                ))
-            }
+        store = poll_fn(store, move |_, mut store| {
+            Ok(maybe_resume_next_task(
+                store.take().unwrap(),
+                guest_task,
+                instance,
+            ))
         })
         .await?;
     }
@@ -547,17 +534,7 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: Send>(
             // Note that this isn't always the case -- a task may yield a result without completing, in which case
             // it should be polled until it's completed using `poll_for_completion`.
 
-            let finished = task
-                .events
-                .iter()
-                .filter_map(|(event, call)| (*event == EVENT_CALL_DONE).then_some(*call))
-                .collect::<Vec<_>>();
-
-            for call in finished {
-                call.delete_from(&mut store.concurrent_state().table)?;
-            }
-
-            store.concurrent_state().table.delete(guest_task)?;
+            EitherTask::Guest(guest_task).delete_all_from(store.as_context_mut())?;
             store.concurrent_state().guest_task = None;
         }
         Ok((*result.downcast().unwrap(), store))
@@ -573,6 +550,7 @@ fn maybe_send_event<'a, T>(
     event: u32,
     call: EitherTask,
 ) -> Result<StoreContextMut<'a, T>> {
+    assert!(guest_task.rep() != call.rep());
     if let Some((callback, context)) = store.concurrent_state().table.get(guest_task)?.callback {
         let old_task = store.concurrent_state().guest_task.replace(guest_task);
         let params = &mut [
@@ -614,10 +592,12 @@ fn maybe_send_event<'a, T>(
             .deferred
             .take_fiber()
         {
-            resume_sync(store, guest_task, fiber)
-        } else {
-            Ok(store)
+            let old_task = store.concurrent_state().guest_task.replace(guest_task);
+            store = resume_sync(store, guest_task, fiber)?;
+            store.concurrent_state().guest_task = old_task;
         }
+
+        Ok(store)
     }
 }
 
@@ -703,15 +683,26 @@ fn poll_loop<'a, T>(
     mut store: StoreContextMut<'a, T>,
     continue_: impl Fn(&mut StoreContextMut<'a, T>) -> Result<bool>,
 ) -> Result<StoreContextMut<'a, T>> {
-    while continue_(&mut store)? {
+    loop {
         let cx = AsyncCx::new(&mut store);
         let mut future = pin!(store.concurrent_state().futures.next());
-        let (ready, _) = unsafe { cx.block_on::<T, _>(future.as_mut(), None)? };
+        let ready = unsafe { cx.poll(future.as_mut()) };
 
-        if let Some(ready) = ready {
-            store = handle_ready(store, ready)?;
-        } else {
-            break;
+        match ready {
+            Poll::Ready(Some(ready)) => {
+                store = handle_ready(store, ready)?;
+            }
+            Poll::Ready(None) => {
+                break;
+            }
+            Poll::Pending => {
+                if continue_(&mut store)? {
+                    let cx = AsyncCx::new(&mut store);
+                    store = unsafe { cx.suspend(Some(store)) }?.unwrap();
+                } else {
+                    break;
+                }
+            }
         }
     }
 
@@ -903,17 +894,19 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, check: TaskCheck) -> Result<u3
 
     let guest_task = cx.concurrent_state().guest_task.unwrap();
 
-    if cx
-        .concurrent_state()
-        .table
-        .get(guest_task)?
-        .callback
-        .is_some()
+    let wait = matches!(check, TaskCheck::Wait(..));
+
+    if wait
+        && cx
+            .concurrent_state()
+            .table
+            .get(guest_task)?
+            .callback
+            .is_some()
     {
         bail!("cannot call `task.wait` from async-lifted export with callback");
     }
 
-    let wait = matches!(check, TaskCheck::Wait(..));
     let mut cx = poll_loop(cx, move |cx| {
         Ok::<_, anyhow::Error>(
             wait && cx
@@ -926,7 +919,7 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, check: TaskCheck) -> Result<u3
     })?;
 
     match check {
-        TaskCheck::Wait(memory, payload) | TaskCheck::Poll(memory, payload) => {
+        TaskCheck::Wait(memory, payload) => {
             let (event, call) = cx
                 .concurrent_state()
                 .table
@@ -944,14 +937,42 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, check: TaskCheck) -> Result<u3
                 None,
             );
             let types = (*instance).component_types();
-            let ptr = func::validate_inbounds::<(u32, u32)>(
-                options.memory_mut(cx.0),
-                &ValRaw::u32(payload),
-            )?;
+            let ptr =
+                func::validate_inbounds::<u32>(options.memory_mut(cx.0), &ValRaw::u32(payload))?;
             let mut lower = LowerContext::new(cx, &options, types, instance);
             call.rep().store(&mut lower, InterfaceType::U32, ptr)?;
 
             Ok(event)
+        }
+        TaskCheck::Poll(memory, payload) => {
+            if let Some((event, call)) = cx
+                .concurrent_state()
+                .table
+                .get_mut(guest_task)?
+                .events
+                .pop_front()
+            {
+                let options = Options::new(
+                    cx.0.id(),
+                    NonNull::new(memory),
+                    None,
+                    StringEncoding::Utf8,
+                    true,
+                    None,
+                );
+                let types = (*instance).component_types();
+                let ptr = func::validate_inbounds::<(u32, u32)>(
+                    options.memory_mut(cx.0),
+                    &ValRaw::u32(payload),
+                )?;
+                let mut lower = LowerContext::new(cx, &options, types, instance);
+                event.store(&mut lower, InterfaceType::U32, ptr)?;
+                call.rep().store(&mut lower, InterfaceType::U32, ptr + 4)?;
+
+                Ok(1)
+            } else {
+                Ok(0)
+            }
         }
         TaskCheck::Yield => Ok(0),
     }
@@ -1063,9 +1084,8 @@ pub(crate) extern "C" fn subtask_drop<T>(cx: *mut VMOpaqueContext, task: u32) {
             let cx = VMComponentContext::from_opaque(cx);
             let instance = (*cx).instance();
             let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
-            cx.concurrent_state()
-                .table
-                .delete(TableId::<HostTask>::new(task))?;
+            let table = &mut cx.concurrent_state().table;
+            table.delete_any(task)?;
             Ok(())
         })
     }
@@ -1077,11 +1097,9 @@ pub(crate) extern "C" fn async_enter<T>(
     return_: *mut VMFuncRef,
     params: u32,
     results: u32,
-    flags: u32,
 ) {
     unsafe {
         handle_result(|| {
-            let expect_retptr = (flags & ENTER_FLAG_EXPECT_RETPTR) != 0;
             let cx = VMComponentContext::from_opaque(cx);
             let instance = (*cx).instance();
             let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
@@ -1095,22 +1113,13 @@ pub(crate) extern "C" fn async_enter<T>(
                     assert!(dst.len() <= MAX_FLAT_PARAMS);
                     let mut src = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
                     src[0] = MaybeUninit::new(ValRaw::u32(params));
-                    let len = if expect_retptr {
-                        src[1] = dst[0];
-                        2
-                    } else {
-                        1
-                    }
-                    .max(dst.len());
                     crate::Func::call_unchecked_raw(
                         &mut cx,
                         start.as_non_null(),
                         src.as_mut_ptr() as _,
-                        len,
+                        1.max(dst.len()),
                     )?;
-                    if !expect_retptr {
-                        dst.copy_from_slice(&src[..dst.len()]);
-                    }
+                    dst.copy_from_slice(&src[..dst.len()]);
                     let task = cx.concurrent_state().guest_task.unwrap();
                     if let Some(rep) = old_task_rep {
                         maybe_send_event(
@@ -1154,6 +1163,7 @@ pub(crate) extern "C" fn async_enter<T>(
             } else {
                 cx.concurrent_state().table.push(new_task)
             }?;
+
             cx.concurrent_state().guest_task = Some(guest_task);
 
             Ok(())
@@ -1340,16 +1350,19 @@ pub(crate) extern "C" fn async_exit<T>(
                 STATUS_DONE
             };
 
-            if status != STATUS_DONE {
+            let call = if status != STATUS_DONE {
                 if (flags & EXIT_FLAG_ASYNC_CALLER) != 0 {
-                    status = (status << 30) | guest_task.rep();
+                    guest_task.rep()
                 } else {
                     poll_for_result(cx)?;
                     status = STATUS_DONE;
+                    0
                 }
-            }
+            } else {
+                0
+            };
 
-            Ok(status)
+            Ok((status << 30) | call)
         })
     }
 }
@@ -1480,10 +1493,48 @@ pub(crate) async fn poll_until<'a, T: Send, U>(
         match future::select(ready, future).await {
             Either::Left((None, future_again)) => break Ok((store, future_again.await)),
             Either::Left((Some(ready), future_again)) => {
-                store = handle_ready(store, ready)?;
+                let mut ready = Some(ready);
+                store = poll_fn(store, move |_, mut store| {
+                    Ok(handle_ready(store.take().unwrap(), ready.take().unwrap()))
+                })
+                .await?;
                 future = future_again;
             }
             Either::Right((result, _)) => break Ok((store, result)),
         }
     }
+}
+
+async fn poll_fn<'a, T>(
+    mut store: StoreContextMut<'a, T>,
+    mut fun: impl FnMut(
+        &mut Context,
+        Option<StoreContextMut<'a, T>>,
+    ) -> Result<Result<StoreContextMut<'a, T>>, Option<StoreContextMut<'a, T>>>,
+) -> Result<StoreContextMut<'a, T>> {
+    #[derive(Clone, Copy)]
+    struct PollCx(*mut *mut Context<'static>);
+
+    unsafe impl Send for PollCx {}
+
+    let poll_cx = PollCx(store.concurrent_state().async_state.current_poll_cx.get());
+    future::poll_fn({
+        let mut store = Some(store);
+
+        move |cx| unsafe {
+            let _reset = Reset(poll_cx.0, *poll_cx.0);
+            *poll_cx.0 = mem::transmute::<&mut Context<'_>, *mut Context<'static>>(cx);
+            #[allow(dropping_copy_types)]
+            drop(poll_cx);
+
+            match fun(cx, store.take()) {
+                Ok(v) => Poll::Ready(v),
+                Err(s) => {
+                    store = s;
+                    Poll::Pending
+                }
+            }
+        }
+    })
+    .await
 }

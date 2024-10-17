@@ -128,7 +128,6 @@ impl<'a> TrampolineCompiler<'a> {
                 vec![
                     ir::AbiParam::new(ir::types::I32),
                     ir::AbiParam::new(ir::types::I32),
-                    ir::AbiParam::new(ir::types::I32),
                 ],
                 vec![ir::AbiParam::new(ir::types::I32)],
             ),
@@ -137,7 +136,6 @@ impl<'a> TrampolineCompiler<'a> {
                 Options::Any(&options),
                 self.offsets.future_receive(),
                 vec![
-                    ir::AbiParam::new(ir::types::I32),
                     ir::AbiParam::new(ir::types::I32),
                     ir::AbiParam::new(ir::types::I32),
                 ],
@@ -180,7 +178,6 @@ impl<'a> TrampolineCompiler<'a> {
                         vec![
                             ir::AbiParam::new(ir::types::I32),
                             ir::AbiParam::new(ir::types::I32),
-                            ir::AbiParam::new(ir::types::I32),
                         ],
                         vec![ir::AbiParam::new(ir::types::I32)],
                     )
@@ -200,7 +197,6 @@ impl<'a> TrampolineCompiler<'a> {
                         Options::Any(options),
                         self.offsets.stream_receive(),
                         vec![
-                            ir::AbiParam::new(ir::types::I32),
                             ir::AbiParam::new(ir::types::I32),
                             ir::AbiParam::new(ir::types::I32),
                         ],
@@ -239,9 +235,6 @@ impl<'a> TrampolineCompiler<'a> {
                     vec![
                         ir::AbiParam::new(pointer_type),
                         ir::AbiParam::new(pointer_type),
-                        ir::AbiParam::new(pointer_type),
-                        ir::AbiParam::new(ir::types::I32),
-                        ir::AbiParam::new(ir::types::I32),
                         ir::AbiParam::new(ir::types::I32),
                         ir::AbiParam::new(ir::types::I32),
                     ],
@@ -254,7 +247,6 @@ impl<'a> TrampolineCompiler<'a> {
                     self.offsets.async_exit(),
                     Some(*callback),
                     vec![
-                        ir::AbiParam::new(ir::types::I32),
                         ir::AbiParam::new(pointer_type),
                         ir::AbiParam::new(ir::types::I32),
                         ir::AbiParam::new(ir::types::I32),
@@ -1053,7 +1045,6 @@ impl<'a> TrampolineCompiler<'a> {
         );
 
         host_sig.params.extend(vec![
-            ir::AbiParam::new(ir::types::I32),
             ir::AbiParam::new(ir::types::I32),
             ir::AbiParam::new(ir::types::I32),
         ]);

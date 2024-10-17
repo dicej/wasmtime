@@ -166,7 +166,6 @@ pub type VMAsyncEnterCallback = extern "C" fn(
     return_: *mut VMFuncRef,
     params: u32,
     results: u32,
-    flags: u32,
 );
 
 /// TODO: docs
@@ -197,7 +196,6 @@ pub type VMFutureTransmitCallback = extern "C" fn(
     ty: TypeFutureTableIndex,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32;
 
 /// TODO: docs
@@ -221,7 +219,6 @@ pub type VMStreamTransmitCallback = extern "C" fn(
     ty: TypeStreamTableIndex,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32;
 
 /// TODO: docs
@@ -234,7 +231,6 @@ pub type VMFlatStreamTransmitCallback = extern "C" fn(
     payload_align: u32,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32;
 
 /// TODO: docs

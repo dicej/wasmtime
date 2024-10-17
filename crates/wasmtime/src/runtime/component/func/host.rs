@@ -244,7 +244,7 @@ where
         let status = if let Some(task) = task {
             (STATUS_PARAMS_READ << 30) | task
         } else {
-            STATUS_DONE
+            STATUS_DONE << 30
         };
 
         storage[0] = MaybeUninit::new(ValRaw::i32(status as i32));

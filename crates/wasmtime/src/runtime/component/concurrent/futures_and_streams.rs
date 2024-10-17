@@ -37,8 +37,9 @@ use {
 // specialization.  We should consider using generics instead to move those branches to compile time.
 
 // TODO: Improve the host APIs for sending to and receiving from streams.  Currently, they require explicitly
-// interleaving calls to `send` or `receive` and `StoreContextMut::wait_until`; we should abstract that away and
-// present a public API in the form of e.g. `futures::Stream` and `futures::Sink`.
+// interleaving calls to `send` or `receive` and `StoreContextMut::wait_until`; see
+// https://github.com/dicej/rfcs/blob/component-async/accepted/component-model-async.md#host-apis-for-creating-using-and-sharing-streams-futures-and-errors
+// for an alternative approach.
 
 fn receive_result(ty: TableIndex, types: &Arc<ComponentTypes>) -> InterfaceType {
     match ty {
@@ -1053,7 +1054,6 @@ fn guest_send<T>(
     flat_abi: Option<FlatAbi>,
     mut params: u32,
     results: u32,
-    call: u32,
 ) -> u32 {
     unsafe {
         handle_result(|| {
@@ -1093,7 +1093,7 @@ fn guest_send<T>(
                 ReceiveState::Open
             };
 
-            let status = match mem::replace(&mut transmit.receive, new_state) {
+            let (status, call) = match mem::replace(&mut transmit.receive, new_state) {
                 ReceiveState::GuestReady {
                     ty: receive_ty,
                     flat_abi: receive_flat_abi,
@@ -1122,7 +1122,7 @@ fn guest_send<T>(
                         (*instance).handle_table().insert(entry);
                     }
 
-                    STATUS_DONE
+                    (STATUS_DONE, 0)
                 }
 
                 ReceiveState::HostReady { accept } => {
@@ -1133,7 +1133,7 @@ fn guest_send<T>(
                         ptr: params,
                     })?;
 
-                    STATUS_DONE
+                    (STATUS_DONE, 0)
                 }
 
                 ReceiveState::Open => {
@@ -1167,15 +1167,7 @@ fn guest_send<T>(
                         close: false,
                     };
 
-                    let ptr = func::validate_inbounds::<u32>(
-                        options.memory_mut(cx.0),
-                        &ValRaw::u32(call),
-                    )?;
-                    let mut lower =
-                        LowerContext::new(cx.as_context_mut(), &options, types, instance);
-                    task.rep().store(&mut lower, InterfaceType::U32, ptr)?;
-
-                    STATUS_NOT_STARTED
+                    (STATUS_NOT_STARTED, task.rep())
                 }
 
                 ReceiveState::Closed => {
@@ -1185,7 +1177,7 @@ fn guest_send<T>(
 
                     cx.concurrent_state().table.delete(sender.0)?;
 
-                    STATUS_DONE
+                    (STATUS_DONE, 0)
                 }
             };
 
@@ -1202,7 +1194,7 @@ fn guest_send<T>(
                 }
             }
 
-            Ok(status)
+            Ok((status << 30) | call)
         })
     }
 }
@@ -1216,7 +1208,6 @@ fn guest_receive<T>(
     flat_abi: Option<FlatAbi>,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32 {
     unsafe {
         handle_result(|| {
@@ -1255,7 +1246,7 @@ fn guest_receive<T>(
                 SendState::Open
             };
 
-            let status = match mem::replace(&mut transmit.send, new_state) {
+            let (status, call) = match mem::replace(&mut transmit.send, new_state) {
                 SendState::GuestReady {
                     ty: send_ty,
                     flat_abi: send_flat_abi,
@@ -1296,7 +1287,7 @@ fn guest_receive<T>(
                         (*instance).handle_table().insert(entry);
                     }
 
-                    STATUS_DONE
+                    (STATUS_DONE, 0)
                 }
 
                 SendState::HostReady { accept, close } => {
@@ -1315,7 +1306,7 @@ fn guest_receive<T>(
                         cx.concurrent_state().table.get_mut(receiver.0)?.send = SendState::Closed;
                     }
 
-                    STATUS_DONE
+                    (STATUS_DONE, 0)
                 }
 
                 SendState::Open => {
@@ -1347,14 +1338,7 @@ fn guest_receive<T>(
                         entry,
                     };
 
-                    let ptr = func::validate_inbounds::<u32>(
-                        options.memory_mut(cx.0),
-                        &ValRaw::u32(call),
-                    )?;
-                    let mut lower = LowerContext::new(cx, &options, types, instance);
-                    task.rep().store(&mut lower, InterfaceType::U32, ptr)?;
-
-                    STATUS_NOT_STARTED
+                    (STATUS_NOT_STARTED, task.rep())
                 }
 
                 SendState::Closed => {
@@ -1380,7 +1364,7 @@ fn guest_receive<T>(
                         }
                     }
 
-                    STATUS_DONE
+                    (STATUS_DONE, 0)
                 }
             };
 
@@ -1390,7 +1374,7 @@ fn guest_receive<T>(
                 }
             }
 
-            Ok(status)
+            Ok((status << 30) | call)
         })
     }
 }
@@ -1440,7 +1424,6 @@ pub(crate) extern "C" fn future_send<T>(
     ty: TypeFutureTableIndex,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32 {
     guest_send::<T>(
         vmctx,
@@ -1451,7 +1434,6 @@ pub(crate) extern "C" fn future_send<T>(
         None,
         params,
         results,
-        call,
     )
 }
 
@@ -1463,7 +1445,6 @@ pub(crate) extern "C" fn future_receive<T>(
     ty: TypeFutureTableIndex,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32 {
     guest_receive::<T>(
         vmctx,
@@ -1474,7 +1455,6 @@ pub(crate) extern "C" fn future_receive<T>(
         None,
         params,
         results,
-        call,
     )
 }
 
@@ -1511,7 +1491,6 @@ pub(crate) extern "C" fn stream_send<T>(
     ty: TypeStreamTableIndex,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32 {
     guest_send::<T>(
         vmctx,
@@ -1522,7 +1501,6 @@ pub(crate) extern "C" fn stream_send<T>(
         None,
         params,
         results,
-        call,
     )
 }
 
@@ -1534,7 +1512,6 @@ pub(crate) extern "C" fn stream_receive<T>(
     ty: TypeStreamTableIndex,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32 {
     guest_receive::<T>(
         vmctx,
@@ -1545,7 +1522,6 @@ pub(crate) extern "C" fn stream_receive<T>(
         None,
         params,
         results,
-        call,
     )
 }
 
@@ -1574,7 +1550,6 @@ pub(crate) extern "C" fn flat_stream_send<T>(
     payload_align: u32,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32 {
     guest_send::<T>(
         vmctx,
@@ -1588,7 +1563,6 @@ pub(crate) extern "C" fn flat_stream_send<T>(
         }),
         params,
         results,
-        call,
     )
 }
 
@@ -1601,7 +1575,6 @@ pub(crate) extern "C" fn flat_stream_receive<T>(
     payload_align: u32,
     params: u32,
     results: u32,
-    call: u32,
 ) -> u32 {
     guest_receive::<T>(
         vmctx,
@@ -1615,7 +1588,6 @@ pub(crate) extern "C" fn flat_stream_receive<T>(
         }),
         params,
         results,
-        call,
     )
 }
 

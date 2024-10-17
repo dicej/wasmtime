@@ -34,20 +34,12 @@ impl ComponentTypesBuilder {
         let ty = &self[options.ty];
         let ptr_ty = options.options.ptr();
 
-        if options.options.async_ {
-            return match context {
-                Context::Lift => Signature {
-                    params: Vec::new(),
-                    results: vec![ptr_ty],
-                    params_indirect: false,
-                    results_indirect: false,
-                },
-                Context::Lower => Signature {
-                    params: vec![ptr_ty; 3],
-                    results: vec![ValType::I32],
-                    params_indirect: true,
-                    results_indirect: true,
-                },
+        if let (Context::Lower, true) = (&context, options.options.async_) {
+            return Signature {
+                params: vec![ptr_ty; 2],
+                results: vec![ValType::I32],
+                params_indirect: true,
+                results_indirect: true,
             };
         }
 
@@ -63,6 +55,15 @@ impl ComponentTypesBuilder {
                 vec![ptr_ty]
             }
         };
+
+        if options.options.async_ {
+            return Signature {
+                params,
+                results: vec![ptr_ty],
+                params_indirect,
+                results_indirect: false,
+            };
+        }
 
         let mut results_indirect = false;
         let results = match self.flatten_types(
@@ -105,11 +106,7 @@ impl ComponentTypesBuilder {
         let mut results_indirect = false;
         let results = match self.flatten_types(
             &options.options,
-            if options.options.async_ {
-                MAX_FLAT_RESULTS
-            } else {
-                MAX_FLAT_PARAMS
-            },
+            MAX_FLAT_PARAMS,
             self[ty.params].types.iter().map(|ty| *ty),
         ) {
             Some(list) => list,

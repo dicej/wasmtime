@@ -40,7 +40,6 @@ use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 const MAX_STRING_BYTE_LENGTH: u32 = 1 << 31;
 const UTF16_TAG: u32 = 1 << 31;
 
-const ENTER_FLAG_EXPECT_RETPTR: i32 = 1 << 0;
 const EXIT_FLAG_ASYNC_CALLER: i32 = 1 << 0;
 const EXIT_FLAG_ASYNC_CALLEE: i32 = 1 << 1;
 
@@ -133,21 +132,20 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
             ty,
         ));
 
-        (
+        Compiler {
+            types: module.types,
+            module,
+            code: Vec::new(),
+            nlocals: sig.params.len() as u32,
+            free_locals: HashMap::new(),
+            traps: Vec::new(),
             result,
-            Compiler {
-                types: module.types,
-                module,
-                code: Vec::new(),
-                nlocals: sig.params.len() as u32,
-                free_locals: HashMap::new(),
-                traps: Vec::new(),
-                result,
-                fuel: INITIAL_FUEL,
-                emit_resource_call: false,
-            }
-            .compile_async_start_adapter(adapter, &sig, param_globals),
-        )
+            fuel: INITIAL_FUEL,
+            emit_resource_call: false,
+        }
+        .compile_async_start_adapter(adapter, &sig, param_globals);
+
+        result
     };
 
     let return_adapter = |module: &mut Module, result_globals| {
@@ -180,7 +178,7 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
             compiler.compile_sync_to_sync_adapter(adapter, &lower_sig, &lift_sig)
         }
         (true, true) => {
-            let (start, expect_retptr) = start_adapter(module, None);
+            let start = start_adapter(module, None);
             let return_ = return_adapter(module, None);
             let (compiler, _, lift_sig) = compiler(module, adapter);
             compiler.compile_async_to_async_adapter(
@@ -188,7 +186,6 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
                 start,
                 return_,
                 i32::try_from(lift_sig.params.len()).unwrap(),
-                expect_retptr,
             );
         }
         (false, true) => {
@@ -223,7 +220,7 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
                 )
             };
 
-            let (start, expect_retptr) = start_adapter(module, param_globals.as_deref());
+            let start = start_adapter(module, param_globals.as_deref());
             let return_ = return_adapter(module, result_globals.as_deref());
             let (compiler, _, lift_sig) = compiler(module, adapter);
             compiler.compile_sync_to_async_adapter(
@@ -231,14 +228,13 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
                 start,
                 return_,
                 i32::try_from(lift_sig.params.len()).unwrap(),
-                expect_retptr,
                 param_globals.as_deref(),
                 result_globals.as_deref(),
             );
         }
         (true, false) => {
             let lift_sig = module.types.signature(&adapter.lift, Context::Lift);
-            let (start, expect_retptr) = start_adapter(module, None);
+            let start = start_adapter(module, None);
             let return_ = return_adapter(module, None);
             let (compiler, ..) = compiler(module, adapter);
             compiler.compile_async_to_sync_adapter(
@@ -247,7 +243,6 @@ pub(super) fn compile(module: &mut Module<'_>, adapter: &AdapterData) {
                 return_,
                 i32::try_from(lift_sig.params.len()).unwrap(),
                 i32::try_from(lift_sig.results.len()).unwrap(),
-                expect_retptr,
             );
         }
     }
@@ -390,7 +385,6 @@ impl Compiler<'_, '_> {
         start: FunctionId,
         return_: FunctionId,
         param_count: i32,
-        expect_retptr: bool,
     ) {
         let enter = self.module.import_async_enter_call();
         let exit = self
@@ -406,11 +400,6 @@ impl Compiler<'_, '_> {
             .push(Body::RefFunc(return_));
         self.instruction(LocalGet(0));
         self.instruction(LocalGet(1));
-        self.instruction(I32Const(if expect_retptr {
-            ENTER_FLAG_EXPECT_RETPTR
-        } else {
-            0
-        }));
         self.instruction(Call(enter.as_u32()));
 
         // TODO: As an optimization, consider checking the backpressure flag on the callee instance and, if it's
@@ -439,7 +428,6 @@ impl Compiler<'_, '_> {
         start: FunctionId,
         return_: FunctionId,
         param_count: i32,
-        expect_retptr: bool,
         param_globals: Option<&[u32]>,
         result_globals: Option<&[u32]>,
     ) {
@@ -477,18 +465,12 @@ impl Compiler<'_, '_> {
             self.instruction(LocalGet(results_local));
         }
 
-        self.instruction(I32Const(if expect_retptr {
-            ENTER_FLAG_EXPECT_RETPTR
-        } else {
-            0
-        }));
         self.instruction(Call(enter.as_u32()));
 
         // TODO: As an optimization, consider checking the backpressure flag on the callee instance and, if it's
         // unset, translate the params and call the callee function directly here (and make sure `exit` knows _not_
         // to call it in that case).
 
-        self.instruction(Call(adapter.callee.as_u32()));
         self.module.exports.push((
             adapter.callee.as_u32(),
             format!("[adapter-callee]{}", adapter.name),
@@ -522,7 +504,6 @@ impl Compiler<'_, '_> {
         return_: FunctionId,
         param_count: i32,
         result_count: i32,
-        expect_retptr: bool,
     ) {
         let enter = self.module.import_async_enter_call();
         let exit = self.module.import_async_exit_call(None);
@@ -536,13 +517,7 @@ impl Compiler<'_, '_> {
             .push(Body::RefFunc(return_));
         self.instruction(LocalGet(0));
         self.instruction(LocalGet(1));
-        self.instruction(I32Const(if expect_retptr {
-            ENTER_FLAG_EXPECT_RETPTR
-        } else {
-            0
-        }));
         self.instruction(Call(enter.as_u32()));
-        self.instruction(I32Const(0)); // dummy guest context
         self.module.exports.push((
             adapter.callee.as_u32(),
             format!("[adapter-callee]{}", adapter.name),
@@ -564,7 +539,7 @@ impl Compiler<'_, '_> {
         adapter: &AdapterData,
         sig: &Signature,
         param_globals: Option<&[u32]>,
-    ) -> bool {
+    ) {
         let mut temps = Vec::new();
         let param_locals = if let Some(globals) = param_globals {
             for global in globals {
@@ -598,7 +573,7 @@ impl Compiler<'_, '_> {
         };
 
         self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, false);
-        let result = self.translate_params(adapter, &param_locals);
+        self.translate_params(adapter, &param_locals);
         self.set_flag(adapter.lift.flags, FLAG_MAY_LEAVE, true);
 
         for tmp in temps {
@@ -606,8 +581,6 @@ impl Compiler<'_, '_> {
         }
 
         self.finish();
-
-        result
     }
 
     fn compile_async_return_adapter(
@@ -738,7 +711,7 @@ impl Compiler<'_, '_> {
         self.finish()
     }
 
-    fn translate_params(&mut self, adapter: &AdapterData, param_locals: &[(u32, ValType)]) -> bool {
+    fn translate_params(&mut self, adapter: &AdapterData, param_locals: &[(u32, ValType)]) {
         let src_tys = self.types[adapter.lower.ty].params;
         let src_tys = self.types[src_tys]
             .types
@@ -763,15 +736,9 @@ impl Compiler<'_, '_> {
             self.types
                 .flatten_types(lower_opts, MAX_FLAT_PARAMS, src_tys.iter().copied())
         };
-        let dst_flat = self.types.flatten_types(
-            lift_opts,
-            if lift_opts.async_ {
-                MAX_FLAT_RESULTS
-            } else {
-                MAX_FLAT_PARAMS
-            },
-            dst_tys.iter().copied(),
-        );
+        let dst_flat =
+            self.types
+                .flatten_types(lift_opts, MAX_FLAT_PARAMS, dst_tys.iter().copied());
 
         let src = if let Some(flat) = &src_flat {
             Source::Stack(Stack {
@@ -836,8 +803,6 @@ impl Compiler<'_, '_> {
             self.instruction(LocalGet(mem.addr.idx));
             self.free_temp_local(mem.addr);
         }
-
-        dst_flat.is_none() && lift_opts.async_
     }
 
     fn translate_results(

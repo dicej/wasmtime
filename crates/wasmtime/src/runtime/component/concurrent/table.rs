@@ -261,6 +261,11 @@ impl Table {
             .map_err(|_| TableError::WrongType)
     }
 
+    pub fn delete_any(&mut self, key: u32) -> Result<(), TableError> {
+        self.delete_entry(key)?;
+        Ok(())
+    }
+
     fn delete_entry(&mut self, key: u32) -> Result<TableEntry, TableError> {
         if !self.occupied(key)?.children.is_empty() {
             return Err(TableError::HasChildren);
