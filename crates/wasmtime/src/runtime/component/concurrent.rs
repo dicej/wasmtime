@@ -1162,6 +1162,43 @@ pub(crate) extern "C" fn async_enter<T>(
     }
 }
 
+fn make_call<T>(
+    guest_task: TableId<GuestTask>,
+    callee: SendSyncPtr<VMFuncRef>,
+    param_count: usize,
+    result_count: usize,
+) -> impl FnOnce(
+    StoreContextMut<T>,
+) -> Result<([MaybeUninit<ValRaw>; MAX_FLAT_PARAMS], StoreContextMut<T>)>
+       + Send
+       + Sync
+       + 'static {
+    move |mut cx: StoreContextMut<T>| {
+        let mut storage = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
+        let lower = cx
+            .concurrent_state()
+            .table
+            .get_mut(guest_task)?
+            .lower_params
+            .take()
+            .unwrap();
+        let cx = cx.0.traitobj();
+        lower(cx, &mut storage[..param_count])?;
+        let mut cx = unsafe { StoreContextMut::<T>::from_raw(cx) };
+
+        unsafe {
+            crate::Func::call_unchecked_raw(
+                &mut cx,
+                callee.as_non_null(),
+                storage.as_mut_ptr() as _,
+                param_count.max(result_count),
+            )?;
+        }
+
+        Ok((storage, cx))
+    }
+}
+
 pub(crate) extern "C" fn async_exit<T>(
     cx: *mut VMOpaqueContext,
     callback: *mut VMFuncRef,
@@ -1184,28 +1221,7 @@ pub(crate) extern "C" fn async_exit<T>(
             let result_count = usize::try_from(result_count).unwrap();
             assert!(result_count <= MAX_FLAT_RESULTS);
 
-            let call = move |mut cx: StoreContextMut<T>| {
-                let mut storage = [MaybeUninit::uninit(); MAX_FLAT_PARAMS];
-                let lower = cx
-                    .concurrent_state()
-                    .table
-                    .get_mut(guest_task)?
-                    .lower_params
-                    .take()
-                    .unwrap();
-                let cx = cx.0.traitobj();
-                lower(cx, &mut storage[..param_count])?;
-                let mut cx = StoreContextMut::<T>::from_raw(cx);
-
-                crate::Func::call_unchecked_raw(
-                    &mut cx,
-                    callee.as_non_null(),
-                    storage.as_mut_ptr() as _,
-                    param_count.max(result_count),
-                )?;
-
-                Ok::<_, anyhow::Error>((storage, cx))
-            };
+            let call = make_call(guest_task, callee, param_count, result_count);
 
             let state = &mut cx
                 .concurrent_state()
@@ -1213,11 +1229,12 @@ pub(crate) extern "C" fn async_exit<T>(
                 .entry(callee_instance)
                 .or_default();
             let ready = state.task_queue.is_empty() && !state.backpressure;
-            state.task_queue.push_back(guest_task);
 
             let mut guest_context = 0;
 
             let mut cx = if (flags & EXIT_FLAG_ASYNC_CALLEE) == 0 {
+                state.task_queue.push_back(guest_task);
+
                 let mut fiber = make_fiber(&mut cx, callee_instance, move |cx| {
                     let (storage, mut cx) = call(cx)?;
 
@@ -1280,6 +1297,13 @@ pub(crate) extern "C" fn async_exit<T>(
                     guest_context = storage[0].assume_init().get_i32() as u32;
                     cx
                 } else {
+                    cx.concurrent_state()
+                        .instance_states
+                        .get_mut(&callee_instance)
+                        .unwrap()
+                        .task_queue
+                        .push_back(guest_task);
+
                     cx.concurrent_state().table.get_mut(guest_task)?.deferred = Deferred::Async {
                         call: Box::new(move |cx| {
                             let cx = StoreContextMut::from_raw(cx);
@@ -1354,15 +1378,62 @@ pub(crate) fn enter<
     Ok(())
 }
 
-pub(crate) fn exit<'a, T: Send, R: 'static>(
+pub(crate) fn exit<'a, T: Send, R: 'static, LowerParams: Copy>(
     mut store: StoreContextMut<'a, T>,
     callback: NonNull<VMFuncRef>,
-    guest_context: u32,
+    callee: NonNull<VMFuncRef>,
+    callee_instance: RuntimeComponentInstanceIndex,
 ) -> Result<(R, StoreContextMut<'a, T>)> {
     let guest_task = store.concurrent_state().guest_task.unwrap();
-    if guest_context != 0 {
-        store.concurrent_state().table.get_mut(guest_task)?.callback =
-            Some((SendSyncPtr::new(callback), guest_context));
+
+    let state = &mut store
+        .concurrent_state()
+        .instance_states
+        .entry(callee_instance)
+        .or_default();
+    let ready = state.task_queue.is_empty() && !state.backpressure;
+
+    let call = make_call(
+        guest_task,
+        SendSyncPtr::new(callee),
+        mem::size_of::<LowerParams>() / mem::size_of::<ValRaw>(),
+        1,
+    );
+
+    let result = if ready {
+        let (storage, cx) = call(store)?;
+        store = cx;
+        Ok(unsafe { storage[0].assume_init() }.get_i32() as u32)
+    } else {
+        Err(call)
+    };
+
+    if !matches!(result, Ok(0)) {
+        match result {
+            Ok(guest_context) => {
+                store.concurrent_state().table.get_mut(guest_task)?.callback =
+                    Some((SendSyncPtr::new(callback), guest_context));
+            }
+            Err(call) => {
+                store
+                    .concurrent_state()
+                    .instance_states
+                    .get_mut(&callee_instance)
+                    .unwrap()
+                    .task_queue
+                    .push_back(guest_task);
+
+                store.concurrent_state().table.get_mut(guest_task)?.deferred = Deferred::Async {
+                    call: Box::new(move |cx| {
+                        let cx = unsafe { StoreContextMut::from_raw(cx) };
+                        let (storage, _) = call(cx)?;
+                        Ok(unsafe { storage[0].assume_init() }.get_i32() as u32)
+                    }),
+                    instance: callee_instance,
+                    callback: SendSyncPtr::new(callback),
+                };
+            }
+        }
 
         store = poll_for_result(store)?;
     }

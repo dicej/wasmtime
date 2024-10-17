@@ -212,7 +212,7 @@ where
         let store = store.as_context_mut();
 
         if store.0[self.func.0].options.async_() {
-            return Ok(if Params::flatten_count() <= MAX_FLAT_RESULTS {
+            return Ok(if Params::flatten_count() <= MAX_FLAT_PARAMS {
                 if Return::flatten_count() <= MAX_FLAT_PARAMS {
                     self.func.call_raw_async(
                         store,

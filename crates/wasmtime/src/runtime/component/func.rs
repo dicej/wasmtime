@@ -401,7 +401,7 @@ impl Func {
 
     fn call_raw_async<
         'a,
-        T: Send + 'static,
+        T: Send,
         Params: Send + Sync + 'static,
         Return: Send + Sync + 'static,
         LowerParams,
@@ -429,7 +429,15 @@ impl Func {
         LowerReturn: Copy,
     {
         let me = self.0;
-        let export = store.0[me].export;
+        let FuncData {
+            export,
+            component_instance,
+            ..
+        } = store.0[self.0];
+        let callback = store.0[me]
+            .options
+            .callback
+            .expect("todo: support callback-less async exports");
 
         concurrent::enter(
             store.as_context_mut(),
@@ -439,14 +447,7 @@ impl Func {
             (me, lift),
         )?;
 
-        let context = unsafe {
-            let mut space = MaybeUninit::<ValRaw>::uninit();
-            crate::Func::call_unchecked_raw(&mut store, export.func_ref, space.as_mut_ptr(), 1)?;
-            space.assume_init().get_u32()
-        };
-
-        let callback = store.0[me].options.callback.unwrap();
-        concurrent::exit(store, callback, context)
+        concurrent::exit::<_, _, LowerParams>(store, callback, export.func_ref, component_instance)
     }
 
     /// Invokes the underlying wasm function, lowering arguments and lifting the

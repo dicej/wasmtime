@@ -216,12 +216,11 @@ where
     let result_tys = InterfaceType::Tuple(ty.results);
 
     if async_ {
-        const STATUS_PARAMS_READ: i32 = 1;
-        const STATUS_DONE: i32 = 3;
+        const STATUS_PARAMS_READ: u32 = 1;
+        const STATUS_DONE: u32 = 3;
 
         let paramptr = storage[0].assume_init();
         let retptr = storage[1].assume_init();
-        let callptr = storage[2].assume_init();
 
         let params = {
             let lift = &mut LiftContext::new(cx.0, &options, types, instance);
@@ -243,17 +242,12 @@ where
         })?;
 
         let status = if let Some(task) = task {
-            let ptr = validate_inbounds::<u32>(options.memory_mut(cx.0), &callptr)?;
-
-            let mut lower = LowerContext::new(cx, &options, types, instance);
-            task.store(&mut lower, InterfaceType::U32, ptr)?;
-
-            STATUS_PARAMS_READ
+            (STATUS_PARAMS_READ << 30) | task
         } else {
             STATUS_DONE
         };
 
-        storage[0] = MaybeUninit::new(ValRaw::i32(status));
+        storage[0] = MaybeUninit::new(ValRaw::i32(status as i32));
     } else {
         // There's a 2x2 matrix of whether parameters and results are stored on the
         // stack or on the heap. Each of the 4 branches here have a different
