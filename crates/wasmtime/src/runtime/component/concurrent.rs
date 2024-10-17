@@ -579,7 +579,6 @@ fn maybe_send_event<'a, T>(
             ValRaw::u32(context),
             ValRaw::u32(event),
             ValRaw::u32(call.rep()),
-            ValRaw::i32(0),
         ];
         unsafe {
             crate::Func::call_unchecked_raw(
@@ -1066,7 +1065,7 @@ pub(crate) extern "C" fn subtask_drop<T>(cx: *mut VMOpaqueContext, task: u32) {
             let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
             cx.concurrent_state()
                 .table
-                .delete(TableId::<GuestTask>::new(task))?;
+                .delete(TableId::<HostTask>::new(task))?;
             Ok(())
         })
     }
