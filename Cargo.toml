@@ -526,14 +526,3 @@ opt-level = 's'
 inherits = "release"
 codegen-units = 1
 lto = true
-
-[patch."https://github.com/dicej/wasm-tools"]
-wasmparser = { path = "../wasm-tools/crates/wasmparser" }
-wat = { path = "../wasm-tools/crates/wat" }
-wast = { path = "../wasm-tools/crates/wast" }
-wasmprinter = { path = "../wasm-tools/crates/wasmprinter" }
-wasm-encoder = { path = "../wasm-tools/crates/wasm-encoder" }
-wasm-smith = { path = "../wasm-tools/crates/wasm-smith" }
-wasm-mutate = { path = "../wasm-tools/crates/wasm-mutate" }
-wit-parser = { path = "../wasm-tools/crates/wit-parser" }
-wit-component = { path = "../wasm-tools/crates/wit-component" }
