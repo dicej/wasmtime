@@ -488,14 +488,14 @@ impl Wasmtime {
             WorldItem::Interface { id, .. } => {
                 gen.gen.interface_last_seen_as_import.insert(*id, true);
                 gen.current_interface = Some((*id, name, false));
-                let snake = match name {
+                let snake = to_rust_ident(&match name {
                     WorldKey::Name(s) => s.to_snake_case(),
                     WorldKey::Interface(id) => resolve.interfaces[*id]
                         .name
                         .as_ref()
                         .unwrap()
                         .to_snake_case(),
-                };
+                });
                 let module = if gen.gen.name_interface(resolve, *id, name, false) {
                     // If this interface is remapped then that means that it was
                     // provided via the `with` key in the bindgen configuration.

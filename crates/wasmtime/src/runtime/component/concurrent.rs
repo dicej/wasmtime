@@ -1005,6 +1005,7 @@ pub(crate) extern "C" fn task_backpressure<T>(
             entry.backpressure = new;
 
             if old && !new {
+                // TODO: are we allowed to run pending calls here, or do we need to defer that?
                 if let Some(task) = entry.task_queue.iter().copied().next() {
                     maybe_resume_next_task(cx, task, caller_instance)?;
                 }
