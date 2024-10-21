@@ -1,7 +1,7 @@
 //! Implementation of the `wasi:http/types` interface's various body types.
 
 use crate::{bindings::http::types, types::FieldMap};
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context as _};
 use bytes::Bytes;
 use futures::FutureExt;
 use http_body::{Body, Frame};
@@ -31,7 +31,11 @@ pub struct HostIncomingBody {
     /// An optional worker task to keep alive while this body is being read.
     /// This ensures that if the parent of this body is dropped before the body
     /// then the backing data behind this worker is kept alive.
-    worker: Option<AbortOnDropJoinHandle<()>>,
+    ///
+    /// This may be cloned into a `HostIncomingBodyStream` in order to keep the
+    /// worker alive if/when the stream is consumed by an `outgoing-body.append`
+    /// operation.
+    worker: Option<Arc<AbortOnDropJoinHandle<()>>>,
 }
 
 impl HostIncomingBody {
@@ -47,7 +51,7 @@ impl HostIncomingBody {
     /// Retain a worker task that needs to be kept alive while this body is being read.
     pub fn retain_worker(&mut self, worker: AbortOnDropJoinHandle<()>) {
         assert!(self.worker.is_none());
-        self.worker = Some(worker);
+        self.worker = Some(Arc::new(worker));
     }
 
     /// Try taking the stream of this body, if it's available.
@@ -65,6 +69,7 @@ impl HostIncomingBody {
             state: IncomingBodyStreamState::Open { body, tx },
             buffer: Bytes::new(),
             error: None,
+            _worker: self.worker.clone(),
         })
     }
 
@@ -169,6 +174,7 @@ pub struct HostIncomingBodyStream {
     state: IncomingBodyStreamState,
     buffer: Bytes,
     error: Option<anyhow::Error>,
+    _worker: Option<Arc<AbortOnDropJoinHandle<()>>>,
 }
 
 impl HostIncomingBodyStream {
@@ -578,17 +584,26 @@ impl HostOutgoingBody {
                                             max_read.min(remaining.unwrap_or(u64::MAX)),
                                         )
                                         .unwrap_or(usize::MAX)
-                                        .min(dst.write_ready().await?);
+                                        .min(
+                                            dst.write_ready().await.context(
+                                                "error while waiting for append \
+                                                 output stream to be ready for writes",
+                                            )?,
+                                        );
 
                                         if length == 0 {
                                             if remaining.map(|v| v > 0).unwrap_or(false) {
                                                 bail!("append output stream closed unexpectedly")
                                             }
                                         } else {
-                                            let bytes = src.blocking_read(length).await?;
+                                            let bytes = src.blocking_read(length).await.context(
+                                                "error while reading from append input stream",
+                                            )?;
                                             let length = bytes.len();
                                             if length > 0 {
-                                                dst.blocking_write_and_flush(bytes).await?;
+                                                dst.blocking_write_and_flush(bytes).await.context(
+                                                    "error while writing to append output stream",
+                                                )?;
                                                 remaining = remaining
                                                     .map(|v| v - u64::try_from(length).unwrap());
                                             }
