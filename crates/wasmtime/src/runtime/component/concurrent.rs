@@ -21,7 +21,7 @@ use {
         borrow::ToOwned,
         boxed::Box,
         cell::UnsafeCell,
-        collections::{HashMap, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
         future::Future,
         marker::PhantomData,
         mem::{self, MaybeUninit},
@@ -106,6 +106,7 @@ struct GuestTask {
     events: VecDeque<(u32, EitherTask)>,
     caller: Option<TableId<GuestTask>>,
     deferred: Deferred,
+    should_yield: bool,
 }
 
 impl Default for GuestTask {
@@ -118,6 +119,7 @@ impl Default for GuestTask {
             events: VecDeque::new(),
             caller: None,
             deferred: Deferred::None,
+            should_yield: false,
         }
     }
 }
@@ -138,7 +140,10 @@ impl EitherTask {
 
     fn delete_all_from<T>(&self, mut store: StoreContextMut<T>) -> Result<()> {
         match self {
-            Self::Host(task) => store.concurrent_state().table.delete(*task).map(drop),
+            Self::Host(task) => {
+                log::trace!("delete {}", task.rep());
+                store.concurrent_state().table.delete(*task).map(drop)
+            }
             Self::Guest(task) => {
                 let finished = store
                     .concurrent_state()
@@ -150,9 +155,11 @@ impl EitherTask {
                     .collect::<Vec<_>>();
 
                 for call in finished {
+                    log::trace!("will delete call {}", call.rep());
                     call.delete_all_from(store.as_context_mut())?;
                 }
 
+                log::trace!("delete {}", task.rep());
                 store.concurrent_state().table.delete(*task).map(drop)
             }
         }?;
@@ -276,6 +283,7 @@ pub struct ConcurrentState<T> {
     table: Table,
     async_state: AsyncState,
     instance_states: HashMap<RuntimeComponentInstanceIndex, InstanceState>,
+    yielding: HashSet<u32>,
     _phantom: PhantomData<T>,
 }
 
@@ -290,6 +298,7 @@ impl<T> Default for ConcurrentState<T> {
                 current_poll_cx: UnsafeCell::new(ptr::null_mut()),
             },
             instance_states: HashMap::new(),
+            yielding: HashSet::new(),
             _phantom: PhantomData,
         }
     }
@@ -345,6 +354,7 @@ pub(crate) fn first_poll<T, R: Send + 'static>(
         .concurrent_state()
         .table
         .push_child(HostTask { caller }, caller)?;
+    log::trace!("new child of {}: {}", caller.rep(), task.rep());
     let mut future = Box::pin(future.map(move |fun| {
         (
             task.rep(),
@@ -362,6 +372,7 @@ pub(crate) fn first_poll<T, R: Send + 'static>(
             .poll(&mut Context::from_waker(&dummy_waker()))
         {
             Poll::Ready((_, fun)) => {
+                log::trace!("delete {} (already ready)", task.rep());
                 store.concurrent_state().table.delete(task)?;
                 fun(store.0.traitobj())?;
                 None
@@ -392,6 +403,7 @@ pub(crate) fn poll_and_block<'a, T, R: Send + Sync + 'static>(
         .concurrent_state()
         .table
         .push_child(HostTask { caller }, caller)?;
+    log::trace!("new child of {}: {}", caller.rep(), task.rep());
     let mut future = Box::pin(future.map(move |fun| {
         (
             task.rep(),
@@ -408,6 +420,7 @@ pub(crate) fn poll_and_block<'a, T, R: Send + Sync + 'static>(
     Ok(
         match unsafe { AsyncCx::new(&mut store).poll(future.as_mut()) } {
             Poll::Ready((_, fun)) => {
+                log::trace!("delete {} (already ready)", task.rep());
                 store.concurrent_state().table.delete(task)?;
                 let store = store.0.traitobj();
                 fun(store)?;
@@ -478,31 +491,11 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: Send>(
         state.task_queue.push_back(guest_task);
     }
 
-    let mut store = poll_fn(store, move |cx, mut store| {
-        if let Some(mut my_store) = store.take() {
-            if let Poll::Ready(Some(ready)) =
-                my_store.concurrent_state().futures.poll_next_unpin(cx)
-            {
-                match handle_ready(my_store, ready) {
-                    Ok(s) => {
-                        my_store = s;
-                    }
-                    Err(e) => {
-                        return Ok(Err(e));
-                    }
-                }
-            }
-            store = Some(my_store);
-        }
-
+    let mut store = poll_fn(store, move |_, mut store| {
         match unsafe { resume_fiber(&mut fiber, store.take(), Ok(())) } {
-            Ok((store, result)) => Ok(result.map(|()| store)),
-            Err(s) => {
-                if let Some(range) = fiber.fiber.as_ref().unwrap().stack().range() {
-                    AsyncWasmCallState::assert_current_state_not_in_range(range);
-                }
-                Err(s)
-            }
+            Ok(Ok((store, result))) => Ok(result.map(|()| store)),
+            Ok(Err(s)) => Err(s),
+            Err(e) => Ok(Err(e)),
         }
     })
     .await?;
@@ -552,6 +545,12 @@ fn maybe_send_event<'a, T>(
 ) -> Result<StoreContextMut<'a, T>> {
     assert!(guest_task.rep() != call.rep());
     if let Some((callback, context)) = store.concurrent_state().table.get(guest_task)?.callback {
+        log::trace!(
+            "use callback to deliver event {event} to {} for {}: {:?} {context}",
+            guest_task.rep(),
+            call.rep(),
+            callback
+        );
         let old_task = store.concurrent_state().guest_task.replace(guest_task);
         let params = &mut [
             ValRaw::u32(context),
@@ -567,6 +566,7 @@ fn maybe_send_event<'a, T>(
             )?;
         }
         let done = params[0].get_u32() != 0;
+        log::trace!("{} done? {done}", guest_task.rep());
         if done {
             store.concurrent_state().table.get_mut(guest_task)?.callback = None;
 
@@ -592,9 +592,20 @@ fn maybe_send_event<'a, T>(
             .deferred
             .take_fiber()
         {
+            log::trace!(
+                "use fiber to deliver event {event} to {} for {}",
+                guest_task.rep(),
+                call.rep()
+            );
             let old_task = store.concurrent_state().guest_task.replace(guest_task);
             store = resume_sync(store, guest_task, fiber)?;
             store.concurrent_state().guest_task = old_task;
+        } else {
+            log::trace!(
+                "queue event {event} to {} for {}",
+                guest_task.rep(),
+                call.rep()
+            );
         }
 
         Ok(store)
@@ -606,10 +617,18 @@ fn resume_sync<'a, T>(
     guest_task: TableId<GuestTask>,
     mut fiber: StoreFiber,
 ) -> Result<StoreContextMut<'a, T>> {
-    match unsafe { resume_fiber(&mut fiber, Some(store), Ok(())) } {
+    match unsafe { resume_fiber(&mut fiber, Some(store), Ok(()))? } {
         Ok((mut store, result)) => {
             result?;
             store = maybe_resume_next_task(store, guest_task, fiber.instance)?;
+            for (event, call) in
+                mem::take(&mut store.concurrent_state().table.get_mut(guest_task)?.events)
+            {
+                if event == EVENT_CALL_DONE {
+                    log::trace!("resume_sync will delete {}", call.rep());
+                    call.delete_all_from(store.as_context_mut())?;
+                }
+            }
             if let Some(next) = store.concurrent_state().table.get(guest_task)?.caller {
                 maybe_send_event(store, next, EVENT_CALL_DONE, EitherTask::Guest(guest_task))
             } else {
@@ -644,7 +663,11 @@ fn resume_async<'a, T>(
         EVENT_CALL_DONE
     };
     if guest_context != 0 {
+        log::trace!("set callback for {}", guest_task.rep());
         task.callback = Some((callback, guest_context));
+        for (event, call) in mem::take(&mut task.events) {
+            store = maybe_send_event(store, guest_task, event, call)?;
+        }
     }
     store = maybe_resume_next_task(store, guest_task, instance)?;
     if let Some(next) = store.concurrent_state().table.get(guest_task)?.caller {
@@ -679,6 +702,45 @@ fn handle_ready<'a, T>(
     Ok(store)
 }
 
+fn maybe_yield<'a, T>(mut store: StoreContextMut<'a, T>) -> Result<StoreContextMut<'a, T>> {
+    let guest_task = store.concurrent_state().guest_task.unwrap();
+
+    if store.concurrent_state().table.get(guest_task)?.should_yield {
+        log::trace!("maybe_yield suspend");
+
+        store.concurrent_state().yielding.insert(guest_task.rep());
+        let cx = AsyncCx::new(&mut store);
+        store = unsafe { cx.suspend(Some(store)) }?.unwrap();
+
+        log::trace!("maybe_yield resume");
+    } else {
+        log::trace!("maybe_yield skip");
+    }
+
+    Ok(store)
+}
+
+fn unyield<'a, T>(mut store: StoreContextMut<'a, T>) -> Result<(StoreContextMut<'a, T>, bool)> {
+    let mut resumed = false;
+    for task in mem::take(&mut store.concurrent_state().yielding) {
+        let guest_task = TableId::<GuestTask>::new(task);
+        if let Some(fiber) = store
+            .concurrent_state()
+            .table
+            .get_mut(guest_task)?
+            .deferred
+            .take_fiber()
+        {
+            resumed = true;
+            let old_task = store.concurrent_state().guest_task.replace(guest_task);
+            store = resume_sync(store, guest_task, fiber)?;
+            store.concurrent_state().guest_task = old_task;
+        }
+    }
+
+    Ok((store, resumed))
+}
+
 fn poll_loop<'a, T>(
     mut store: StoreContextMut<'a, T>,
     continue_: impl Fn(&mut StoreContextMut<'a, T>) -> Result<bool>,
@@ -693,13 +755,19 @@ fn poll_loop<'a, T>(
                 store = handle_ready(store, ready)?;
             }
             Poll::Ready(None) => {
-                break;
+                let (s, resumed) = unyield(store)?;
+                store = s;
+                if !resumed {
+                    break;
+                }
             }
             Poll::Pending => {
+                let (s, resumed) = unyield(store)?;
+                store = s;
                 if continue_(&mut store)? {
                     let cx = AsyncCx::new(&mut store);
                     store = unsafe { cx.suspend(Some(store)) }?.unwrap();
-                } else {
+                } else if !resumed {
                     break;
                 }
             }
@@ -857,12 +925,46 @@ unsafe fn resume_fiber_raw(
 
 unsafe fn resume_fiber<'a, T>(
     fiber: &mut StoreFiber,
-    store: Option<StoreContextMut<'a, T>>,
+    mut store: Option<StoreContextMut<'a, T>>,
     result: Result<()>,
-) -> Result<(StoreContextMut<'a, T>, Result<()>), Option<StoreContextMut<'a, T>>> {
-    resume_fiber_raw(fiber, store.map(|s| s.0.traitobj()), result)
+) -> Result<Result<(StoreContextMut<'a, T>, Result<()>), Option<StoreContextMut<'a, T>>>> {
+    if let Some(mut my_store) = store.take() {
+        let cx = *my_store
+            .concurrent_state()
+            .async_state
+            .current_poll_cx
+            .get();
+        assert!(!cx.is_null());
+        while let Poll::Ready(Some(ready)) = my_store
+            .concurrent_state()
+            .futures
+            .poll_next_unpin(&mut *cx)
+        {
+            match handle_ready(my_store, ready) {
+                Ok(s) => {
+                    my_store = s;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        store = Some(my_store);
+    }
+
+    match resume_fiber_raw(fiber, store.map(|s| s.0.traitobj()), result)
         .map(|(store, result)| (StoreContextMut::from_raw(store.unwrap()), result))
         .map_err(|v| v.map(|v| StoreContextMut::from_raw(v)))
+    {
+        Ok(pair) => Ok(Ok(pair)),
+        Err(s) => {
+            if let Some(range) = fiber.fiber.as_ref().unwrap().stack().range() {
+                AsyncWasmCallState::assert_current_state_not_in_range(range);
+            }
+
+            Ok(Err(s))
+        }
+    }
 }
 
 unsafe fn suspend_fiber<'a, T>(
@@ -892,6 +994,8 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, check: TaskCheck) -> Result<u3
     let instance = (*cx).instance();
     let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
 
+    cx = maybe_yield(cx)?;
+
     let guest_task = cx.concurrent_state().guest_task.unwrap();
 
     let wait = matches!(check, TaskCheck::Wait(..));
@@ -918,7 +1022,7 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, check: TaskCheck) -> Result<u3
         )
     })?;
 
-    match check {
+    let result = match check {
         TaskCheck::Wait(memory, payload) => {
             let (event, call) = cx
                 .concurrent_state()
@@ -975,13 +1079,18 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, check: TaskCheck) -> Result<u3
             }
         }
         TaskCheck::Yield => Ok(0),
-    }
+    };
+
+    result
 }
 
 unsafe fn handle_result<T>(func: impl FnOnce() -> Result<T>) -> T {
     match crate::runtime::vm::catch_unwind_and_longjmp(func) {
         Ok(value) => value,
-        Err(e) => crate::trap::raise(e),
+        Err(e) => {
+            log::trace!("handle_result error: {e:?}");
+            crate::trap::raise(e)
+        }
     }
 }
 
@@ -1086,6 +1195,7 @@ pub(crate) extern "C" fn subtask_drop<T>(cx: *mut VMOpaqueContext, task: u32) {
             let instance = (*cx).instance();
             let mut cx = StoreContextMut::<T>::from_raw((*instance).store());
             let table = &mut cx.concurrent_state().table;
+            log::trace!("subtask_drop delete {task}");
             table.delete_any(task)?;
             Ok(())
         })
@@ -1158,12 +1268,15 @@ pub(crate) extern "C" fn async_enter<T>(
                 caller: old_task,
                 deferred: Deferred::None,
                 events: VecDeque::new(),
+                should_yield: false,
             };
             let guest_task = if let Some(old_task) = old_task {
-                cx.concurrent_state().table.push_child(new_task, old_task)
+                let child = cx.concurrent_state().table.push_child(new_task, old_task)?;
+                log::trace!("new child of {}: {}", old_task.rep(), child.rep());
+                child
             } else {
-                cx.concurrent_state().table.push(new_task)
-            }?;
+                cx.concurrent_state().table.push(new_task)?
+            };
 
             cx.concurrent_state().guest_task = Some(guest_task);
 
@@ -1277,10 +1390,15 @@ pub(crate) extern "C" fn async_exit<T>(
                     Ok(())
                 })?;
 
+                cx.concurrent_state()
+                    .table
+                    .get_mut(guest_task)?
+                    .should_yield = true;
+
                 if ready {
                     let mut cx = Some(cx);
                     loop {
-                        match resume_fiber(&mut fiber, cx.take(), Ok(())) {
+                        match resume_fiber(&mut fiber, cx.take(), Ok(()))? {
                             Ok((cx, result)) => {
                                 result?;
                                 break maybe_resume_next_task(cx, guest_task, callee_instance)?;
@@ -1335,11 +1453,17 @@ pub(crate) extern "C" fn async_exit<T>(
             let task = cx.concurrent_state().table.get_mut(guest_task)?;
 
             if guest_context != 0 {
+                log::trace!("set callback for {}", guest_task.rep());
                 task.callback = Some((
                     SendSyncPtr::new(NonNull::new(callback).unwrap()),
                     guest_context,
                 ));
+                for (event, call) in mem::take(&mut task.events) {
+                    cx = maybe_send_event(cx, guest_task, event, call)?;
+                }
             }
+
+            let task = cx.concurrent_state().table.get(guest_task)?;
 
             let mut status = if task.lower_params.is_some() {
                 STATUS_NOT_STARTED
@@ -1424,8 +1548,12 @@ pub(crate) fn exit<'a, T: Send, R: 'static, LowerParams: Copy>(
     if !matches!(result, Ok(0)) {
         match result {
             Ok(guest_context) => {
-                store.concurrent_state().table.get_mut(guest_task)?.callback =
-                    Some((SendSyncPtr::new(callback), guest_context));
+                log::trace!("set callback for {}", guest_task.rep());
+                let task = store.concurrent_state().table.get_mut(guest_task)?;
+                task.callback = Some((SendSyncPtr::new(callback), guest_context));
+                for (event, call) in mem::take(&mut task.events) {
+                    store = maybe_send_event(store, guest_task, event, call)?;
+                }
             }
             Err(call) => {
                 store
