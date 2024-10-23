@@ -491,8 +491,8 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: Send>(
         state.task_queue.push_back(guest_task);
     }
 
-    let mut store = poll_fn(store, move |_, mut store| {
-        match unsafe { resume_fiber(&mut fiber, store.take(), Ok(())) } {
+    store = poll_fn(store, move |_, mut store| {
+        match resume_fiber(&mut fiber, store.take(), Ok(())) {
             Ok(Ok((store, result))) => Ok(result.map(|()| store)),
             Ok(Err(s)) => Err(s),
             Err(e) => Ok(Err(e)),
@@ -506,6 +506,11 @@ pub(crate) async fn on_fiber<'a, R: Send + Sync + 'static, T: Send>(
         .get_mut(guest_task)?
         .result
         .take();
+
+    store = poll_fn(store, move |_, mut store| {
+        Ok(poll_ready(store.take().unwrap()))
+    })
+    .await?;
 
     if !is_concurrent {
         store = poll_fn(store, move |_, mut store| {
@@ -617,7 +622,7 @@ fn resume_sync<'a, T>(
     guest_task: TableId<GuestTask>,
     mut fiber: StoreFiber,
 ) -> Result<StoreContextMut<'a, T>> {
-    match unsafe { resume_fiber(&mut fiber, Some(store), Ok(()))? } {
+    match resume_fiber(&mut fiber, Some(store), Ok(()))? {
         Ok((mut store, result)) => {
             result?;
             store = maybe_resume_next_task(store, guest_task, fiber.instance)?;
@@ -923,46 +928,48 @@ unsafe fn resume_fiber_raw(
     }
 }
 
-unsafe fn resume_fiber<'a, T>(
-    fiber: &mut StoreFiber,
-    mut store: Option<StoreContextMut<'a, T>>,
-    result: Result<()>,
-) -> Result<Result<(StoreContextMut<'a, T>, Result<()>), Option<StoreContextMut<'a, T>>>> {
-    if let Some(mut my_store) = store.take() {
-        let cx = *my_store
-            .concurrent_state()
-            .async_state
-            .current_poll_cx
-            .get();
+fn poll_ready<'a, T>(mut store: StoreContextMut<'a, T>) -> Result<StoreContextMut<'a, T>> {
+    unsafe {
+        let cx = *store.concurrent_state().async_state.current_poll_cx.get();
         assert!(!cx.is_null());
-        while let Poll::Ready(Some(ready)) = my_store
-            .concurrent_state()
-            .futures
-            .poll_next_unpin(&mut *cx)
+        while let Poll::Ready(Some(ready)) =
+            store.concurrent_state().futures.poll_next_unpin(&mut *cx)
         {
-            match handle_ready(my_store, ready) {
+            match handle_ready(store, ready) {
                 Ok(s) => {
-                    my_store = s;
+                    store = s;
                 }
                 Err(e) => {
                     return Err(e);
                 }
             }
         }
-        store = Some(my_store);
+    }
+    Ok(store)
+}
+
+fn resume_fiber<'a, T>(
+    fiber: &mut StoreFiber,
+    mut store: Option<StoreContextMut<'a, T>>,
+    result: Result<()>,
+) -> Result<Result<(StoreContextMut<'a, T>, Result<()>), Option<StoreContextMut<'a, T>>>> {
+    if let Some(s) = store.take() {
+        store = Some(poll_ready(s)?);
     }
 
-    match resume_fiber_raw(fiber, store.map(|s| s.0.traitobj()), result)
-        .map(|(store, result)| (StoreContextMut::from_raw(store.unwrap()), result))
-        .map_err(|v| v.map(|v| StoreContextMut::from_raw(v)))
-    {
-        Ok(pair) => Ok(Ok(pair)),
-        Err(s) => {
-            if let Some(range) = fiber.fiber.as_ref().unwrap().stack().range() {
-                AsyncWasmCallState::assert_current_state_not_in_range(range);
-            }
+    unsafe {
+        match resume_fiber_raw(fiber, store.map(|s| s.0.traitobj()), result)
+            .map(|(store, result)| (StoreContextMut::from_raw(store.unwrap()), result))
+            .map_err(|v| v.map(|v| StoreContextMut::from_raw(v)))
+        {
+            Ok(pair) => Ok(Ok(pair)),
+            Err(s) => {
+                if let Some(range) = fiber.fiber.as_ref().unwrap().stack().range() {
+                    AsyncWasmCallState::assert_current_state_not_in_range(range);
+                }
 
-            Ok(Err(s))
+                Ok(Err(s))
+            }
         }
     }
 }
@@ -1032,6 +1039,12 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, check: TaskCheck) -> Result<u3
                 .pop_front()
                 .unwrap();
 
+            log::trace!(
+                "deliver event {event} via task.wait to {} for {}",
+                guest_task.rep(),
+                call.rep()
+            );
+
             let options = Options::new(
                 cx.0.id(),
                 NonNull::new(memory),
@@ -1056,6 +1069,12 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, check: TaskCheck) -> Result<u3
                 .events
                 .pop_front()
             {
+                log::trace!(
+                    "deliver event {event} via task.poll to {} for {}",
+                    guest_task.rep(),
+                    call.rep()
+                );
+
                 let options = Options::new(
                     cx.0.id(),
                     NonNull::new(memory),
@@ -1075,6 +1094,11 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, check: TaskCheck) -> Result<u3
 
                 Ok(1)
             } else {
+                log::trace!(
+                    "no events ready to deliver via task.poll to {}",
+                    guest_task.rep()
+                );
+
                 Ok(0)
             }
         }
