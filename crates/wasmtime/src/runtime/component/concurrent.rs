@@ -284,6 +284,7 @@ pub struct ConcurrentState<T> {
     async_state: AsyncState,
     instance_states: HashMap<RuntimeComponentInstanceIndex, InstanceState>,
     yielding: HashSet<u32>,
+    unblocked: HashSet<RuntimeComponentInstanceIndex>,
     _phantom: PhantomData<T>,
 }
 
@@ -299,6 +300,7 @@ impl<T> Default for ConcurrentState<T> {
             },
             instance_states: HashMap::new(),
             yielding: HashSet::new(),
+            unblocked: HashSet::new(),
             _phantom: PhantomData,
         }
     }
@@ -548,7 +550,7 @@ fn maybe_send_event<'a, T>(
     event: u32,
     call: EitherTask,
 ) -> Result<StoreContextMut<'a, T>> {
-    assert!(guest_task.rep() != call.rep());
+    assert_ne!(guest_task.rep(), call.rep());
     if let Some((callback, context)) = store.concurrent_state().table.get(guest_task)?.callback {
         log::trace!(
             "use callback to deliver event {event} to {} for {}: {:?} {context}",
@@ -743,6 +745,21 @@ fn unyield<'a, T>(mut store: StoreContextMut<'a, T>) -> Result<(StoreContextMut<
         }
     }
 
+    for instance in mem::take(&mut store.concurrent_state().unblocked) {
+        let entry = store
+            .concurrent_state()
+            .instance_states
+            .entry(instance)
+            .or_default();
+
+        if !entry.backpressure {
+            if let Some(task) = entry.task_queue.iter().copied().next() {
+                resumed = true;
+                store = resume(store, task)?;
+            }
+        }
+    }
+
     Ok((store, resumed))
 }
 
@@ -782,6 +799,28 @@ fn poll_loop<'a, T>(
     Ok(store)
 }
 
+fn resume<'a, T>(
+    mut store: StoreContextMut<'a, T>,
+    task: TableId<GuestTask>,
+) -> Result<StoreContextMut<'a, T>> {
+    log::trace!("resume {}", task.rep());
+
+    // TODO: Avoid tail calling `resume_sync` or `resume_async` here, because it may call us, leading to
+    // recursion limited only by the number of waiters.  Flatten this into an iteration instead.
+    match mem::replace(
+        &mut store.concurrent_state().table.get_mut(task)?.deferred,
+        Deferred::None,
+    ) {
+        Deferred::None => unreachable!(),
+        Deferred::Sync(fiber) => resume_sync(store, task, fiber),
+        Deferred::Async {
+            call,
+            instance,
+            callback,
+        } => resume_async(store, task, call, instance, callback),
+    }
+}
+
 fn maybe_resume_next_task<'a, T>(
     mut store: StoreContextMut<'a, T>,
     current_task: TableId<GuestTask>,
@@ -801,21 +840,8 @@ fn maybe_resume_next_task<'a, T>(
             state.task_queue.pop_front().unwrap().rep()
         );
 
-        if let Some(next) = state.task_queue.pop_front() {
-            // TODO: Avoid tail calling `resume_sync` or `resume_async` here, because it may call us, leading to
-            // recursion limited only by the number of waiters.  Flatten this into an iteration instead.
-            match mem::replace(
-                &mut store.concurrent_state().table.get_mut(next)?.deferred,
-                Deferred::None,
-            ) {
-                Deferred::None => unreachable!(),
-                Deferred::Sync(fiber) => resume_sync(store, next, fiber),
-                Deferred::Async {
-                    call,
-                    instance,
-                    callback,
-                } => resume_async(store, next, call, instance, callback),
-            }
+        if let Some(next) = state.task_queue.iter().copied().next() {
+            resume(store, next)
         } else {
             Ok(store)
         }
@@ -1138,9 +1164,8 @@ pub(crate) extern "C" fn task_backpressure<T>(
             entry.backpressure = new;
 
             if old && !new {
-                // TODO: are we allowed to run pending calls here, or do we need to defer that?
-                if let Some(task) = entry.task_queue.iter().copied().next() {
-                    maybe_resume_next_task(cx, task, caller_instance)?;
+                if let Some(_) = entry.task_queue.iter().next() {
+                    cx.concurrent_state().unblocked.insert(caller_instance);
                 }
             }
 
@@ -1458,8 +1483,10 @@ pub(crate) extern "C" fn async_exit<T>(
 
                     cx.concurrent_state().table.get_mut(guest_task)?.deferred = Deferred::Async {
                         call: Box::new(move |cx| {
-                            let cx = StoreContextMut::from_raw(cx);
-                            let (storage, _) = call(cx)?;
+                            let mut cx = StoreContextMut::from_raw(cx);
+                            let old_task = cx.concurrent_state().guest_task.replace(guest_task);
+                            let (storage, mut cx) = call(cx)?;
+                            cx.concurrent_state().guest_task = old_task;
                             Ok(storage[0].assume_init().get_i32() as u32)
                         }),
                         instance: callee_instance,
