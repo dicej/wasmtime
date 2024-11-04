@@ -596,9 +596,13 @@ impl HostOutgoingBody {
                                                 bail!("append output stream closed unexpectedly")
                                             }
                                         } else {
-                                            let bytes = src.blocking_read(length).await.context(
-                                                "error while reading from append input stream",
-                                            )?;
+                                            let bytes = match src.blocking_read(length).await {
+                                                Ok(bytes) => bytes,
+                                                Err(StreamError::Closed) => break,
+                                                v => v.context(
+                                                    "error while reading from append input stream",
+                                                )?,
+                                            };
                                             let length = bytes.len();
                                             if length > 0 {
                                                 dst.blocking_write_and_flush(bytes).await.context(
@@ -608,6 +612,10 @@ impl HostOutgoingBody {
                                                     .map(|v| v - u64::try_from(length).unwrap());
                                             }
                                         }
+                                    }
+
+                                    if remaining.map(|v| v > 0).unwrap_or(false) {
+                                        bail!("unexpected end of append input stream");
                                     }
                                 }
                                 AppendEvent::Finish(trailers) => {
