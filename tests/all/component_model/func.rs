@@ -821,13 +821,46 @@ fn strings() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn many_parameters() -> Result<()> {
-    let component = format!(
-        r#"(component
-            (core module $m
-                (memory (export "memory") 1)
-                (func (export "foo") (param i32) (result i32)
+#[tokio::test]
+async fn many_parameters() -> Result<()> {
+    test_many_parameters(false, false).await
+}
+
+#[tokio::test]
+async fn many_parameters_concurrent() -> Result<()> {
+    test_many_parameters(false, true).await
+}
+
+#[tokio::test]
+async fn many_parameters_dynamic() -> Result<()> {
+    test_many_parameters(true, false).await
+}
+
+#[tokio::test]
+async fn many_parameters_dynamic_concurrent() -> Result<()> {
+    test_many_parameters(true, true).await
+}
+
+async fn test_many_parameters(dynamic: bool, concurrent: bool) -> Result<()> {
+    let (body, async_opts) = if concurrent {
+        (
+            r#"
+                    (call $task-return
+                        (i32.const 0)
+                        (i32.mul
+                            (memory.size)
+                            (i32.const 65536)
+                        )
+                        (local.get 0)
+                    )
+
+                    (i32.const 0)
+            "#,
+            r#"async (callback (func $i "callback"))"#,
+        )
+    } else {
+        (
+            r#"
                     (local $base i32)
 
                     ;; Allocate space for the return
@@ -855,11 +888,28 @@ fn many_parameters() -> Result<()> {
                         (local.get 0))
 
                     (local.get $base)
+            "#,
+            "",
+        )
+    };
+
+    let component = format!(
+        r#"(component
+            (core module $m
+                (import "" "task.return" (func $task-return (param i32 i32 i32)))
+                (memory (export "memory") 1)
+                (func (export "foo") (param i32) (result i32)
+                    {body}
                 )
+                (func (export "callback") (param i32 i32 i32 i32) (result i32) unreachable)
 
                 {REALLOC_AND_FREE}
             )
-            (core instance $i (instantiate $m))
+            (core type $task-return-type (func (param i32 i32 i32)))
+            (core func $task-return (canon task.return $task-return-type))
+            (core instance $i (instantiate $m
+                (with "" (instance (export "task.return" (func $task-return))))
+            ))
 
             (type $t (func
                 (param "p1" s8)              ;; offset  0, size 1
@@ -883,30 +933,22 @@ fn many_parameters() -> Result<()> {
                     (core func $i "foo")
                     (memory $i "memory")
                     (realloc (func $i "realloc"))
+                    {async_opts}
                 )
             )
         )"#
     );
 
-    let engine = super::engine();
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    config.async_support(true);
+    let engine = &Engine::new(&config)?;
     let component = Component::new(&engine, component)?;
     let mut store = Store::new(&engine, ());
-    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
-    let func = instance.get_typed_func::<(
-        i8,
-        u64,
-        f32,
-        u8,
-        i16,
-        &str,
-        &[u32],
-        bool,
-        bool,
-        char,
-        &[bool],
-        &[char],
-        &[&str],
-    ), ((WasmList<u8>, u32),)>(&mut store, "many-param")?;
+
+    let instance = Linker::new(&engine)
+        .instantiate_async(&mut store, &component)
+        .await?;
 
     let input = (
         -100,
@@ -930,8 +972,76 @@ fn many_parameters() -> Result<()> {
         ]
         .as_slice(),
     );
-    let ((memory, pointer),) = func.call(&mut store, input)?;
-    let memory = memory.as_le_slice(&store);
+
+    let (memory, pointer) = if dynamic {
+        let input = vec![
+            Val::S8(input.0),
+            Val::U64(input.1),
+            Val::Float32(input.2),
+            Val::U8(input.3),
+            Val::S16(input.4),
+            Val::String(input.5.into()),
+            Val::List(input.6.iter().copied().map(Val::U32).collect()),
+            Val::Bool(input.7),
+            Val::Bool(input.8),
+            Val::Char(input.9),
+            Val::List(input.10.iter().copied().map(Val::Bool).collect()),
+            Val::List(input.11.iter().copied().map(Val::Char).collect()),
+            Val::List(input.12.iter().map(|&s| Val::String(s.into())).collect()),
+        ];
+        let func = instance.get_func(&mut store, "many-param").unwrap();
+
+        let mut results = if concurrent {
+            let promise = func.call_concurrent(&mut store, input).await?;
+            promise.get(&mut store).await?.into_iter()
+        } else {
+            let mut results = vec![Val::Bool(false)];
+            func.call_async(&mut store, &input, &mut results).await?;
+            results.into_iter()
+        };
+
+        let Some(Val::Tuple(results)) = results.next() else {
+            panic!()
+        };
+        let mut results = results.into_iter();
+        let Some(Val::List(memory)) = results.next() else {
+            panic!()
+        };
+        let Some(Val::U32(pointer)) = results.next() else {
+            panic!()
+        };
+        (
+            memory
+                .into_iter()
+                .map(|v| if let Val::U8(v) = v { v } else { panic!() })
+                .collect(),
+            pointer,
+        )
+    } else {
+        let func = instance.get_typed_func::<(
+            i8,
+            u64,
+            f32,
+            u8,
+            i16,
+            &str,
+            &[u32],
+            bool,
+            bool,
+            char,
+            &[bool],
+            &[char],
+            &[&str],
+        ), ((Vec<u8>, u32),)>(&mut store, "many-param")?;
+
+        if concurrent {
+            let promise = func.call_concurrent(&mut store, input).await?;
+            promise.get(&mut store).await?.0
+        } else {
+            func.call_async(&mut store, input).await?.0
+        }
+    };
+    let memory = &memory[..];
 
     let mut actual = &memory[pointer as usize..][..72];
     assert_eq!(i8::from_le_bytes(*actual.take_n::<1>()), input.0);
