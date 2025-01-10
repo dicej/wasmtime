@@ -297,9 +297,9 @@ io-extras = "0.18.1"
 rustix = "0.38.43"
 # wit-bindgen:
 # TODO: switch to crates.io once https://github.com/bytecodealliance/wit-bindgen/pull/1124 has been released
-wit-bindgen = { git = "https://github.com/bytecodealliance/wit-bindgen", default-features = false }
-wit-bindgen-rt = { git = "https://github.com/bytecodealliance/wit-bindgen", default-features = false }
-wit-bindgen-rust-macro = { git = "https://github.com/bytecodealliance/wit-bindgen", default-features = false }
+wit-bindgen = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "341c47375d44bb82dc726d34e94bbb2e92b4b595", default-features = false }
+wit-bindgen-rt = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "341c47375d44bb82dc726d34e94bbb2e92b4b595", default-features = false }
+wit-bindgen-rust-macro = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "341c47375d44bb82dc726d34e94bbb2e92b4b595", default-features = false }
 
 # wasm-tools family:
 wasmparser = { version = "0.223.0", default-features = false, features = ['simd'] }

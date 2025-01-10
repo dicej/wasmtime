@@ -15,7 +15,7 @@ anyhow = { workspace = true, features = ['std'] }
 wasi = "0.11.0"
 wasi-nn = "0.6.0"
 wit-bindgen = { workspace = true, features = ['default'] }
-wit-bindgen-rt = { workspace = true }
+wit-bindgen-rt = { workspace = true, features = ['async'] }
 libc = { workspace = true }
 getrandom = "0.2.9"
 futures = { workspace = true, default-features = false, features = ['alloc'] }

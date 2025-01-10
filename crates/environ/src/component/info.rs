@@ -849,7 +849,7 @@ pub enum Trampoline {
     /// specified debug message.
     ErrorContextNew {
         /// The table index for the `error-context` type in the caller instance.
-        ty: TypeErrorContextTableIndex,
+        ty: TypeComponentLocalErrorContextTableIndex,
         /// String encoding, memory, etc. to use when loading debug message.
         options: CanonicalOptions,
     },
@@ -861,7 +861,7 @@ pub enum Trampoline {
     /// to `error.new`.
     ErrorContextDebugMessage {
         /// The table index for the `error-context` type in the caller instance.
-        ty: TypeErrorContextTableIndex,
+        ty: TypeComponentLocalErrorContextTableIndex,
         /// String encoding, memory, etc. to use when storing debug message.
         options: CanonicalOptions,
     },
@@ -869,7 +869,7 @@ pub enum Trampoline {
     /// A `error-context.drop` intrinsic to drop a specified `error-context`.
     ErrorContextDrop {
         /// The table index for the `error-context` type in the caller instance.
-        ty: TypeErrorContextTableIndex,
+        ty: TypeComponentLocalErrorContextTableIndex,
     },
 
     /// An intrinsic used by FACT-generated modules which will transfer an owned

@@ -697,7 +697,7 @@ pub(crate) mod concurrent {
             task::{Context, Poll, Waker},
         },
         wasmtime_environ::component::{
-            InterfaceType, RuntimeComponentInstanceIndex, TypeErrorContextTableIndex,
+            InterfaceType, RuntimeComponentInstanceIndex, TypeComponentLocalErrorContextTableIndex,
             TypeFutureTableIndex, TypeStreamTableIndex, TypeTaskReturnIndex,
         },
     };
@@ -981,7 +981,7 @@ pub(crate) mod concurrent {
         _memory: *mut VMMemoryDefinition,
         _realloc: *mut VMFuncRef,
         _string_encoding: u8,
-        _ty: TypeErrorContextTableIndex,
+        _ty: TypeComponentLocalErrorContextTableIndex,
         _address: u32,
         _count: u32,
     ) -> u64 {
@@ -993,7 +993,7 @@ pub(crate) mod concurrent {
         _memory: *mut VMMemoryDefinition,
         _realloc: *mut VMFuncRef,
         _string_encoding: u8,
-        _ty: TypeErrorContextTableIndex,
+        _ty: TypeComponentLocalErrorContextTableIndex,
         _handle: u32,
         _address: u32,
     ) -> bool {
@@ -1002,7 +1002,7 @@ pub(crate) mod concurrent {
 
     pub(crate) extern "C" fn error_context_drop<T>(
         _vmctx: *mut VMOpaqueContext,
-        _ty: TypeErrorContextTableIndex,
+        _ty: TypeComponentLocalErrorContextTableIndex,
         _error: u32,
     ) -> bool {
         unreachable!()

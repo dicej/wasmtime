@@ -129,3 +129,7 @@ world borrowing-host {
   import borrowing-types;
   export run-bool;
 }
+
+world error-context-usage {
+  export run;
+}

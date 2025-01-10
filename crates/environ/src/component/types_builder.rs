@@ -49,7 +49,7 @@ pub struct ComponentTypesBuilder {
     streams: HashMap<TypeStream, TypeStreamIndex>,
     future_tables: HashMap<TypeFutureTable, TypeFutureTableIndex>,
     stream_tables: HashMap<TypeStreamTable, TypeStreamTableIndex>,
-    error_context_tables: HashMap<TypeErrorContextTable, TypeErrorContextTableIndex>,
+    error_context_tables: HashMap<TypeErrorContextTable, TypeComponentLocalErrorContextTableIndex>,
     task_returns: HashMap<TypeTaskReturn, TypeTaskReturnIndex>,
 
     component_types: ComponentTypes,
@@ -210,7 +210,7 @@ impl ComponentTypesBuilder {
     }
 
     /// Returns the number of error-context tables allocated so far, or the maximum
-    /// `TypeErrorContextTableIndex`.
+    /// `TypeComponentLocalErrorContextTableIndex`.
     pub fn num_error_context_tables(&self) -> usize {
         self.component_types.error_context_tables.len()
     }
@@ -444,7 +444,7 @@ impl ComponentTypesBuilder {
     }
 
     /// Retrieve Wasmtime's type representation of the `error-context` type.
-    pub fn error_context_type(&mut self) -> Result<TypeErrorContextTableIndex> {
+    pub fn error_context_type(&mut self) -> Result<TypeComponentLocalErrorContextTableIndex> {
         self.error_context_table_type()
     }
 
@@ -599,7 +599,7 @@ impl ComponentTypesBuilder {
         }))
     }
 
-    fn error_context_table_type(&mut self) -> Result<TypeErrorContextTableIndex> {
+    fn error_context_table_type(&mut self) -> Result<TypeComponentLocalErrorContextTableIndex> {
         Ok(self.add_error_context_table_type(TypeErrorContextTable {
             instance: self.resources.get_current_instance().unwrap(),
         }))
@@ -694,7 +694,7 @@ impl ComponentTypesBuilder {
     pub fn add_error_context_table_type(
         &mut self,
         ty: TypeErrorContextTable,
-    ) -> TypeErrorContextTableIndex {
+    ) -> TypeComponentLocalErrorContextTableIndex {
         intern(
             &mut self.error_context_tables,
             &mut self.component_types.error_context_tables,

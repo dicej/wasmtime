@@ -354,15 +354,15 @@ pub enum Trampoline {
         ty: TypeFutureTableIndex,
     },
     ErrorContextNew {
-        ty: TypeErrorContextTableIndex,
+        ty: TypeComponentLocalErrorContextTableIndex,
         options: CanonicalOptions,
     },
     ErrorContextDebugMessage {
-        ty: TypeErrorContextTableIndex,
+        ty: TypeComponentLocalErrorContextTableIndex,
         options: CanonicalOptions,
     },
     ErrorContextDrop {
-        ty: TypeErrorContextTableIndex,
+        ty: TypeComponentLocalErrorContextTableIndex,
     },
     ResourceTransferOwn,
     ResourceTransferBorrow,

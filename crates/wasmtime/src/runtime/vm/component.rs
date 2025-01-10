@@ -12,6 +12,7 @@ use crate::runtime::vm::{
     VMOpaqueContext, VMStore, VMWasmCallFunction, ValRaw,
 };
 use alloc::alloc::Layout;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::any::Any;
 use core::marker;
@@ -27,10 +28,12 @@ use wasmtime_environ::{HostPtr, PrimaryMap, VMSharedTypeIndex};
                                            // 32-bit platforms
 const INVALID_PTR: usize = 0xdead_dead_beef_beef_u64 as usize;
 
+mod error_contexts;
 mod libcalls;
 mod resources;
 mod states;
 
+pub use self::error_contexts::{GlobalErrorContextRefCount, LocalErrorContextRefCount};
 pub use self::resources::{CallContexts, ResourceTable, ResourceTables};
 pub use self::states::StateTable;
 
@@ -64,7 +67,33 @@ pub struct ComponentInstance {
     component_resource_tables: PrimaryMap<TypeResourceTableIndex, ResourceTable>,
 
     component_waitable_tables: PrimaryMap<RuntimeComponentInstanceIndex, StateTable<WaitableState>>,
-    component_error_context_tables: PrimaryMap<TypeErrorContextTableIndex, StateTable<usize>>,
+
+    /// (Sub)Component specific error context tracking
+    ///
+    /// At the component level, only the number of references (`usize`) to a given error context is tracked,
+    /// with state related to the error context being held at the component model level, in concurrent
+    /// state.
+    ///
+    /// The state tables in the (sub)component local tracking must contain a pointer into the global
+    /// error context lookups in order to ensure that in contexts where only the local reference is present
+    /// the global state can still be maintained/updated.
+    component_error_context_tables:
+        PrimaryMap<TypeComponentLocalErrorContextTableIndex, StateTable<LocalErrorContextRefCount>>,
+
+    /// Reference counts for all component error contexts
+    ///
+    /// NOTE: it is possible the global ref count to be *greater* than the sum of
+    /// (sub)component ref counts as tracked by `component_error_context_tables`, for
+    /// example when the host holds one or more references to error contexts.
+    ///
+    /// The key of this primary map is often referred to as the "rep" (i.e. host-side
+    /// component-wide representation) of the index into concurrent state for a given
+    /// stored `ErrorContext`.
+    ///
+    /// Stated another way, `TypeComponentGlobalErrorContextTableIndex` is essentially the same
+    /// as a `TableId<ErrorContextState>`.
+    component_global_error_context_ref_counts:
+        BTreeMap<TypeComponentGlobalErrorContextTableIndex, GlobalErrorContextRefCount>,
 
     /// Storage for the type information about resources within this component
     /// instance.
@@ -297,7 +326,7 @@ pub type VMErrorContextNewCallback = extern "C" fn(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     string_encoding: u8,
-    ty: TypeErrorContextTableIndex,
+    ty: TypeComponentLocalErrorContextTableIndex,
     address: u32,
     count: u32,
 ) -> u64;
@@ -309,14 +338,17 @@ pub type VMErrorContextDebugMessageCallback = extern "C" fn(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     string_encoding: u8,
-    ty: TypeErrorContextTableIndex,
+    ty: TypeComponentLocalErrorContextTableIndex,
     handle: u32,
     address: u32,
 ) -> bool;
 
 /// Type signature for the host-defined `error-context.drop` built-in function.
-pub type VMErrorContextDropCallback =
-    extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeErrorContextTableIndex, handle: u32) -> bool;
+pub type VMErrorContextDropCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    ty: TypeComponentLocalErrorContextTableIndex,
+    handle: u32,
+) -> bool;
 
 /// This is a marker type to represent the underlying allocation of a
 /// `VMComponentContext`.
@@ -358,6 +390,13 @@ pub enum WaitableState {
     Stream(TypeStreamTableIndex, StreamFutureState),
     /// Represents a future handle.
     Future(TypeFutureTableIndex, StreamFutureState),
+}
+
+/// Represents the state associated with an error context
+#[derive(Debug, PartialEq, Eq, PartialOrd)]
+pub struct ErrorContextState {
+    /// Debug message associated with the error context
+    pub(crate) debug_msg: String,
 }
 
 impl ComponentInstance {
@@ -423,11 +462,15 @@ impl ComponentInstance {
         }
 
         let num_error_context_tables = runtime_info.component().num_error_context_tables;
-        let mut component_error_context_tables =
-            PrimaryMap::with_capacity(num_error_context_tables);
+        let mut component_error_context_tables = PrimaryMap::<
+            TypeComponentLocalErrorContextTableIndex,
+            StateTable<LocalErrorContextRefCount>,
+        >::with_capacity(num_error_context_tables);
         for _ in 0..num_error_context_tables {
             component_error_context_tables.push(StateTable::default());
         }
+
+        let component_global_error_context_ref_counts = BTreeMap::new();
 
         ptr::write(
             ptr.as_ptr(),
@@ -444,6 +487,7 @@ impl ComponentInstance {
                 component_resource_tables,
                 component_waitable_tables,
                 component_error_context_tables,
+                component_global_error_context_ref_counts,
                 runtime_info,
                 resource_types,
                 vmctx: VMComponentContext {
@@ -749,8 +793,7 @@ impl ComponentInstance {
                 stream_close_readable;
             *self.vmctx_plus_offset_mut(self.offsets.flat_stream_write()) = flat_stream_write;
             *self.vmctx_plus_offset_mut(self.offsets.flat_stream_read()) = flat_stream_read;
-            *self.vmctx_plus_offset_mut(self.offsets.error_context_debug_message()) =
-                error_context_new;
+            *self.vmctx_plus_offset_mut(self.offsets.error_context_new()) = error_context_new;
             *self.vmctx_plus_offset_mut(self.offsets.error_context_debug_message()) =
                 error_context_debug_message;
             *self.vmctx_plus_offset_mut(self.offsets.error_context_drop()) = error_context_drop;
@@ -908,8 +951,19 @@ impl ComponentInstance {
     /// counts with respect to the components which own them.
     pub fn component_error_context_tables(
         &mut self,
-    ) -> &mut PrimaryMap<TypeErrorContextTableIndex, StateTable<usize>> {
+    ) -> &mut PrimaryMap<
+        TypeComponentLocalErrorContextTableIndex,
+        StateTable<LocalErrorContextRefCount>,
+    > {
         &mut self.component_error_context_tables
+    }
+
+    /// Retrieves the tables for tracking component-global error-context handles
+    /// and their reference counts with respect to the components which own them.
+    pub fn component_global_error_context_ref_counts(
+        &mut self,
+    ) -> &mut BTreeMap<TypeComponentGlobalErrorContextTableIndex, GlobalErrorContextRefCount> {
+        &mut self.component_global_error_context_ref_counts
     }
 
     /// Returns the destructor and instance flags for the specified resource
@@ -1063,21 +1117,44 @@ impl ComponentInstance {
         }
     }
 
+    /// Transfer the state of a given error context from one component to another
     pub(crate) fn error_context_transfer(
         &mut self,
         src_idx: u32,
-        src: TypeErrorContextTableIndex,
-        dst: TypeErrorContextTableIndex,
+        src: TypeComponentLocalErrorContextTableIndex,
+        dst: TypeComponentLocalErrorContextTableIndex,
     ) -> Result<u32> {
-        let (rep, _) = self.component_error_context_tables[src].get_mut_by_index(src_idx)?;
-        let dst = &mut self.component_error_context_tables[dst];
+        let (rep, _) = {
+            let rep = self
+                .component_error_context_tables
+                .get_mut(src)
+                .context("error context table index present in (sub)component lookup")?
+                .get_mut_by_index(src_idx)?;
+            rep
+        };
+        let dst = self
+            .component_error_context_tables
+            .get_mut(dst)
+            .context("error context table index present in (sub)component lookup")?;
 
-        if let Some((dst_idx, dst_state)) = dst.get_mut_by_rep(rep) {
-            *dst_state += 1;
-            Ok(dst_idx)
+        // Update the component local for the destination
+        let updated_count = if let Some((dst_idx, count)) = dst.get_mut_by_rep(rep.clone()) {
+            (*count).0 += 1;
+            dst_idx
         } else {
-            dst.insert(rep, 1)
-        }
+            dst.insert(rep, LocalErrorContextRefCount(1))?
+        };
+
+        // Update the global (cross-subcomponent) count for error contexts
+        // as the new component has essentially created a new reference that will
+        // be dropped/handled independently
+        let global_ref_count = self
+            .component_global_error_context_ref_counts
+            .get_mut(&TypeComponentGlobalErrorContextTableIndex::from_u32(rep))
+            .context("global ref count present for existing (sub)component error context")?;
+        global_ref_count.0 += 1;
+
+        Ok(updated_count)
     }
 }
 

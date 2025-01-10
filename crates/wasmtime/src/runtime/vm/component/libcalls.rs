@@ -7,7 +7,7 @@ use core::cell::Cell;
 use core::convert::Infallible;
 use core::slice;
 use wasmtime_environ::component::{
-    TypeErrorContextTableIndex, TypeFutureTableIndex, TypeResourceTableIndex, TypeStreamTableIndex,
+    TypeComponentLocalErrorContextTableIndex, TypeFutureTableIndex, TypeResourceTableIndex, TypeStreamTableIndex,
 };
 
 const UTF16_TAG: usize = 1 << 31;
@@ -592,8 +592,8 @@ unsafe fn error_context_transfer(
     src_table: u32,
     dst_table: u32,
 ) -> Result<u32> {
-    let src_table = TypeErrorContextTableIndex::from_u32(src_table);
-    let dst_table = TypeErrorContextTableIndex::from_u32(dst_table);
+    let src_table = TypeComponentLocalErrorContextTableIndex::from_u32(src_table);
+    let dst_table = TypeComponentLocalErrorContextTableIndex::from_u32(dst_table);
     ComponentInstance::from_vmctx(vmctx, |instance| {
         instance.error_context_transfer(src_idx, src_table, dst_table)
     })

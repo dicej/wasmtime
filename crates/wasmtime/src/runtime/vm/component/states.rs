@@ -90,6 +90,14 @@ impl<T> StateTable<T> {
         }
     }
 
+    pub fn has_handle(&self, idx: u32) -> bool {
+        matches!(
+            self.handle_index_to_table_index(idx)
+                .and_then(|i| self.slots.get(i)),
+            Some(Slot::Occupied { .. })
+        )
+    }
+
     pub fn get_mut_by_index(&mut self, idx: u32) -> Result<(u32, &mut T)> {
         let slot = self
             .handle_index_to_table_index(idx)

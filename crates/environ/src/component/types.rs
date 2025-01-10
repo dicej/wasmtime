@@ -103,11 +103,19 @@ indices! {
     /// This is analogous to `TypeResourceTableIndex` in that it tracks
     /// ownership of stream within each (sub)component instance.
     pub struct TypeStreamTableIndex(u32);
+
     /// Index pointing to a error context table within a component.
     ///
     /// This is analogous to `TypeResourceTableIndex` in that it tracks
     /// ownership of error contexts within each (sub)component instance.
-    pub struct TypeErrorContextTableIndex(u32);
+    pub struct TypeComponentLocalErrorContextTableIndex(u32);
+
+    /// Index pointing to a (component) globally tracked error context table entry
+    ///
+    /// Unlike [`TypeComponentLocalErrorContextTableIndex`], this index refers to
+    /// the global state table for error contexts at the level of the entire component,
+    /// not just a subcomponent.
+    pub struct TypeComponentGlobalErrorContextTableIndex(u32);
 
     /// Index pointing to an interned `task.return` type within a component.
     pub struct TypeTaskReturnIndex(u32);
@@ -267,7 +275,7 @@ pub struct ComponentTypes {
     pub(super) future_tables: PrimaryMap<TypeFutureTableIndex, TypeFutureTable>,
     pub(super) streams: PrimaryMap<TypeStreamIndex, TypeStream>,
     pub(super) stream_tables: PrimaryMap<TypeStreamTableIndex, TypeStreamTable>,
-    pub(super) error_context_tables: PrimaryMap<TypeErrorContextTableIndex, TypeErrorContextTable>,
+    pub(super) error_context_tables: PrimaryMap<TypeComponentLocalErrorContextTableIndex, TypeErrorContextTable>,
     pub(super) task_returns: PrimaryMap<TypeTaskReturnIndex, TypeTaskReturn>,
 }
 
@@ -357,7 +365,7 @@ impl_index! {
     impl Index<TypeStreamIndex> for ComponentTypes { TypeStream => streams }
     impl Index<TypeFutureTableIndex> for ComponentTypes { TypeFutureTable => future_tables }
     impl Index<TypeStreamTableIndex> for ComponentTypes { TypeStreamTable => stream_tables }
-    impl Index<TypeErrorContextTableIndex> for ComponentTypes { TypeErrorContextTable => error_context_tables }
+    impl Index<TypeComponentLocalErrorContextTableIndex> for ComponentTypes { TypeErrorContextTable => error_context_tables }
 }
 
 // Additionally forward anything that can index `ModuleTypes` to `ModuleTypes`
@@ -518,7 +526,7 @@ pub enum InterfaceType {
     Borrow(TypeResourceTableIndex),
     Future(TypeFutureTableIndex),
     Stream(TypeStreamTableIndex),
-    ErrorContext(TypeErrorContextTableIndex),
+    ErrorContext(TypeComponentLocalErrorContextTableIndex),
 }
 
 impl From<&wasmparser::PrimitiveValType> for InterfaceType {

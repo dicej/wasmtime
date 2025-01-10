@@ -1288,7 +1288,7 @@ impl<'a> TrampolineCompiler<'a> {
 
     fn translate_error_context_call(
         &mut self,
-        ty: TypeErrorContextTableIndex,
+        ty: TypeComponentLocalErrorContextTableIndex,
         options: &CanonicalOptions,
         offset: u32,
         params: Vec<ir::AbiParam>,
@@ -1379,7 +1379,7 @@ impl<'a> TrampolineCompiler<'a> {
         }
     }
 
-    fn translate_error_context_drop_call(&mut self, ty: TypeErrorContextTableIndex) {
+    fn translate_error_context_drop_call(&mut self, ty: TypeComponentLocalErrorContextTableIndex) {
         match self.abi {
             Abi::Wasm => {}
 

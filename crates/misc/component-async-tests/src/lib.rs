@@ -1289,4 +1289,9 @@ mod test {
             &fs::read(test_programs_artifacts::ASYNC_HTTP_MIDDLEWARE_COMPONENT).await?;
         test_http_echo(&compose(middleware, echo).await?, true).await
     }
+
+    #[tokio::test]
+    async fn async_error_context() -> Result<()> {
+        test_run(&fs::read(test_programs_artifacts::ASYNC_ERROR_CONTEXT_COMPONENT).await?).await
+    }
 }

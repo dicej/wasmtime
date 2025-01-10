@@ -17,7 +17,7 @@
 
 use crate::component::{
     CanonicalAbiInfo, ComponentTypesBuilder, FixedEncoding as FE, FlatType, InterfaceType,
-    StringEncoding, Transcode, TypeEnumIndex, TypeErrorContextTableIndex, TypeFlagsIndex,
+    StringEncoding, Transcode, TypeEnumIndex, TypeComponentLocalErrorContextTableIndex, TypeFlagsIndex,
     TypeFutureTableIndex, TypeListIndex, TypeOptionIndex, TypeRecordIndex, TypeResourceTableIndex,
     TypeResultIndex, TypeStreamTableIndex, TypeTupleIndex, TypeVariantIndex, VariantInfo,
     FLAG_MAY_ENTER, FLAG_MAY_LEAVE, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
@@ -2935,7 +2935,7 @@ impl Compiler<'_, '_> {
 
     fn translate_error_context_context(
         &mut self,
-        src_ty: TypeErrorContextTableIndex,
+        src_ty: TypeComponentLocalErrorContextTableIndex,
         src: &Source<'_>,
         dst_ty: &InterfaceType,
         dst: &Destination,
