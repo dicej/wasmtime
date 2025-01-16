@@ -34,7 +34,7 @@ interface transmit {
     write-stream(string),
     write-future(string),
   }
-  
+
   exchange: func(control: stream<control>,
                  caller-stream: stream<string>,
                  caller-future1: future<string>,
@@ -61,6 +61,11 @@ interface borrowing {
 
 interface run-bool {
   run: func(v: bool);
+}
+
+interface run-result {
+  run-fail: func() -> result<_, error-context>;
+  run-pass: func() -> result<_, error-context>;
 }
 
 world yield-caller {
@@ -131,5 +136,15 @@ world borrowing-host {
 }
 
 world error-context-usage {
+  export run;
+}
+
+world error-context-callee {
+  export run-result;
+  export run;
+}
+
+world error-context-caller {
+  import run-result;
   export run;
 }
