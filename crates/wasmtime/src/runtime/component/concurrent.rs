@@ -531,7 +531,10 @@ pub(crate) fn first_poll<T, R: Send + 'static>(
     caller_instance: RuntimeComponentInstanceIndex,
     lower: impl FnOnce(StoreContextMut<T>, R) -> Result<()> + Send + Sync + 'static,
 ) -> Result<Option<u32>> {
-    let caller = store.concurrent_state().guest_task.unwrap();
+    let caller = store
+        .concurrent_state()
+        .guest_task
+        .context("guest task missing")?;
     let task = store
         .concurrent_state()
         .table
@@ -1000,7 +1003,10 @@ fn handle_ready<'a, T>(
 }
 
 fn maybe_yield<'a, T>(mut store: StoreContextMut<'a, T>) -> Result<StoreContextMut<'a, T>> {
-    let guest_task = store.concurrent_state().guest_task.unwrap();
+    let guest_task = store
+        .concurrent_state()
+        .guest_task
+        .context("guest task missing")?;
 
     if store.concurrent_state().table.get(guest_task)?.should_yield {
         log::trace!("maybe_yield suspend {}", guest_task.rep());
@@ -1318,7 +1324,10 @@ unsafe fn task_check<T>(cx: *mut VMOpaqueContext, async_: bool, check: TaskCheck
     let instance = (*cx).instance();
     let mut cx = StoreContextMut::<T>(&mut *(*instance).store().cast());
 
-    let guest_task = cx.concurrent_state().guest_task.unwrap();
+    let guest_task = cx
+        .concurrent_state()
+        .guest_task
+        .context("guest task missing")?;
 
     log::trace!("task check for {}", guest_task.rep());
 
@@ -1517,7 +1526,10 @@ pub(crate) extern "C" fn task_return<T>(
             let cx = VMComponentContext::from_opaque(cx);
             let instance = (*cx).instance();
             let mut cx = StoreContextMut::<T>(&mut *(*instance).store().cast());
-            let guest_task = cx.concurrent_state().guest_task.unwrap();
+            let guest_task = cx
+                .concurrent_state()
+                .guest_task
+                .context("guest task missing")?;
             let (lift, lift_ty) = cx
                 .concurrent_state()
                 .table
@@ -1678,7 +1690,10 @@ pub(crate) extern "C" fn async_enter<T>(
                         &mut src[..1.max(dst.len())] as *mut [MaybeUninit<ValRaw>] as _,
                     )?;
                     dst.copy_from_slice(&src[..dst.len()]);
-                    let task = cx.concurrent_state().guest_task.unwrap();
+                    let task = cx
+                        .concurrent_state()
+                        .guest_task
+                        .context("guest task missing")?;
                     if let Some(rep) = old_task_rep {
                         maybe_send_event(
                             cx,
@@ -1700,7 +1715,10 @@ pub(crate) extern "C" fn async_enter<T>(
                             return_.as_non_null(),
                             my_src.as_mut_slice(),
                         )?;
-                        let task = cx.concurrent_state().guest_task.unwrap();
+                        let task = cx
+                            .concurrent_state()
+                            .guest_task
+                            .context("guest task missing")?;
                         if let Some(rep) = old_task_rep {
                             maybe_send_event(
                                 cx,
@@ -2047,7 +2065,10 @@ pub(crate) extern "C" fn async_exit<T>(
             let instance = (*cx).instance();
             let mut cx = StoreContextMut::<T>(&mut *(*instance).store().cast());
 
-            let guest_task = cx.concurrent_state().guest_task.unwrap();
+            let guest_task = cx
+                .concurrent_state()
+                .guest_task
+                .context("guest task missing")?;
             let callee = SendSyncPtr::new(NonNull::new(callee).unwrap());
             let param_count = usize::try_from(param_count).unwrap();
             assert!(param_count <= MAX_FLAT_PARAMS);

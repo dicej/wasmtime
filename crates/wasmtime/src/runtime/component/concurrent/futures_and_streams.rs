@@ -1462,7 +1462,10 @@ fn guest_write<T>(
                 ReadState::Open => {
                     assert!(matches!(&transmit.write, WriteState::Open));
 
-                    let caller = cx.concurrent_state().guest_task.unwrap();
+                    let caller = cx
+                        .concurrent_state()
+                        .guest_task
+                        .context("guest task missing")?;
                     log::trace!(
                         "add write {} child of {}: {}",
                         match ty {
@@ -1628,7 +1631,10 @@ fn guest_read<T>(
                 WriteState::Open => {
                     assert!(matches!(&transmit.read, ReadState::Open));
 
-                    let caller = cx.concurrent_state().guest_task.unwrap();
+                    let caller = cx
+                        .concurrent_state()
+                        .guest_task
+                        .context("guest task missing")?;
                     log::trace!(
                         "add read {} child of {}: {}",
                         match ty {
