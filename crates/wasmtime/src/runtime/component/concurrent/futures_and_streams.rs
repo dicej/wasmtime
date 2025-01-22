@@ -20,7 +20,7 @@ use {
         },
         AsContextMut, StoreContextMut, ValRaw,
     },
-    anyhow::{anyhow, bail, Context, Result},
+    anyhow::{anyhow, bail, ensure, Context, Result},
     futures::{
         channel::oneshot,
         future::{self, FutureExt},
@@ -183,6 +183,7 @@ fn accept<T: func::Lower + Send + Sync + 'static, U>(
                     transmit.write = WriteState::HostReady {
                         accept: Box::new(accept::<T, U>(values, offset, transmit_id, tx)),
                         close: false,
+                        err_ctx: 0,
                     };
                 }
 
@@ -202,15 +203,26 @@ fn accept<T: func::Lower + Send + Sync + 'static, U>(
     }
 }
 
+/// Write a waitable value from the host
+///
+/// # Arguments
+///
+/// * `store` - the engine store
+/// * `transmit_rep` - Global representation of the transmit object that will be modified
+/// * `values` - List of values that should be written
+/// * `close` - Whether the transmit should be closed after write
+/// * `err_ctx` - The error context handle (`0` if no error was written)
+///
 fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = U>>(
     mut store: S,
-    rep: u32,
+    transmit_rep: u32,
     values: Vec<T>,
     mut close: bool,
+    err_ctx: u32,
 ) -> Result<oneshot::Receiver<()>> {
     let mut store = store.as_context_mut();
     let (tx, rx) = oneshot::channel();
-    let transmit_id = TableId::<TransmitState>::new(rep);
+    let transmit_id = TableId::<TransmitState>::new(transmit_rep);
     let mut offset = 0;
 
     loop {
@@ -218,9 +230,10 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
             .concurrent_state()
             .table
             .get_mut(transmit_id)
-            .with_context(|| rep.to_string())?;
-        let new_state = if let ReadState::Closed = &transmit.read {
-            ReadState::Closed
+            .with_context(|| format!("retrieving state for transmit [{transmit_rep}]"))?;
+
+        let new_state = if let ReadState::Closed(err_ctx) = &transmit.read {
+            ReadState::Closed(*err_ctx)
         } else {
             ReadState::Open
         };
@@ -232,6 +245,7 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
                 transmit.write = WriteState::HostReady {
                     accept: Box::new(accept::<T, U>(values, offset, transmit_id, tx)),
                     close,
+                    err_ctx,
                 };
                 close = false;
             }
@@ -245,6 +259,7 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
                 instance,
                 handle,
                 caller,
+                ..
             } => unsafe {
                 let types = (*instance.as_ptr()).component_types();
                 let lower = &mut LowerContext::new(
@@ -268,11 +283,7 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
                 }
                 offset += count;
 
-                log::trace!(
-                    "remove read child of {}: {}",
-                    caller.rep(),
-                    transmit_id.rep()
-                );
+                log::trace!("remove read child of {}: {transmit_rep}", caller.rep());
                 store
                     .concurrent_state()
                     .table
@@ -282,7 +293,7 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
 
                 push_event(
                     store.as_context_mut(),
-                    transmit_id.rep(),
+                    transmit_rep,
                     match ty {
                         TableIndex::Future(_) => Event::FutureRead,
                         TableIndex::Stream(_) => Event::StreamRead,
@@ -299,14 +310,15 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
             ReadState::HostReady { accept } => {
                 accept(Writer::Host {
                     values: Box::new(values),
+                    err_ctx, // TODO: redundant, err_ctx is used after the close later
                 })?;
             }
 
-            ReadState::Closed => {}
+            ReadState::Closed(_) => {}
         }
 
         if close {
-            host_close_writer(store, rep)?;
+            host_close_writer(store, transmit_rep, err_ctx)?;
         }
 
         break Ok(rx);
@@ -325,8 +337,9 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
         .table
         .get_mut(transmit_id)
         .with_context(|| rep.to_string())?;
-    let new_state = if let WriteState::Closed = &transmit.write {
-        WriteState::Closed
+
+    let new_state = if let WriteState::Closed(maybe_err_ctx) = &transmit.write {
+        WriteState::Closed(*maybe_err_ctx)
     } else {
         WriteState::Open
     };
@@ -343,6 +356,7 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
                             ty,
                             address,
                             count,
+                            ..
                         } => {
                             _ = tx.send(
                                 ty.map(|ty| {
@@ -363,7 +377,7 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
                             );
                             count
                         }
-                        Writer::Host { values } => {
+                        Writer::Host { values, err_ctx } => {
                             let values = *values
                                 .downcast::<Vec<T>>()
                                 .map_err(|_| anyhow!("transmit type mismatch"))?;
@@ -387,6 +401,7 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
             handle,
             caller,
             close,
+            err_ctx,
         } => unsafe {
             let types = (*instance.as_ptr()).component_types();
             let lift = &mut LiftContext::new(store.0, &options, types, instance.as_ptr());
@@ -410,7 +425,8 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
                 .remove_child(transmit_id, caller)?;
 
             if close {
-                store.concurrent_state().table.get_mut(transmit_id)?.write = WriteState::Closed;
+                store.concurrent_state().table.get_mut(transmit_id)?.write =
+                    WriteState::Closed(err_ctx);
             } else {
                 *get_mut_by_index(&mut *instance.as_ptr(), ty, handle)?.1 =
                     StreamFutureState::Write;
@@ -428,7 +444,11 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
             );
         },
 
-        WriteState::HostReady { accept, close } => {
+        WriteState::HostReady {
+            accept,
+            close,
+            err_ctx,
+        } => {
             accept(Reader::Host {
                 accept: Box::new(move |any| {
                     _ = tx.send(Some(
@@ -440,11 +460,12 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
             })?;
 
             if close {
-                store.concurrent_state().table.get_mut(transmit_id)?.write = WriteState::Closed;
+                store.concurrent_state().table.get_mut(transmit_id)?.write =
+                    WriteState::Closed(err_ctx);
             }
         }
 
-        WriteState::Closed => {
+        WriteState::Closed(_) => {
             host_close_reader(store, rep)?;
         }
     }
@@ -471,7 +492,7 @@ fn host_cancel_write<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Re
             transmit.write = WriteState::Open;
         }
 
-        WriteState::Open | WriteState::Closed => {
+        WriteState::Open | WriteState::Closed(_) => {
             bail!("stream or future write canceled when no write is pending")
         }
     }
@@ -500,7 +521,7 @@ fn host_cancel_read<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Res
             transmit.read = ReadState::Open;
         }
 
-        ReadState::Open | ReadState::Closed => {
+        ReadState::Open | ReadState::Closed(_) => {
             bail!("stream or future read canceled when no read is pending")
         }
     }
@@ -510,34 +531,70 @@ fn host_cancel_read<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Res
     Ok(0)
 }
 
-fn host_close_writer<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Result<()> {
+/// Close the writer end of a Future or Stream
+///
+/// # Arguments
+///
+/// * `store` - the store for the component
+/// * `transmit_rep` - A global-component-level representation of the transmit state for the writer that should be closed
+/// * `err_ctx` - An optional error context to pass along as the final value of the writer (`0` if none)
+///
+fn host_close_writer<U, S: AsContextMut<Data = U>>(
+    mut store: S,
+    transmit_rep: u32,
+    err_ctx: u32,
+) -> Result<()> {
     let mut store = store.as_context_mut();
-    let transmit_id = TableId::<TransmitState>::new(rep);
+    let transmit_id = TableId::<TransmitState>::new(transmit_rep);
     let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
 
+    // Update transmit write state for the writer
     match &mut transmit.write {
-        WriteState::GuestReady { close, .. } => {
+        // For guest-level streams that were waiting for a write, we must update to close on the *next* read.
+        WriteState::GuestReady {
+            close,
+            err_ctx: err_ctx_ref,
+            ..
+        } => {
             *close = true;
+            *err_ctx_ref = err_ctx;
         }
 
-        WriteState::HostReady { close, .. } => {
+        // For host-level streams that were waiting for a write, we must update to close on the *next* read.
+        WriteState::HostReady {
+            close,
+            err_ctx: err_ctx_ref,
+            ..
+        } => {
             *close = true;
+            *err_ctx_ref = err_ctx;
         }
 
+        // If the write state was simply opened (and a read has not been attempted), we can immediately close
         v @ WriteState::Open => {
-            *v = WriteState::Closed;
+            *v = WriteState::Closed(err_ctx);
         }
 
-        WriteState::Closed => unreachable!(),
+        // It should be impossible to double-close a writable
+        WriteState::Closed(_) => unreachable!("write state is already closed"),
     }
 
-    let new_state = if let ReadState::Closed = &transmit.read {
-        ReadState::Closed
+    // If the existing read state is closed, then there's nothing to read
+    // and we can keep it that way.
+    //
+    // If the read state was any other state, then we must set the new state to open
+    // to indicate that there *is* data to be read
+    let new_state = if let ReadState::Closed(read_err_ctx) = &transmit.read {
+        ReadState::Closed(*read_err_ctx)
     } else {
         ReadState::Open
     };
 
+    // Swap in the new read state
     match mem::replace(&mut transmit.read, new_state) {
+        // If the guest was ready to read, then we cannot close the reader (or writer)
+        // we must deliver the event, and update the state associated with the handle to
+        // represent that a read must be performed
         ReadState::GuestReady {
             ty,
             instance,
@@ -545,6 +602,7 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Re
             caller,
             ..
         } => unsafe {
+            // Ensure the final read of the guest is queued, with appropriate closure indicator
             push_event(
                 store,
                 transmit_id.rep(),
@@ -552,49 +610,68 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Re
                     TableIndex::Future(_) => Event::FutureRead,
                     TableIndex::Stream(_) => Event::StreamRead,
                 },
-                CLOSED,
+                CLOSED | err_ctx as usize,
                 caller,
             );
 
             *get_mut_by_index(&mut *instance.as_ptr(), ty, handle)?.1 = StreamFutureState::Read;
         },
 
+        // If the the host was ready to read, and the writer end is being closed (host->host write?)
+        // we can accept but discard the write, and close the reader immediately
         ReadState::HostReady { accept } => {
             accept(Writer::None)?;
-
-            host_close_reader(store, rep)?;
+            host_close_reader(store, transmit_rep)?;
         }
 
+        // If the read state is open, then there are no registered readers of the stream/future
+        //
+        // we can delay delivering a final value
         ReadState::Open => {}
 
-        ReadState::Closed => {
-            log::trace!("host_close_writer delete {}", transmit_id.rep());
+        // If the read state was already closed, then we can remove the transmit state completely
+        // (both writer and reader have been closed)
+        ReadState::Closed(_) => {
+            log::trace!("host_close_writer delete {transmit_rep}");
             store.concurrent_state().table.delete(transmit_id)?;
         }
     }
     Ok(())
 }
 
-fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Result<()> {
+/// Close the reader end of a Future or Stream
+///
+/// # Arguments
+///
+/// * `store` - the store for the component
+/// * `transmit_rep` - A global-component-level representation of the transmit state for the reader that should be closed
+/// * `err_ctx` - An optional error context to pass along as the final value of the reader (`0` if none)
+///
+fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, transmit_rep: u32) -> Result<()> {
     let mut store = store.as_context_mut();
-    let transmit_id = TableId::<TransmitState>::new(rep);
+    let transmit_id = TableId::<TransmitState>::new(transmit_rep);
     let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
 
-    transmit.read = ReadState::Closed;
+    transmit.read = ReadState::Closed(0);
 
-    let new_state = if let WriteState::Closed = &transmit.write {
-        WriteState::Closed
+    // If the write end is already closed, it should stay closed,
+    // otherwise, it should be opened.
+    let new_state = if let WriteState::Closed(err_ctx) = &transmit.write {
+        WriteState::Closed(*err_ctx)
     } else {
         WriteState::Open
     };
 
     match mem::replace(&mut transmit.write, new_state) {
+        // If a guest is waiting to write, ensure that the next write
+        // reflects the closed state of the stream, with
         WriteState::GuestReady {
             ty,
             instance,
             handle,
             close,
             caller,
+            err_ctx,
             ..
         } => unsafe {
             push_event(
@@ -604,7 +681,13 @@ fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Re
                     TableIndex::Future(_) => Event::FutureRead,
                     TableIndex::Stream(_) => Event::StreamRead,
                 },
-                CLOSED,
+                // When closing a reader if the last write was a closing write
+                // we must propagate error context if present
+                if close {
+                    CLOSED | err_ctx as usize
+                } else {
+                    CLOSED
+                },
                 caller,
             );
 
@@ -616,9 +699,11 @@ fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Re
             }
         },
 
-        WriteState::HostReady { accept, close } => {
+        // If the host is ready we can receive and discard the write
+        WriteState::HostReady { accept, close, .. } => {
+            // (????) We can always throw away writers when closing readers because the host should never
+            // close a reader *before* a writer.
             accept(Reader::None)?;
-
             if close {
                 store.concurrent_state().table.delete(transmit_id)?;
             }
@@ -626,8 +711,8 @@ fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Re
 
         WriteState::Open => {}
 
-        WriteState::Closed => {
-            log::trace!("host_close_reader delete {}", transmit_id.rep());
+        WriteState::Closed(_) => {
+            log::trace!("host_close_reader delete {transmit_rep}");
             store.concurrent_state().table.delete(transmit_id)?;
         }
     }
@@ -653,7 +738,7 @@ impl<T> FutureWriter<T> {
         T: func::Lower + Send + Sync + 'static,
     {
         Ok(Promise(Box::pin(
-            host_write(store, self.rep, vec![value], true)?.map(drop),
+            host_write(store, self.rep, vec![value], true, 0)?.map(drop),
         )))
     }
 
@@ -661,8 +746,14 @@ impl<T> FutureWriter<T> {
     ///
     /// If this object is dropped without calling either this method or `write`,
     /// any read on the readable end will remain pending forever.
-    pub fn close<U, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
-        host_close_writer(store, self.rep)
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - the store associated with the component instance
+    /// * `err_ctx` - the handle of an error context that should be reported with the stream closure (`0` if none)
+    ///
+    pub fn close<U, S: AsContextMut<Data = U>>(self, store: S, err_ctx: u32) -> Result<()> {
+        host_close_writer(store, self.rep, err_ctx)
     }
 }
 
@@ -845,7 +936,7 @@ impl<T> StreamWriter<T> {
         T: func::Lower + Send + Sync + 'static,
     {
         Ok(Promise(Box::pin(
-            host_write(store, self.rep, values, false)?.map(move |_| self),
+            host_write(store, self.rep, values, false, 0)?.map(move |_| self),
         )))
     }
 
@@ -853,8 +944,14 @@ impl<T> StreamWriter<T> {
     ///
     /// If this object is dropped without calling this method, any read on the
     /// readable end will remain pending forever.
-    pub fn close<U, S: AsContextMut<Data = U>>(self, store: S) -> Result<()> {
-        host_close_writer(store, self.rep)
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - the store associated with the component instance
+    /// * `err_ctx` - the handle of an error context that should be reported with the stream closure (`0` if none)
+    ///
+    pub fn close<U, S: AsContextMut<Data = U>>(self, store: S, err_ctx: u32) -> Result<()> {
+        host_close_writer(store, self.rep, err_ctx)
     }
 }
 
@@ -1151,14 +1248,30 @@ enum WriteState {
         handle: u32,
         caller: TableId<GuestTask>,
         close: bool,
+        /// Error context that may have been written along with the writes
+        ///
+        /// If the guest wrote This value is zero when there is no error context sent along with the write
+        err_ctx: u32,
     },
     HostReady {
         accept: Box<dyn FnOnce(Reader) -> Result<usize> + Send + Sync>,
         close: bool,
+        err_ctx: u32,
     },
-    Closed,
+    /// When write streams are closed, they maybe closed
+    /// with an error context that should be used
+    ///
+    /// Note that this error context is identical to the rep
+    /// for the component-global error context table.
+    Closed(u32),
 }
 
+/// Read state of a transmit channel
+///
+/// Channels generally start as open, and once they are read for data by either
+/// a guest or host, we transition into `GuestReady` or `HostReady` respectively.
+///
+/// Once a transmit channel is closed, it should *stay* closed.
 enum ReadState {
     Open,
     GuestReady {
@@ -1174,18 +1287,30 @@ enum ReadState {
     HostReady {
         accept: Box<dyn FnOnce(Writer) -> Result<usize> + Send + Sync>,
     },
-    Closed,
+    /// Closed read end, with an optional error context
+    ///
+    /// If a read operation became closed after a write with an
+    /// error context, the final read should receive the error context
+    /// as an extra value.
+    Closed(u32),
 }
 
 enum Writer<'a> {
+    /// Writes that are queued from guests
     Guest {
         lift: &'a mut LiftContext<'a>,
         ty: Option<InterfaceType>,
         address: usize,
         count: usize,
+        /// Error context that may have been written along with the writes
+        ///
+        /// If the guest wrote This value is zero when there is no error context sent along with the write
+        err_ctx: u32,
     },
     Host {
         values: Box<dyn Any>,
+        /// An error context that may have been written along with the given values
+        err_ctx: u32,
     },
     None,
 }
@@ -1210,6 +1335,7 @@ enum Reader<'a> {
     None,
 }
 
+/// Create a new waitable state (i.e. for a future or stream)
 fn guest_new<T>(vmctx: *mut VMOpaqueContext, ty: TableIndex) -> u64 {
     unsafe {
         call_host_and_handle_result::<T, _>(vmctx, || {
@@ -1387,13 +1513,19 @@ fn guest_write<T>(
             *state = StreamFutureState::Busy;
             let transmit_id = TableId::<TransmitState>::new(rep);
             let transmit = cx.concurrent_state().table.get_mut(transmit_id)?;
-            let new_state = if let ReadState::Closed = &transmit.read {
-                ReadState::Closed
+
+            let new_state = if let ReadState::Closed(err_ctx) = &transmit.read {
+                ReadState::Closed(*err_ctx)
             } else {
                 ReadState::Open
             };
 
+            // TODO: If the read end is in a closed state with an error context,
+            // ensure this component has access to the error context.
+
             let result = match mem::replace(&mut transmit.read, new_state) {
+                // If the read state represents a guest that is waiting to read,
+                // we can continue with our write
                 ReadState::GuestReady {
                     ty: read_ty,
                     flat_abi: read_flat_abi,
@@ -1449,16 +1581,25 @@ fn guest_write<T>(
                     count
                 }
 
+                // If the read state represents the host being ready to read, we can perform the write
+                // against the callback left by the host for accepting the read.
                 ReadState::HostReady { accept } => {
                     let lift = &mut LiftContext::new(cx.0, &options, types, instance);
+
+                    // TODO: during guest write,
+
                     accept(Writer::Guest {
                         lift,
                         ty: payload(ty, types),
                         address,
                         count,
+                        // TODO: do we need this here?
+                        err_ctx: 0,
                     })?
                 }
 
+                // If the read state indicates that no waiters have yet come along interested in the value
+                // we save the guest's intent to write
                 ReadState::Open => {
                     assert!(matches!(&transmit.write, WriteState::Open));
 
@@ -1485,12 +1626,39 @@ fn guest_write<T>(
                         handle,
                         caller,
                         close: false,
+                        err_ctx: 0,
                     };
 
                     BLOCKED
                 }
 
-                ReadState::Closed => CLOSED,
+                // If we receive a closed read state, we return ensure that the current task
+                // has the relevant error context available locally, and return the indicator
+                // of task closed with the error context handle
+                ReadState::Closed(err_ctx) => {
+                    // Look up existing global err_ctx
+                    ensure!(cx
+                        .concurrent_state()
+                        .table
+                        .get(TableId::<ErrorContextState>::new(err_ctx))
+                        .is_ok());
+                    // Add the global error context to this local component instance if it's not present already
+                    let local_tbl_id = TypeComponentLocalErrorContextTableIndex::from_u32(err_ctx);
+                    let local_tbl = (*instance)
+                        .component_error_context_tables()
+                        .get_mut_or_insert_with(local_tbl_id, || StateTable::default());
+                    if local_tbl.has_handle(local_tbl_id.as_u32()) {
+                        let (_, LocalErrorContextRefCount(ref mut n)) =
+                            local_tbl.get_mut_by_index(local_tbl_id.as_u32())?;
+                        *n += 1;
+                    } else {
+                        local_tbl
+                            .insert(local_tbl_id.as_u32(), LocalErrorContextRefCount(1))
+                            .context("copying local error context during closing guest write")?;
+                    }
+
+                    CLOSED | err_ctx as usize
+                }
             };
 
             if result != BLOCKED {
@@ -1536,10 +1704,12 @@ fn guest_read<T>(
             *state = StreamFutureState::Busy;
             let transmit_id = TableId::<TransmitState>::new(rep);
             let transmit = cx.concurrent_state().table.get_mut(transmit_id)?;
-            let new_state = if let WriteState::Closed = &transmit.write {
-                WriteState::Closed
+
+            // Get the current write status
+            let (new_state, err_ctx) = if let WriteState::Closed(err_ctx) = &transmit.write {
+                (WriteState::Closed(*err_ctx), *err_ctx)
             } else {
-                WriteState::Open
+                (WriteState::Open, 0)
             };
 
             let result = match mem::replace(&mut transmit.write, new_state) {
@@ -1553,6 +1723,7 @@ fn guest_read<T>(
                     handle: write_handle,
                     caller: write_caller,
                     close,
+                    err_ctx,
                 } => {
                     assert_eq!(flat_abi, write_flat_abi);
 
@@ -1582,9 +1753,10 @@ fn guest_read<T>(
                         .table
                         .remove_child(transmit_id, write_caller)?;
 
+                    // If the writer elected to close the channel after writing, pass along the error context
                     if close {
                         cx.concurrent_state().table.get_mut(transmit_id)?.write =
-                            WriteState::Closed;
+                            WriteState::Closed(err_ctx);
                     } else {
                         *get_mut_by_index(&mut *instance, write_ty, write_handle)?.1 =
                             StreamFutureState::Write;
@@ -1604,7 +1776,11 @@ fn guest_read<T>(
                     count
                 }
 
-                WriteState::HostReady { accept, close } => {
+                WriteState::HostReady {
+                    accept,
+                    close,
+                    err_ctx,
+                } => {
                     let count = accept(Reader::Guest {
                         lower: RawLowerContext {
                             store: cx.0.traitobj(),
@@ -1617,9 +1793,10 @@ fn guest_read<T>(
                         count,
                     })?;
 
+                    // If the host writer elected to close the channel after writing, pass along the error context
                     if close {
                         cx.concurrent_state().table.get_mut(transmit_id)?.write =
-                            WriteState::Closed;
+                            WriteState::Closed(err_ctx);
                     }
 
                     count
@@ -1655,7 +1832,9 @@ fn guest_read<T>(
                     BLOCKED
                 }
 
-                WriteState::Closed => CLOSED,
+                // If at some point the writer chose to close, the final stream that comes back
+                // should contain CLOSED and the error context
+                WriteState::Closed(err_ctx) => CLOSED | err_ctx as usize,
             };
 
             if result != BLOCKED {
@@ -1735,17 +1914,14 @@ fn guest_close_writable<T>(
     vmctx: *mut VMOpaqueContext,
     ty: TableIndex,
     writer: u32,
-    error: u32,
+    err_ctx: u32,
 ) -> bool {
     unsafe {
         call_host_and_handle_result::<T, _>(vmctx, || {
-            if error != 0 {
-                bail!("todo: closing writable streams and futures with errors not yet implemented");
-            }
-
             let cx = VMComponentContext::from_opaque(vmctx);
             let instance = (*cx).instance();
-            let cx = StoreContextMut::<T>(&mut *(*instance).store().cast());
+            let mut cx = StoreContextMut::<T>(&mut *(*instance).store().cast());
+
             let (rep, WaitableState::Stream(_, state) | WaitableState::Future(_, state)) =
                 state_table(&mut *instance, ty).remove_by_index(writer)?
             else {
@@ -1758,7 +1934,26 @@ fn guest_close_writable<T>(
                 }
                 StreamFutureState::Busy => bail!("cannot drop busy stream or future"),
             }
-            host_close_writer(cx, rep)
+
+            // If an error context was provided, ensure it's valid
+            if err_ctx != 0 {
+                assert!(
+                    (*instance)
+                        .component_error_context_tables()
+                        .get(TypeComponentLocalErrorContextTableIndex::from_u32(err_ctx))
+                        .is_some(),
+                    "invalid component-local error context handle"
+                );
+                assert!(
+                    cx.concurrent_state()
+                        .table
+                        .get(TableId::<ErrorContextState>::new(err_ctx))
+                        .is_ok(),
+                    "failed to find error context state"
+                );
+            }
+
+            host_close_writer(cx, rep, err_ctx)
         })
     }
 }
