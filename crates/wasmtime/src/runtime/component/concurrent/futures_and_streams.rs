@@ -51,6 +51,23 @@ enum TableIndex {
     Future(TypeFutureTableIndex),
 }
 
+pub(crate) enum HostReadResult<T> {
+    /// Values sent during the stream
+    Values(Option<Vec<T>>),
+    /// When host streams end, they may have an attached error-context
+    #[allow(unused)]
+    EndOfStream(u32),
+}
+
+impl<T> HostReadResult<T> {
+    fn into_values(self) -> Option<Vec<T>> {
+        match self {
+            HostReadResult::Values(maybe_vec) => maybe_vec,
+            HostReadResult::EndOfStream(_) => None,
+        }
+    }
+}
+
 fn payload(ty: TableIndex, types: &Arc<ComponentTypes>) -> Option<InterfaceType> {
     match ty {
         TableIndex::Future(ty) => types[types[ty].ty].payload,
@@ -310,7 +327,6 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
             ReadState::HostReady { accept } => {
                 accept(Writer::Host {
                     values: Box::new(values),
-                    err_ctx, // TODO: redundant, err_ctx is used after the close later
                 })?;
             }
 
@@ -328,9 +344,9 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
 pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data = U>>(
     mut store: S,
     rep: u32,
-) -> Result<oneshot::Receiver<Option<Vec<T>>>> {
+) -> Result<oneshot::Receiver<HostReadResult<T>>> {
     let mut store = store.as_context_mut();
-    let (tx, rx) = oneshot::channel();
+    let (tx, rx) = oneshot::channel::<HostReadResult<T>>();
     let transmit_id = TableId::<TransmitState>::new(rep);
     let transmit = store
         .concurrent_state()
@@ -356,9 +372,8 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
                             ty,
                             address,
                             count,
-                            ..
                         } => {
-                            _ = tx.send(
+                            _ = tx.send(HostReadResult::Values(
                                 ty.map(|ty| {
                                     if address % usize::try_from(T::ALIGN32)? != 0 {
                                         bail!("write pointer not aligned");
@@ -374,18 +389,23 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
                                     T::load_list(lift, list)
                                 })
                                 .transpose()?,
-                            );
+                            ));
                             count
                         }
-                        Writer::Host { values, err_ctx } => {
+                        Writer::Host { values } => {
                             let values = *values
                                 .downcast::<Vec<T>>()
                                 .map_err(|_| anyhow!("transmit type mismatch"))?;
                             let count = values.len();
-                            _ = tx.send(Some(values));
+                            _ = tx.send(HostReadResult::Values(Some(values)));
                             count
                         }
-                        Writer::None => 0,
+                        // In this case, the very first writer that comes along
+                        // was a close stream (with error)
+                        Writer::End(err_ctx) => {
+                            _ = tx.send(HostReadResult::EndOfStream(err_ctx));
+                            0
+                        }
                     })
                 }),
             };
@@ -405,14 +425,14 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
         } => unsafe {
             let types = (*instance.as_ptr()).component_types();
             let lift = &mut LiftContext::new(store.0, &options, types, instance.as_ptr());
-            _ = tx.send(
+            _ = tx.send(HostReadResult::Values(
                 payload(ty, types)
                     .map(|ty| {
                         let list = &WasmList::new(address, count, lift, ty)?;
                         T::load_list(lift, list)
                     })
                     .transpose()?,
-            );
+            ));
 
             log::trace!(
                 "remove write child of {}: {}",
@@ -451,10 +471,10 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
         } => {
             accept(Reader::Host {
                 accept: Box::new(move |any| {
-                    _ = tx.send(Some(
+                    _ = tx.send(HostReadResult::Values(Some(
                         *any.downcast()
                             .map_err(|_| anyhow!("transmit type mismatch"))?,
-                    ));
+                    )));
                     Ok(())
                 }),
             })?;
@@ -620,7 +640,7 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
         // If the the host was ready to read, and the writer end is being closed (host->host write?)
         // we can accept but discard the write, and close the reader immediately
         ReadState::HostReady { accept } => {
-            accept(Writer::None)?;
+            accept(Writer::End(err_ctx))?;
             host_close_reader(store, transmit_rep)?;
         }
 
@@ -699,10 +719,8 @@ fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, transmit_rep: u
             }
         },
 
-        // If the host is ready we can receive and discard the write
+        // If the reader is closed, we can ignore the waiting write from  host
         WriteState::HostReady { accept, close, .. } => {
-            // (????) We can always throw away writers when closing readers because the host should never
-            // close a reader *before* a writer.
             accept(Reader::None)?;
             if close {
                 store.concurrent_state().table.delete(transmit_id)?;
@@ -778,7 +796,7 @@ impl<T> FutureReader<T> {
     {
         Ok(Promise(Box::pin(host_read(store, self.rep)?.map(|v| {
             v.ok()
-                .and_then(|v| v.map(|v| v.into_iter().next().unwrap()))
+                .and_then(|v| v.into_values().map(|v| v.into_iter().next().unwrap()))
         }))))
     }
 
@@ -977,9 +995,9 @@ impl<T> StreamReader<T> {
     where
         T: func::Lift + Sync + Send + 'static,
     {
-        Ok(Promise(Box::pin(
-            host_read(store, self.rep)?.map(move |v| v.ok().and_then(|v| v.map(|v| (self, v)))),
-        )))
+        Ok(Promise(Box::pin(host_read(store, self.rep)?.map(
+            move |v| v.ok().and_then(|v| v.into_values().map(|v| (self, v))),
+        ))))
     }
 
     /// Convert this `StreamReader` into a [`Val`].
@@ -1302,17 +1320,11 @@ enum Writer<'a> {
         ty: Option<InterfaceType>,
         address: usize,
         count: usize,
-        /// Error context that may have been written along with the writes
-        ///
-        /// If the guest wrote This value is zero when there is no error context sent along with the write
-        err_ctx: u32,
     },
     Host {
         values: Box<dyn Any>,
-        /// An error context that may have been written along with the given values
-        err_ctx: u32,
     },
-    None,
+    End(u32),
 }
 
 struct RawLowerContext<'a> {
@@ -1585,16 +1597,11 @@ fn guest_write<T>(
                 // against the callback left by the host for accepting the read.
                 ReadState::HostReady { accept } => {
                     let lift = &mut LiftContext::new(cx.0, &options, types, instance);
-
-                    // TODO: during guest write,
-
                     accept(Writer::Guest {
                         lift,
                         ty: payload(ty, types),
                         address,
                         count,
-                        // TODO: do we need this here?
-                        err_ctx: 0,
                     })?
                 }
 
@@ -1706,10 +1713,10 @@ fn guest_read<T>(
             let transmit = cx.concurrent_state().table.get_mut(transmit_id)?;
 
             // Get the current write status
-            let (new_state, err_ctx) = if let WriteState::Closed(err_ctx) = &transmit.write {
-                (WriteState::Closed(*err_ctx), *err_ctx)
+            let new_state = if let WriteState::Closed(err_ctx) = &transmit.write {
+                WriteState::Closed(*err_ctx)
             } else {
-                (WriteState::Open, 0)
+                WriteState::Open
             };
 
             let result = match mem::replace(&mut transmit.write, new_state) {
