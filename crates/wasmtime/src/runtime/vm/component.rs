@@ -243,6 +243,7 @@ pub type VMFutureTransmitCallback = extern "C" fn(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TypeFutureTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     future: u32,
     address: u32,
 ) -> u64;
@@ -281,6 +282,7 @@ pub type VMStreamTransmitCallback = extern "C" fn(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TypeStreamTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     stream: u32,
     address: u32,
     count: u32,
@@ -293,6 +295,7 @@ pub type VMFlatStreamTransmitCallback = extern "C" fn(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     ty: TypeStreamTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     payload_size: u32,
     payload_align: u32,
     stream: u32,

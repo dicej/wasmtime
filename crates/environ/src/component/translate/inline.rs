@@ -754,12 +754,17 @@ impl<'a> Inliner<'a> {
                 else {
                     unreachable!()
                 };
+                let err_ctx_ty = types.error_context_table_type()?;
                 let options = self.adapter_options(frame, types, options);
                 let options = self.canonical_options(options);
-                let index = self
-                    .result
-                    .trampolines
-                    .push((*func, dfg::Trampoline::StreamRead { ty, options }));
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::StreamRead {
+                        ty,
+                        err_ctx_ty,
+                        options,
+                    },
+                ));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
             StreamWrite { ty, func, options } => {
@@ -849,12 +854,17 @@ impl<'a> Inliner<'a> {
                 else {
                     unreachable!()
                 };
+                let err_ctx_ty = types.error_context_table_type()?;
                 let options = self.adapter_options(frame, types, options);
                 let options = self.canonical_options(options);
-                let index = self
-                    .result
-                    .trampolines
-                    .push((*func, dfg::Trampoline::FutureRead { ty, options }));
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::FutureRead {
+                        ty,
+                        err_ctx_ty,
+                        options,
+                    },
+                ));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
             FutureWrite { ty, func, options } => {

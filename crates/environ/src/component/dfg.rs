@@ -308,6 +308,7 @@ pub enum Trampoline {
     },
     StreamRead {
         ty: TypeStreamTableIndex,
+        err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
         options: CanonicalOptions,
     },
     StreamWrite {
@@ -334,6 +335,7 @@ pub enum Trampoline {
     },
     FutureRead {
         ty: TypeFutureTableIndex,
+        err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
         options: CanonicalOptions,
     },
     FutureWrite {
@@ -791,8 +793,13 @@ impl LinearizeDfg<'_> {
                 instance: *instance,
             },
             Trampoline::StreamNew { ty } => info::Trampoline::StreamNew { ty: *ty },
-            Trampoline::StreamRead { ty, options } => info::Trampoline::StreamRead {
+            Trampoline::StreamRead {
+                ty,
+                err_ctx_ty,
+                options,
+            } => info::Trampoline::StreamRead {
                 ty: *ty,
+                err_ctx_ty: *err_ctx_ty,
                 options: self.options(options),
             },
             Trampoline::StreamWrite { ty, options } => info::Trampoline::StreamWrite {
@@ -817,8 +824,13 @@ impl LinearizeDfg<'_> {
                 }
             }
             Trampoline::FutureNew { ty } => info::Trampoline::FutureNew { ty: *ty },
-            Trampoline::FutureRead { ty, options } => info::Trampoline::FutureRead {
+            Trampoline::FutureRead {
+                ty,
+                err_ctx_ty,
+                options,
+            } => info::Trampoline::FutureRead {
                 ty: *ty,
+                err_ctx_ty: *err_ctx_ty,
                 options: self.options(options),
             },
             Trampoline::FutureWrite { ty, options } => info::Trampoline::FutureWrite {

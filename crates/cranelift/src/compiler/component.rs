@@ -130,7 +130,11 @@ impl<'a> TrampolineCompiler<'a> {
                 Vec::new(),
                 ir::types::I64,
             ),
-            Trampoline::StreamRead { ty, options } => {
+            Trampoline::StreamRead {
+                ty,
+                err_ctx_ty,
+                options,
+            } => {
                 if let Some(info) = self.flat_stream_element_info(*ty) {
                     self.translate_flat_stream_call(
                         *ty,
@@ -140,7 +144,7 @@ impl<'a> TrampolineCompiler<'a> {
                     )
                 } else {
                     self.translate_future_or_stream_call(
-                        &[ty.as_u32()],
+                        &[ty.as_u32(), err_ctx_ty.as_u32()],
                         Some(options),
                         self.offsets.stream_read(),
                         vec![
@@ -205,8 +209,12 @@ impl<'a> TrampolineCompiler<'a> {
                 Vec::new(),
                 ir::types::I64,
             ),
-            Trampoline::FutureRead { ty, options } => self.translate_future_or_stream_call(
-                &[ty.as_u32()],
+            Trampoline::FutureRead {
+                ty,
+                err_ctx_ty,
+                options,
+            } => self.translate_future_or_stream_call(
+                &[ty.as_u32(), err_ctx_ty.as_u32()],
                 Some(&options),
                 self.offsets.future_read(),
                 vec![

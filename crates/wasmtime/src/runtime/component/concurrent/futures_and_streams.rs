@@ -1513,6 +1513,7 @@ fn guest_write<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TableIndex,
+    _err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     flat_abi: Option<FlatAbi>,
     handle: u32,
     address: u32,
@@ -1702,6 +1703,7 @@ fn guest_read<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TableIndex,
+    _err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     flat_abi: Option<FlatAbi>,
     handle: u32,
     address: u32,
@@ -1860,7 +1862,26 @@ fn guest_read<T>(
 
                 // If at some point the writer chose to close, the final stream that comes back
                 // should contain CLOSED and the error context
+                //
+                // The error context handle returned here is a component-global one,
+                // which must be lowered into a context this component can understand
+                //
+                // Since prior to this writer coming along, we preemptively increased
+                // the global reference count for the error context, we can reduce it now,
+                // after ensuring that the error context is present
                 WriteState::Closed(err_ctx) => {
+                    let GlobalErrorContextRefCount(global_count) = (*instance)
+                        .component_global_error_context_ref_counts()
+                        .get_mut(&TypeComponentGlobalErrorContextTableIndex::from_u32(
+                            err_ctx,
+                        ))
+                        .context("retrieving global during guest read")?;
+                    // The global count should not hit zero here -- even if the original component referencing the
+                    // error disappeared, the count should have been increased to avoid  garbage collection before
+                    // this read arrived
+                    assert!(*global_count > 1);
+                    *global_count -= 1;
+
                     // TODO: LOWER
 
                     CLOSED | err_ctx as usize
@@ -2048,6 +2069,7 @@ pub(crate) extern "C" fn future_write<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TypeFutureTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     future: u32,
     address: u32,
 ) -> u64 {
@@ -2057,6 +2079,7 @@ pub(crate) extern "C" fn future_write<T>(
         realloc,
         string_encoding,
         TableIndex::Future(ty),
+        err_ctx_ty,
         None,
         future,
         address,
@@ -2070,6 +2093,7 @@ pub(crate) extern "C" fn future_read<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TypeFutureTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     future: u32,
     address: u32,
 ) -> u64 {
@@ -2079,6 +2103,7 @@ pub(crate) extern "C" fn future_read<T>(
         realloc,
         string_encoding,
         TableIndex::Future(ty),
+        err_ctx_ty,
         None,
         future,
         address,
@@ -2135,6 +2160,7 @@ pub(crate) extern "C" fn stream_write<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TypeStreamTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     stream: u32,
     address: u32,
     count: u32,
@@ -2145,6 +2171,7 @@ pub(crate) extern "C" fn stream_write<T>(
         realloc,
         string_encoding,
         TableIndex::Stream(ty),
+        err_ctx_ty,
         None,
         stream,
         address,
@@ -2158,6 +2185,7 @@ pub(crate) extern "C" fn stream_read<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TypeStreamTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     stream: u32,
     address: u32,
     count: u32,
@@ -2168,6 +2196,7 @@ pub(crate) extern "C" fn stream_read<T>(
         realloc,
         string_encoding,
         TableIndex::Stream(ty),
+        err_ctx_ty,
         None,
         stream,
         address,
@@ -2216,6 +2245,7 @@ pub(crate) extern "C" fn flat_stream_write<T>(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     ty: TypeStreamTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     payload_size: u32,
     payload_align: u32,
     stream: u32,
@@ -2228,6 +2258,7 @@ pub(crate) extern "C" fn flat_stream_write<T>(
         realloc,
         StringEncoding::Utf8 as u8,
         TableIndex::Stream(ty),
+        err_ctx_ty,
         Some(FlatAbi {
             size: payload_size,
             align: payload_align,
@@ -2243,6 +2274,7 @@ pub(crate) extern "C" fn flat_stream_read<T>(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     ty: TypeStreamTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     payload_size: u32,
     payload_align: u32,
     stream: u32,
@@ -2255,6 +2287,7 @@ pub(crate) extern "C" fn flat_stream_read<T>(
         realloc,
         StringEncoding::Utf8 as u8,
         TableIndex::Stream(ty),
+        err_ctx_ty,
         Some(FlatAbi {
             size: payload_size,
             align: payload_align,
