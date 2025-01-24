@@ -573,26 +573,12 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
     match &mut transmit.write {
         // For guest-level streams that were waiting to write, we must update to close on the *next* read.
         WriteState::GuestReady {
-            err_ctx_ty,
-            err_ctx: local_err_ctx,
+            err_ctx: err_ctx_ref,
             close,
-            instance,
             ..
         } => {
             *close = true;
-
-            // Update the writing instance's error context reference
-            let instance = unsafe { instance.as_mut() };
-            let local_state_tbl = (*instance)
-                .component_error_context_tables()
-                .get_mut(*err_ctx_ty)
-                .context("retrieving state table for pending write during writer close")?;
-            // TODO: do we *know* that the component has the global error context we're passing it
-            // tracked locally?
-            let (local_err_ctx_idx, _) = local_state_tbl
-                .get_mut_by_rep(err_ctx)
-                .context("retrieving local error context for pending write during writer close")?;
-            *local_err_ctx = local_err_ctx_idx;
+            *err_ctx_ref = err_ctx;
         }
 
         // For host-level streams that were waiting for a write, we must update to close on the *next* read.
@@ -1292,7 +1278,6 @@ enum WriteState {
     Open,
     GuestReady {
         ty: TableIndex,
-        err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
         flat_abi: Option<FlatAbi>,
         options: Options,
         address: usize,
@@ -1301,9 +1286,9 @@ enum WriteState {
         handle: u32,
         caller: TableId<GuestTask>,
         close: bool,
-        /// Error context that may have been written along with the writes
+        /// Component-global error context handle that has been written, if any.
         ///
-        /// If the guest wrote This value is zero when there is no error context sent along with the write
+        /// This value is zero writes that have been marked as closing writes without error.
         err_ctx: u32,
     },
     HostReady {
@@ -1664,7 +1649,6 @@ fn guest_write<T>(
                         caller,
                         close: false,
                         err_ctx: 0,
-                        err_ctx_ty,
                     };
 
                     BLOCKED
