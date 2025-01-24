@@ -404,6 +404,11 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
                         // was a close stream (with error)
                         Writer::End(err_ctx) => {
                             _ = tx.send(HostReadResult::EndOfStream(err_ctx));
+
+                            // TODO: Update the global context error reference count, as it was either
+                            // preemptively increased during a guest closing write or increased if handled
+                            // during a host closing write.
+
                             0
                         }
                     })
@@ -556,8 +561,8 @@ fn host_cancel_read<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Res
 /// # Arguments
 ///
 /// * `store` - the store for the component
-/// * `transmit_rep` - A global-component-level representation of the transmit state for the writer that should be closed
-/// * `err_ctx` - An optional error context to pass along as the final value of the writer (`0` if none)
+/// * `transmit_rep` - A component-global representation of the transmit state for the writer that should be closed
+/// * `err_ctx` - An optional component-global representation of an error context to use as the final value of the writer (`0` if none)
 ///
 fn host_close_writer<U, S: AsContextMut<Data = U>>(
     mut store: S,
@@ -578,6 +583,17 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
         } => {
             *close = true;
             *err_ctx_ref = err_ctx;
+
+            // If the original writer is still waiting for a reader to come along,
+            // then we must use that information
+
+            // If we know that once the write completes, the error context will be passed along,
+            // then we should update the global count to ensure the error context stays
+            // around
+
+            // Since the writer will won't write...?
+
+            // TODO: remove the global count here??
         }
 
         // For host-level streams that were waiting for a write, we must update to close on the *next* read.
@@ -622,29 +638,11 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
             caller,
             ..
         } => unsafe {
-            // Retrieve the global error context
-            // let global_err_ctx_idx = TypeComponentGlobalErrorContextTableIndex::from_u32(err_ctx);
+            // TODO: LIFT err_ctx
 
-            // let GlobalErrorContextRefCount(global_ref_count) = (*instance)
-            //     .component_error_context_tables()
-            //     .get_mut(ty)
-
-            // InterfaceType::ErrorContext(dst) => {
-            //     let tbl = unsafe {
-            //         &mut (*cx.instance)
-            //             .component_error_context_tables()
-            //             .get_mut(dst)
-            //             .expect("error context table index present in (sub)component table during lower")
-            //     };
-
-            //     if let Some((dst_idx, dst_state)) = tbl.get_mut_by_rep(self.rep) {
-            //         dst_state.0 += 1;
-            //         Ok(dst_idx)
-            //     } else {
-            //         tbl.insert(self.rep, LocalErrorContextRefCount(1))
-            //     }
-            // }
-            // _ => func::bad_type_info(),
+            // NOTE: we do not have to manage the global error context ref count here, because
+            // it was preemptively increased, and the guest that is ready to consume this
+            // will account for the extra global context ref count.
 
             // Ensure the final read of the guest is queued, with appropriate closure indicator
             push_event(
@@ -669,8 +667,6 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
         }
 
         // If the read state is open, then there are no registered readers of the stream/future
-        //
-        // we can delay delivering a final value
         ReadState::Open => {}
 
         // If the read state was already closed, then we can remove the transmit state completely
@@ -1622,7 +1618,7 @@ fn guest_write<T>(
                     })?
                 }
 
-                // If the read state indicates that no waiters have yet come along interested in the value
+                // If the read state indicates that no readers have yet come along interested in the value
                 // we save the guest's intent to write
                 ReadState::Open => {
                     assert!(matches!(&transmit.write, WriteState::Open));
@@ -1703,7 +1699,7 @@ fn guest_read<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TableIndex,
-    _err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     flat_abi: Option<FlatAbi>,
     handle: u32,
     address: u32,
@@ -1861,30 +1857,61 @@ fn guest_read<T>(
                 }
 
                 // If at some point the writer chose to close, the final stream that comes back
-                // should contain CLOSED and the error context
+                // should contain CLOSED and a error context handle that is interpretable by the
+                // guest reading.
                 //
-                // The error context handle returned here is a component-global one,
-                // which must be lowered into a context this component can understand
-                //
-                // Since prior to this writer coming along, we preemptively increased
-                // the global reference count for the error context, we can reduce it now,
-                // after ensuring that the error context is present
+                // The error context handle stored in WriteState is a component-global one,
+                // which must be lowered into a the guest component's context
                 WriteState::Closed(err_ctx) => {
-                    let GlobalErrorContextRefCount(global_count) = (*instance)
-                        .component_global_error_context_ref_counts()
-                        .get_mut(&TypeComponentGlobalErrorContextTableIndex::from_u32(
-                            err_ctx,
-                        ))
-                        .context("retrieving global during guest read")?;
-                    // The global count should not hit zero here -- even if the original component referencing the
-                    // error disappeared, the count should have been increased to avoid  garbage collection before
-                    // this read arrived
-                    assert!(*global_count > 1);
-                    *global_count -= 1;
+                    // Lower the global error context that was saved into write state into a component-local
+                    // error context handle
+                    let state_tbl = (*instance)
+                        .component_error_context_tables()
+                        .get_mut(err_ctx_ty)
+                        .context(
+                            "retrieving local error context table during closed read w/ error",
+                        )?;
 
-                    // TODO: LOWER
+                    // Get or insert the global error context into this guest's component-local error context tracking
+                    let (local_err_ctx, _) = match state_tbl.get_mut_by_rep(err_ctx) {
+                        Some(r) => {
+                            // If the error already existed, since we're about to read it, increase
+                            // the local component-wide reference count
+                            (*r.1).0 += 1;
+                            r
+                        }
+                        None => {
+                            // If the error context was not already tracked locally, start tracking
+                            state_tbl.insert(err_ctx, LocalErrorContextRefCount(1))?;
+                            state_tbl.get_mut_by_rep(err_ctx).context(
+                                "retrieving inserted local error context during guest read",
+                            )?
+                        }
+                    };
 
-                    CLOSED | err_ctx as usize
+                    // NOTE: During write closure when the error context was provided, we
+                    // incremented the global count to ensure the error context would not be garbage collected,
+                    // if dropped by the sending component.
+                    //
+                    // Since we did that preemptively, we do not need to increment the global ref count even
+                    // after this increase in local ref count.
+                    //
+                    // If a reader (this reader) *never* comes along, when the relevant stream/future is closed,
+                    // the writer state will indicate that the global count must be amended.
+
+                    // let GlobalErrorContextRefCount(global_count) = (*instance)
+                    //     .component_global_error_context_ref_counts()
+                    //     .get_mut(&TypeComponentGlobalErrorContextTableIndex::from_u32(
+                    //         err_ctx,
+                    //     ))
+                    //     .context("retrieving global during guest read")?;
+                    // // The global count should not hit zero here -- even if the original component referencing the
+                    // // error disappeared, the count should have been increased to avoid  garbage collection before
+                    // // this read arrived
+                    // assert!(*global_count >= 1);
+                    // *global_count += 1;
+
+                    CLOSED | local_err_ctx as usize
                 }
             };
 
@@ -2005,6 +2032,9 @@ fn guest_close_writable<T>(
                         .context("retrieving local error context during guest close writable")?;
                     // NOTE: the rep below is the component-global error context index
                     let (rep, _) = state_tbl.get_mut_by_index(err_ctx_idx)?;
+
+                    // TODO: Should the below be moved??
+
                     // Closing the writer with an error context means that a reader must later
                     // come along and discover the error context even once the writer goes away.
                     //
