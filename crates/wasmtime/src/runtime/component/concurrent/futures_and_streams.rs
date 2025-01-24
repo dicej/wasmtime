@@ -1341,11 +1341,6 @@ enum ReadState {
     HostReady {
         accept: Box<dyn FnOnce(Writer) -> Result<usize> + Send + Sync>,
     },
-    /// Closed read end, with an optional error context
-    ///
-    /// If a read operation became closed after a write with an
-    /// error context, the final read should receive the error context
-    /// as an extra value.
     Closed,
 }
 
