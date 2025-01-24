@@ -249,8 +249,8 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
             .get_mut(transmit_id)
             .with_context(|| format!("retrieving state for transmit [{transmit_rep}]"))?;
 
-        let new_state = if let ReadState::Closed(err_ctx) = &transmit.read {
-            ReadState::Closed(*err_ctx)
+        let new_state = if let ReadState::Closed = &transmit.read {
+            ReadState::Closed
         } else {
             ReadState::Open
         };
@@ -330,7 +330,7 @@ fn host_write<T: func::Lower + Send + Sync + 'static, U, S: AsContextMut<Data = 
                 })?;
             }
 
-            ReadState::Closed(_) => {}
+            ReadState::Closed => {}
         }
 
         if close {
@@ -541,7 +541,7 @@ fn host_cancel_read<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Res
             transmit.read = ReadState::Open;
         }
 
-        ReadState::Open | ReadState::Closed(_) => {
+        ReadState::Open | ReadState::Closed => {
             bail!("stream or future read canceled when no read is pending")
         }
     }
@@ -604,8 +604,8 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
     //
     // If the read state was any other state, then we must set the new state to open
     // to indicate that there *is* data to be read
-    let new_state = if let ReadState::Closed(read_err_ctx) = &transmit.read {
-        ReadState::Closed(*read_err_ctx)
+    let new_state = if let ReadState::Closed = &transmit.read {
+        ReadState::Closed
     } else {
         ReadState::Open
     };
@@ -622,6 +622,30 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
             caller,
             ..
         } => unsafe {
+            // Retrieve the global error context
+            // let global_err_ctx_idx = TypeComponentGlobalErrorContextTableIndex::from_u32(err_ctx);
+
+            // let GlobalErrorContextRefCount(global_ref_count) = (*instance)
+            //     .component_error_context_tables()
+            //     .get_mut(ty)
+
+            // InterfaceType::ErrorContext(dst) => {
+            //     let tbl = unsafe {
+            //         &mut (*cx.instance)
+            //             .component_error_context_tables()
+            //             .get_mut(dst)
+            //             .expect("error context table index present in (sub)component table during lower")
+            //     };
+
+            //     if let Some((dst_idx, dst_state)) = tbl.get_mut_by_rep(self.rep) {
+            //         dst_state.0 += 1;
+            //         Ok(dst_idx)
+            //     } else {
+            //         tbl.insert(self.rep, LocalErrorContextRefCount(1))
+            //     }
+            // }
+            // _ => func::bad_type_info(),
+
             // Ensure the final read of the guest is queued, with appropriate closure indicator
             push_event(
                 store,
@@ -637,8 +661,8 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
             *get_mut_by_index(&mut *instance.as_ptr(), ty, handle)?.1 = StreamFutureState::Read;
         },
 
-        // If the the host was ready to read, and the writer end is being closed (host->host write?)
-        // we can accept but discard the write, and close the reader immediately
+        // If the host was ready to read, and the writer end is being closed (host->host write?)
+        // signal to the reader that we've reached the end of the stream, and close the reader immediately
         ReadState::HostReady { accept } => {
             accept(Writer::End(err_ctx))?;
             host_close_reader(store, transmit_rep)?;
@@ -651,7 +675,7 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
 
         // If the read state was already closed, then we can remove the transmit state completely
         // (both writer and reader have been closed)
-        ReadState::Closed(_) => {
+        ReadState::Closed => {
             log::trace!("host_close_writer delete {transmit_rep}");
             store.concurrent_state().table.delete(transmit_id)?;
         }
@@ -665,14 +689,13 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
 ///
 /// * `store` - the store for the component
 /// * `transmit_rep` - A global-component-level representation of the transmit state for the reader that should be closed
-/// * `err_ctx` - An optional error context to pass along as the final value of the reader (`0` if none)
 ///
 fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, transmit_rep: u32) -> Result<()> {
     let mut store = store.as_context_mut();
     let transmit_id = TableId::<TransmitState>::new(transmit_rep);
     let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
 
-    transmit.read = ReadState::Closed(0);
+    transmit.read = ReadState::Closed;
 
     // If the write end is already closed, it should stay closed,
     // otherwise, it should be opened.
@@ -684,14 +707,13 @@ fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, transmit_rep: u
 
     match mem::replace(&mut transmit.write, new_state) {
         // If a guest is waiting to write, ensure that the next write
-        // reflects the closed state of the stream, with
+        // reflects the closed state of the stream
         WriteState::GuestReady {
             ty,
             instance,
             handle,
             close,
             caller,
-            err_ctx,
             ..
         } => unsafe {
             push_event(
@@ -701,13 +723,7 @@ fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, transmit_rep: u
                     TableIndex::Future(_) => Event::FutureRead,
                     TableIndex::Stream(_) => Event::StreamRead,
                 },
-                // When closing a reader if the last write was a closing write
-                // we must propagate error context if present
-                if close {
-                    CLOSED | err_ctx as usize
-                } else {
-                    CLOSED
-                },
+                CLOSED,
                 caller,
             );
 
@@ -1310,7 +1326,7 @@ enum ReadState {
     /// If a read operation became closed after a write with an
     /// error context, the final read should receive the error context
     /// as an extra value.
-    Closed(u32),
+    Closed,
 }
 
 enum Writer<'a> {
@@ -1526,8 +1542,8 @@ fn guest_write<T>(
             let transmit_id = TableId::<TransmitState>::new(rep);
             let transmit = cx.concurrent_state().table.get_mut(transmit_id)?;
 
-            let new_state = if let ReadState::Closed(err_ctx) = &transmit.read {
-                ReadState::Closed(*err_ctx)
+            let new_state = if let ReadState::Closed = &transmit.read {
+                ReadState::Closed
             } else {
                 ReadState::Open
             };
@@ -1642,29 +1658,32 @@ fn guest_write<T>(
                 // If we receive a closed read state, we return ensure that the current task
                 // has the relevant error context available locally, and return the indicator
                 // of task closed with the error context handle
-                ReadState::Closed(err_ctx) => {
-                    // Look up existing global err_ctx
-                    ensure!(cx
-                        .concurrent_state()
-                        .table
-                        .get(TableId::<ErrorContextState>::new(err_ctx))
-                        .is_ok());
-                    // Add the global error context to this local component instance if it's not present already
-                    let local_tbl_id = TypeComponentLocalErrorContextTableIndex::from_u32(err_ctx);
-                    let local_tbl = (*instance)
-                        .component_error_context_tables()
-                        .get_mut_or_insert_with(local_tbl_id, || StateTable::default());
-                    if local_tbl.has_handle(local_tbl_id.as_u32()) {
-                        let (_, LocalErrorContextRefCount(ref mut n)) =
-                            local_tbl.get_mut_by_index(local_tbl_id.as_u32())?;
-                        *n += 1;
-                    } else {
-                        local_tbl
-                            .insert(local_tbl_id.as_u32(), LocalErrorContextRefCount(1))
-                            .context("copying local error context during closing guest write")?;
-                    }
+                ReadState::Closed => {
+                    // TODO: RE-REVIEW
 
-                    CLOSED | err_ctx as usize
+                    // // Look up existing global err_ctx
+                    // ensure!(cx
+                    //     .concurrent_state()
+                    //     .table
+                    //     .get(TableId::<ErrorContextState>::new(err_ctx))
+                    //     .is_ok());
+                    // // Add the global error context to this local component instance if it's not present already
+                    // let local_tbl_id = TypeComponentLocalErrorContextTableIndex::from_u32(err_ctx);
+                    // let local_tbl = (*instance)
+                    //     .component_error_context_tables()
+                    //     .get_mut_or_insert_with(local_tbl_id, || StateTable::default());
+                    // if local_tbl.has_handle(local_tbl_id.as_u32()) {
+                    //     let (_, LocalErrorContextRefCount(ref mut n)) =
+                    //         local_tbl.get_mut_by_index(local_tbl_id.as_u32())?;
+                    //     *n += 1;
+                    // } else {
+                    //     local_tbl
+                    //         .insert(local_tbl_id.as_u32(), LocalErrorContextRefCount(1))
+                    //         .context("copying local error context during closing guest write")?;
+                    // }
+                    // CLOSED | err_ctx as usize
+
+                    CLOSED
                 }
             };
 
@@ -1841,7 +1860,11 @@ fn guest_read<T>(
 
                 // If at some point the writer chose to close, the final stream that comes back
                 // should contain CLOSED and the error context
-                WriteState::Closed(err_ctx) => CLOSED | err_ctx as usize,
+                WriteState::Closed(err_ctx) => {
+                    // TODO: LOWER
+
+                    CLOSED | err_ctx as usize
+                }
             };
 
             if result != BLOCKED {
@@ -1921,7 +1944,8 @@ fn guest_close_writable<T>(
     vmctx: *mut VMOpaqueContext,
     ty: TableIndex,
     writer: u32,
-    err_ctx: u32,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
+    err_ctx_idx: u32,
 ) -> bool {
     unsafe {
         call_host_and_handle_result::<T, _>(vmctx, || {
@@ -1942,25 +1966,48 @@ fn guest_close_writable<T>(
                 StreamFutureState::Busy => bail!("cannot drop busy stream or future"),
             }
 
-            // If an error context was provided, ensure it's valid
-            if err_ctx != 0 {
-                assert!(
-                    (*instance)
-                        .component_error_context_tables()
-                        .get(TypeComponentLocalErrorContextTableIndex::from_u32(err_ctx))
-                        .is_some(),
-                    "invalid component-local error context handle"
-                );
-                assert!(
-                    cx.concurrent_state()
-                        .table
-                        .get(TableId::<ErrorContextState>::new(err_ctx))
-                        .is_ok(),
-                    "failed to find error context state"
-                );
-            }
+            let global_err_ctx = match err_ctx_idx {
+                // If no error context was provided, we can pass that along as-is
+                0 => 0,
 
-            host_close_writer(cx, rep, err_ctx)
+                // If a non-zero error context was provided, first ensure it's valid,
+                // then lift the guest-local (component instance local) error context reference
+                // to the component-global level.
+                //
+                // This ensures that after closing the writer, when the eventual reader appears
+                // we can lower the component-global error context into a reader-local error context
+                err_ctx => {
+                    // Look up the local component error context
+                    let state_tbl = (*instance)
+                        .component_error_context_tables()
+                        .get_mut(err_ctx_ty)
+                        .context("retrieving local error context during guest close writable")?;
+                    // NOTE: the rep below is the component-global error context index
+                    let (rep, _) = state_tbl.get_mut_by_index(err_ctx_idx)?;
+                    // Closing the writer with an error context means that a reader must later
+                    // come along and discover the error context even once the writer goes away.
+                    //
+                    // Here we preemptively increase the ref count to ensure the error context
+                    // won't be removed by the time the reader comes along
+                    let GlobalErrorContextRefCount(global_count) = (*instance)
+                        .component_global_error_context_ref_counts()
+                        .get_mut(&TypeComponentGlobalErrorContextTableIndex::from_u32(rep))
+                        .context(
+                            "retrieving global error context ref count during guest close writable",
+                        )?;
+                    *global_count += 1;
+                    ensure!(
+                        cx.concurrent_state()
+                            .table
+                            .get(TableId::<ErrorContextState>::new(rep))
+                            .is_ok(),
+                        "missing global error context state [{rep}] for local error context [{err_ctx}] during guest close writable"
+                    );
+                    rep
+                }
+            };
+
+            host_close_writer(cx, rep, global_err_ctx)
         })
     }
 }
@@ -2060,10 +2107,11 @@ pub(crate) extern "C" fn future_cancel_read<T>(
 pub(crate) extern "C" fn future_close_writable<T>(
     vmctx: *mut VMOpaqueContext,
     ty: TypeFutureTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     writer: u32,
     error: u32,
 ) -> bool {
-    guest_close_writable::<T>(vmctx, TableIndex::Future(ty), writer, error)
+    guest_close_writable::<T>(vmctx, TableIndex::Future(ty), writer, err_ctx_ty, error)
 }
 
 pub(crate) extern "C" fn future_close_readable<T>(
@@ -2148,10 +2196,11 @@ pub(crate) extern "C" fn stream_cancel_read<T>(
 pub(crate) extern "C" fn stream_close_writable<T>(
     vmctx: *mut VMOpaqueContext,
     ty: TypeStreamTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     writer: u32,
-    error: u32,
+    error_ctx: u32,
 ) -> bool {
-    guest_close_writable::<T>(vmctx, TableIndex::Stream(ty), writer, error)
+    guest_close_writable::<T>(vmctx, TableIndex::Stream(ty), writer, err_ctx_ty, error_ctx)
 }
 
 pub(crate) extern "C" fn stream_close_readable<T>(

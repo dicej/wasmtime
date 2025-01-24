@@ -264,6 +264,7 @@ pub type VMFutureCloseReadableCallback =
 pub type VMFutureCloseWritableCallback = extern "C" fn(
     vmctx: *mut VMOpaqueContext,
     ty: TypeFutureTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     handle: u32,
     error: u32,
 ) -> bool;
@@ -307,6 +308,7 @@ pub type VMStreamCloseReadableCallback =
 pub type VMStreamCloseWritableCallback = extern "C" fn(
     vmctx: *mut VMOpaqueContext,
     ty: TypeStreamTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     handle: u32,
     error: u32,
 ) -> bool;

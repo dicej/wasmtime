@@ -124,7 +124,7 @@ impl<'a> TrampolineCompiler<'a> {
             Trampoline::TaskYield { async_ } => self.translate_task_yield_call(*async_),
             Trampoline::SubtaskDrop { instance } => self.translate_subtask_drop_call(*instance),
             Trampoline::StreamNew { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 None,
                 self.offsets.stream_new(),
                 Vec::new(),
@@ -140,7 +140,7 @@ impl<'a> TrampolineCompiler<'a> {
                     )
                 } else {
                     self.translate_future_or_stream_call(
-                        ty.as_u32(),
+                        &[ty.as_u32()],
                         Some(options),
                         self.offsets.stream_read(),
                         vec![
@@ -162,7 +162,7 @@ impl<'a> TrampolineCompiler<'a> {
                     )
                 } else {
                     self.translate_future_or_stream_call(
-                        ty.as_u32(),
+                        &[ty.as_u32()],
                         Some(options),
                         self.offsets.stream_write(),
                         vec![
@@ -181,31 +181,32 @@ impl<'a> TrampolineCompiler<'a> {
                 self.translate_cancel_call(ty.as_u32(), *async_, self.offsets.stream_cancel_write())
             }
             Trampoline::StreamCloseReadable { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 None,
                 self.offsets.stream_close_readable(),
                 vec![ir::AbiParam::new(ir::types::I32)],
                 ir::types::I8,
             ),
-            Trampoline::StreamCloseWritable { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
-                None,
-                self.offsets.stream_close_writable(),
-                vec![
-                    ir::AbiParam::new(ir::types::I32),
-                    ir::AbiParam::new(ir::types::I32),
-                ],
-                ir::types::I8,
-            ),
+            Trampoline::StreamCloseWritable { ty, err_ctx_ty } => self
+                .translate_future_or_stream_call(
+                    &[ty.as_u32(), err_ctx_ty.as_u32()],
+                    None,
+                    self.offsets.stream_close_writable(),
+                    vec![
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                    ],
+                    ir::types::I8,
+                ),
             Trampoline::FutureNew { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 None,
                 self.offsets.future_new(),
                 Vec::new(),
                 ir::types::I64,
             ),
             Trampoline::FutureRead { ty, options } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 Some(&options),
                 self.offsets.future_read(),
                 vec![
@@ -215,7 +216,7 @@ impl<'a> TrampolineCompiler<'a> {
                 ir::types::I64,
             ),
             Trampoline::FutureWrite { ty, options } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 Some(options),
                 self.offsets.future_write(),
                 vec![
@@ -231,22 +232,23 @@ impl<'a> TrampolineCompiler<'a> {
                 self.translate_cancel_call(ty.as_u32(), *async_, self.offsets.future_cancel_write())
             }
             Trampoline::FutureCloseReadable { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 None,
                 self.offsets.future_close_readable(),
                 vec![ir::AbiParam::new(ir::types::I32)],
                 ir::types::I8,
             ),
-            Trampoline::FutureCloseWritable { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
-                None,
-                self.offsets.future_close_writable(),
-                vec![
-                    ir::AbiParam::new(ir::types::I32),
-                    ir::AbiParam::new(ir::types::I32),
-                ],
-                ir::types::I8,
-            ),
+            Trampoline::FutureCloseWritable { ty, err_ctx_ty } => self
+                .translate_future_or_stream_call(
+                    &[ty.as_u32(), err_ctx_ty.as_u32()],
+                    None,
+                    self.offsets.future_close_writable(),
+                    vec![
+                        ir::AbiParam::new(ir::types::I32),
+                        ir::AbiParam::new(ir::types::I32),
+                    ],
+                    ir::types::I8,
+                ),
             Trampoline::ErrorContextNew { ty, options } => self.translate_error_context_call(
                 *ty,
                 options,
@@ -1109,7 +1111,7 @@ impl<'a> TrampolineCompiler<'a> {
 
     fn translate_future_or_stream_call(
         &mut self,
-        ty: u32,
+        tys: &[u32],
         options: Option<&CanonicalOptions>,
         offset: u32,
         params: Vec<ir::AbiParam>,
@@ -1165,7 +1167,10 @@ impl<'a> TrampolineCompiler<'a> {
         }
 
         host_sig.params.push(ir::AbiParam::new(ir::types::I32));
-        host_args.push(self.builder.ins().iconst(ir::types::I32, i64::from(ty)));
+
+        for ty in tys {
+            host_args.push(self.builder.ins().iconst(ir::types::I32, i64::from(*ty)));
+        }
 
         host_sig.params.extend(params);
         host_args.extend(args[2..].iter().copied());
