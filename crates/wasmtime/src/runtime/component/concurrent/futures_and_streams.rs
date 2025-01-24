@@ -404,12 +404,7 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
                         // was a close stream (with error)
                         Writer::End(err_ctx) => {
                             _ = tx.send(HostReadResult::EndOfStream(err_ctx));
-
-                            // TODO: Update the global context error reference count, as it was either
-                            // preemptively increased during a guest closing write or increased if handled
-                            // during a host closing write.
-
-                            0
+                            1
                         }
                     })
                 }),
@@ -427,6 +422,7 @@ pub fn host_read<T: func::Lift + Sync + Send + 'static, U, S: AsContextMut<Data 
             caller,
             close,
             err_ctx,
+            ..
         } => unsafe {
             let types = (*instance.as_ptr()).component_types();
             let lift = &mut LiftContext::new(store.0, &options, types, instance.as_ptr());
@@ -573,27 +569,30 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
     let transmit_id = TableId::<TransmitState>::new(transmit_rep);
     let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
 
-    // Update transmit write state for the writer
+    // If there was a write in progress, update it with the changed information
     match &mut transmit.write {
-        // For guest-level streams that were waiting for a write, we must update to close on the *next* read.
+        // For guest-level streams that were waiting to write, we must update to close on the *next* read.
         WriteState::GuestReady {
+            err_ctx_ty,
+            err_ctx: local_err_ctx,
             close,
-            err_ctx: err_ctx_ref,
+            instance,
             ..
         } => {
             *close = true;
-            *err_ctx_ref = err_ctx;
 
-            // If the original writer is still waiting for a reader to come along,
-            // then we must use that information
-
-            // If we know that once the write completes, the error context will be passed along,
-            // then we should update the global count to ensure the error context stays
-            // around
-
-            // Since the writer will won't write...?
-
-            // TODO: remove the global count here??
+            // Update the writing instance's error context reference
+            let instance = unsafe { instance.as_mut() };
+            let local_state_tbl = (*instance)
+                .component_error_context_tables()
+                .get_mut(*err_ctx_ty)
+                .context("retrieving state table for pending write during writer close")?;
+            // TODO: do we *know* that the component has the global error context we're passing it
+            // tracked locally?
+            let (local_err_ctx_idx, _) = local_state_tbl
+                .get_mut_by_rep(err_ctx)
+                .context("retrieving local error context for pending write during writer close")?;
+            *local_err_ctx = local_err_ctx_idx;
         }
 
         // For host-level streams that were waiting for a write, we must update to close on the *next* read.
@@ -633,12 +632,35 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
         // represent that a read must be performed
         ReadState::GuestReady {
             ty,
+            err_ctx_ty,
             instance,
             handle,
             caller,
             ..
         } => unsafe {
-            // TODO: LIFT err_ctx
+            // Lift the global err_ctx that we're receiving into an error context
+            // reference that the reader(caller) will
+            let reader_state_tbl = (*instance.as_ptr())
+                .component_error_context_tables()
+                .get_mut(err_ctx_ty)
+                .context("retrieving component-local error context during host writer close")?;
+
+            // Get or insert the global error context into this guest's component-local error context tracking
+            let (local_err_ctx, _) = match reader_state_tbl.get_mut_by_rep(err_ctx) {
+                Some(r) => {
+                    // If the error already existed, since we're about to read it, increase
+                    // the local component-wide reference count
+                    (*r.1).0 += 1;
+                    r
+                }
+                None => {
+                    // If the error context was not already tracked locally, start tracking
+                    reader_state_tbl.insert(err_ctx, LocalErrorContextRefCount(1))?;
+                    reader_state_tbl
+                        .get_mut_by_rep(err_ctx)
+                        .context("retrieving inserted local error context during guest read")?
+                }
+            };
 
             // NOTE: we do not have to manage the global error context ref count here, because
             // it was preemptively increased, and the guest that is ready to consume this
@@ -652,7 +674,7 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
                     TableIndex::Future(_) => Event::FutureRead,
                     TableIndex::Stream(_) => Event::StreamRead,
                 },
-                CLOSED | err_ctx as usize,
+                CLOSED | local_err_ctx as usize,
                 caller,
             );
 
@@ -1270,6 +1292,7 @@ enum WriteState {
     Open,
     GuestReady {
         ty: TableIndex,
+        err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
         flat_abi: Option<FlatAbi>,
         options: Options,
         address: usize,
@@ -1306,6 +1329,7 @@ enum ReadState {
     Open,
     GuestReady {
         ty: TableIndex,
+        err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
         flat_abi: Option<FlatAbi>,
         options: Options,
         address: usize,
@@ -1509,7 +1533,7 @@ fn guest_write<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TableIndex,
-    _err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
+    err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     flat_abi: Option<FlatAbi>,
     handle: u32,
     address: u32,
@@ -1545,9 +1569,6 @@ fn guest_write<T>(
                 ReadState::Open
             };
 
-            // TODO: If the read end is in a closed state with an error context,
-            // ensure this component has access to the error context.
-
             let result = match mem::replace(&mut transmit.read, new_state) {
                 // If the read state represents a guest that is waiting to read,
                 // we can continue with our write
@@ -1560,6 +1581,7 @@ fn guest_write<T>(
                     instance: _,
                     handle: read_handle,
                     caller: read_caller,
+                    ..
                 } => {
                     assert_eq!(flat_abi, read_flat_abi);
 
@@ -1647,41 +1669,15 @@ fn guest_write<T>(
                         caller,
                         close: false,
                         err_ctx: 0,
+                        err_ctx_ty,
                     };
 
                     BLOCKED
                 }
 
-                // If we receive a closed read state, we return ensure that the current task
-                // has the relevant error context available locally, and return the indicator
-                // of task closed with the error context handle
-                ReadState::Closed => {
-                    // TODO: RE-REVIEW
-
-                    // // Look up existing global err_ctx
-                    // ensure!(cx
-                    //     .concurrent_state()
-                    //     .table
-                    //     .get(TableId::<ErrorContextState>::new(err_ctx))
-                    //     .is_ok());
-                    // // Add the global error context to this local component instance if it's not present already
-                    // let local_tbl_id = TypeComponentLocalErrorContextTableIndex::from_u32(err_ctx);
-                    // let local_tbl = (*instance)
-                    //     .component_error_context_tables()
-                    //     .get_mut_or_insert_with(local_tbl_id, || StateTable::default());
-                    // if local_tbl.has_handle(local_tbl_id.as_u32()) {
-                    //     let (_, LocalErrorContextRefCount(ref mut n)) =
-                    //         local_tbl.get_mut_by_index(local_tbl_id.as_u32())?;
-                    //     *n += 1;
-                    // } else {
-                    //     local_tbl
-                    //         .insert(local_tbl_id.as_u32(), LocalErrorContextRefCount(1))
-                    //         .context("copying local error context during closing guest write")?;
-                    // }
-                    // CLOSED | err_ctx as usize
-
-                    CLOSED
-                }
+                // If the reader is already closed, there is no work to do --
+                // return the fact that the reader is closed
+                ReadState::Closed => CLOSED,
             };
 
             if result != BLOCKED {
@@ -1748,6 +1744,7 @@ fn guest_read<T>(
                     caller: write_caller,
                     close,
                     err_ctx,
+                    ..
                 } => {
                     assert_eq!(flat_abi, write_flat_abi);
 
@@ -1844,6 +1841,7 @@ fn guest_read<T>(
                     let transmit = cx.concurrent_state().table.get_mut(transmit_id)?;
                     transmit.read = ReadState::GuestReady {
                         ty,
+                        err_ctx_ty,
                         flat_abi,
                         options,
                         address: usize::try_from(address).unwrap(),
@@ -1898,18 +1896,6 @@ fn guest_read<T>(
                     //
                     // If a reader (this reader) *never* comes along, when the relevant stream/future is closed,
                     // the writer state will indicate that the global count must be amended.
-
-                    // let GlobalErrorContextRefCount(global_count) = (*instance)
-                    //     .component_global_error_context_ref_counts()
-                    //     .get_mut(&TypeComponentGlobalErrorContextTableIndex::from_u32(
-                    //         err_ctx,
-                    //     ))
-                    //     .context("retrieving global during guest read")?;
-                    // // The global count should not hit zero here -- even if the original component referencing the
-                    // // error disappeared, the count should have been increased to avoid  garbage collection before
-                    // // this read arrived
-                    // assert!(*global_count >= 1);
-                    // *global_count += 1;
 
                     CLOSED | local_err_ctx as usize
                 }
@@ -2032,8 +2018,6 @@ fn guest_close_writable<T>(
                         .context("retrieving local error context during guest close writable")?;
                     // NOTE: the rep below is the component-global error context index
                     let (rep, _) = state_tbl.get_mut_by_index(err_ctx_idx)?;
-
-                    // TODO: Should the below be moved??
 
                     // Closing the writer with an error context means that a reader must later
                     // come along and discover the error context even once the writer goes away.
