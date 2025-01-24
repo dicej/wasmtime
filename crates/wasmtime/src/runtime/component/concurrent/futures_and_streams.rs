@@ -1537,7 +1537,7 @@ fn guest_write<T>(
             let types = (*instance).component_types();
             let (rep, state) = get_mut_by_index(&mut *instance, ty, handle)?;
             let StreamFutureState::Write = *state else {
-                bail!("invalid handle");
+                bail!("invalid handle, write operation is unexpected");
             };
             *state = StreamFutureState::Busy;
             let transmit_id = TableId::<TransmitState>::new(rep);
@@ -1727,7 +1727,7 @@ fn guest_read<T>(
             let types = (*instance).component_types();
             let (rep, state) = get_mut_by_index(&mut *instance, ty, handle)?;
             let StreamFutureState::Read = *state else {
-                bail!("invalid handle");
+                bail!("invalid handle, read operation is unexpected");
             };
             *state = StreamFutureState::Busy;
             let transmit_id = TableId::<TransmitState>::new(rep);
