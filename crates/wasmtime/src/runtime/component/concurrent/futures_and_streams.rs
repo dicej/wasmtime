@@ -2061,7 +2061,6 @@ pub(crate) extern "C" fn future_write<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TypeFutureTableIndex,
-    _err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     future: u32,
     address: u32,
 ) -> u64 {
@@ -2151,7 +2150,6 @@ pub(crate) extern "C" fn stream_write<T>(
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TypeStreamTableIndex,
-    _err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     stream: u32,
     address: u32,
     count: u32,
@@ -2235,7 +2233,6 @@ pub(crate) extern "C" fn flat_stream_write<T>(
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     ty: TypeStreamTableIndex,
-    _err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
     payload_size: u32,
     payload_align: u32,
     stream: u32,

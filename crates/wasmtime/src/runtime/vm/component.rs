@@ -235,15 +235,25 @@ pub type VMAsyncExitCallback = extern "C" fn(
 pub type VMFutureNewCallback =
     extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeFutureTableIndex) -> u64;
 
-/// Type signature for the host-defined `future.read` and `future.write`
-/// built-in functions.
-pub type VMFutureTransmitCallback = extern "C" fn(
+/// Type signature for the host-defined `future.read` built-in function.
+pub type VMFutureReadCallback = extern "C" fn(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     string_encoding: u8,
     ty: TypeFutureTableIndex,
     err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
+    future: u32,
+    address: u32,
+) -> u64;
+
+/// Type signature for the host-defined `future.write` built-in function.
+pub type VMFutureWriteCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: u8,
+    ty: TypeFutureTableIndex,
     future: u32,
     address: u32,
 ) -> u64;
@@ -274,9 +284,8 @@ pub type VMFutureCloseWritableCallback = extern "C" fn(
 pub type VMStreamNewCallback =
     extern "C" fn(vmctx: *mut VMOpaqueContext, ty: TypeStreamTableIndex) -> u64;
 
-/// Type signature for the host-defined `stream.read` and `stream.write`
-/// built-in functions
-pub type VMStreamTransmitCallback = extern "C" fn(
+/// Type signature for the host-defined `stream.read` built-in function.
+pub type VMStreamReadCallback = extern "C" fn(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
@@ -288,14 +297,38 @@ pub type VMStreamTransmitCallback = extern "C" fn(
     count: u32,
 ) -> u64;
 
-/// Type signature for the host-defined `stream.read` ans `stream.write`
-/// built-in functions for when the payload is trivially `memcpy`-able.
-pub type VMFlatStreamTransmitCallback = extern "C" fn(
+/// Type signature for the host-defined `stream.write` built-in function.
+pub type VMStreamWriteCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    string_encoding: u8,
+    ty: TypeStreamTableIndex,
+    stream: u32,
+    address: u32,
+    count: u32,
+) -> u64;
+
+/// Type signature for the host-defined `stream.read` when the payload is trivially `memcpy`-able.
+pub type VMFlatStreamReadCallback = extern "C" fn(
     vmctx: *mut VMOpaqueContext,
     memory: *mut VMMemoryDefinition,
     realloc: *mut VMFuncRef,
     ty: TypeStreamTableIndex,
     err_ctx_ty: TypeComponentLocalErrorContextTableIndex,
+    payload_size: u32,
+    payload_align: u32,
+    stream: u32,
+    address: u32,
+    count: u32,
+) -> u64;
+
+/// Type signature for the host-defined `stream.write` when the payload is trivially `memcpy`-able.
+pub type VMFlatStreamWriteCallback = extern "C" fn(
+    vmctx: *mut VMOpaqueContext,
+    memory: *mut VMMemoryDefinition,
+    realloc: *mut VMFuncRef,
+    ty: TypeStreamTableIndex,
     payload_size: u32,
     payload_align: u32,
     stream: u32,
@@ -750,21 +783,21 @@ impl ComponentInstance {
         async_enter: VMAsyncEnterCallback,
         async_exit: VMAsyncExitCallback,
         future_new: VMFutureNewCallback,
-        future_write: VMFutureTransmitCallback,
-        future_read: VMFutureTransmitCallback,
+        future_write: VMFutureWriteCallback,
+        future_read: VMFutureReadCallback,
         future_cancel_write: VMFutureCancelCallback,
         future_cancel_read: VMFutureCancelCallback,
         future_close_writable: VMFutureCloseWritableCallback,
         future_close_readable: VMFutureCloseReadableCallback,
         stream_new: VMStreamNewCallback,
-        stream_write: VMStreamTransmitCallback,
-        stream_read: VMStreamTransmitCallback,
+        stream_write: VMStreamWriteCallback,
+        stream_read: VMStreamReadCallback,
         stream_cancel_write: VMStreamCancelCallback,
         stream_cancel_read: VMStreamCancelCallback,
         stream_close_writable: VMStreamCloseWritableCallback,
         stream_close_readable: VMStreamCloseReadableCallback,
-        flat_stream_write: VMFlatStreamTransmitCallback,
-        flat_stream_read: VMFlatStreamTransmitCallback,
+        flat_stream_write: VMFlatStreamWriteCallback,
+        flat_stream_read: VMFlatStreamReadCallback,
         error_context_new: VMErrorContextNewCallback,
         error_context_debug_message: VMErrorContextDebugMessageCallback,
         error_context_drop: VMErrorContextDropCallback,
@@ -1303,21 +1336,21 @@ impl OwnedComponentInstance {
         async_enter: VMAsyncEnterCallback,
         async_exit: VMAsyncExitCallback,
         future_new: VMFutureNewCallback,
-        future_write: VMFutureTransmitCallback,
-        future_read: VMFutureTransmitCallback,
+        future_write: VMFutureWriteCallback,
+        future_read: VMFutureReadCallback,
         future_cancel_write: VMFutureCancelCallback,
         future_cancel_read: VMFutureCancelCallback,
         future_close_writable: VMFutureCloseWritableCallback,
         future_close_readable: VMFutureCloseReadableCallback,
         stream_new: VMStreamNewCallback,
-        stream_write: VMStreamTransmitCallback,
-        stream_read: VMStreamTransmitCallback,
+        stream_write: VMStreamWriteCallback,
+        stream_read: VMStreamReadCallback,
         stream_cancel_write: VMStreamCancelCallback,
         stream_cancel_read: VMStreamCancelCallback,
         stream_close_writable: VMStreamCloseWritableCallback,
         stream_close_readable: VMStreamCloseReadableCallback,
-        flat_stream_write: VMFlatStreamTransmitCallback,
-        flat_stream_read: VMFlatStreamTransmitCallback,
+        flat_stream_write: VMFlatStreamWriteCallback,
+        flat_stream_read: VMFlatStreamReadCallback,
         error_context_new: VMErrorContextNewCallback,
         error_context_debug_message: VMErrorContextDebugMessageCallback,
         error_context_drop: VMErrorContextDropCallback,
