@@ -1288,7 +1288,7 @@ enum WriteState {
         close: bool,
         /// Component-global error context handle that has been written, if any.
         ///
-        /// This value is zero writes that have been marked as closing writes without error.
+        /// This value is zero if either the writer has not yet closed its end or if the writer _has_ closed its end but without providing an error context.
         err_ctx: u32,
     },
     HostReady {
