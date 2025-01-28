@@ -118,17 +118,21 @@ impl<'a> TrampolineCompiler<'a> {
             Trampoline::TaskYield { async_ } => self.translate_task_yield_call(*async_),
             Trampoline::SubtaskDrop { instance } => self.translate_subtask_drop_call(*instance),
             Trampoline::StreamNew { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 None,
                 host::stream_new,
                 ir::types::I64,
             ),
-            Trampoline::StreamRead { ty, options } => {
+            Trampoline::StreamRead {
+                ty,
+                err_ctx_ty,
+                options,
+            } => {
                 if let Some(info) = self.flat_stream_element_info(*ty) {
                     self.translate_flat_stream_call(*ty, options, host::flat_stream_read, &info)
                 } else {
                     self.translate_future_or_stream_call(
-                        ty.as_u32(),
+                        &[ty.as_u32(), err_ctx_ty.as_u32()],
                         Some(options),
                         host::stream_read,
                         ir::types::I64,
@@ -140,7 +144,7 @@ impl<'a> TrampolineCompiler<'a> {
                     self.translate_flat_stream_call(*ty, options, host::flat_stream_write, &info)
                 } else {
                     self.translate_future_or_stream_call(
-                        ty.as_u32(),
+                        &[ty.as_u32()],
                         Some(options),
                         host::stream_write,
                         ir::types::I64,
@@ -154,31 +158,35 @@ impl<'a> TrampolineCompiler<'a> {
                 self.translate_cancel_call(ty.as_u32(), *async_, host::stream_cancel_write)
             }
             Trampoline::StreamCloseReadable { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 None,
                 host::stream_close_readable,
                 ir::types::I8,
             ),
             Trampoline::StreamCloseWritable { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32(), err_ctx_ty.as_u32()],
                 None,
                 host::stream_close_writable,
                 ir::types::I8,
             ),
             Trampoline::FutureNew { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 None,
                 host::future_new,
                 ir::types::I64,
             ),
-            Trampoline::FutureRead { ty, options } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+            Trampoline::FutureRead {
+                ty,
+                err_ctx_ty,
+                options,
+            } => self.translate_future_or_stream_call(
+                &[ty.as_u32(), err_ctx_ty.as_u32()],
                 Some(&options),
                 host::future_read,
                 ir::types::I64,
             ),
             Trampoline::FutureWrite { ty, options } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 Some(options),
                 host::future_write,
                 ir::types::I64,
@@ -190,13 +198,13 @@ impl<'a> TrampolineCompiler<'a> {
                 self.translate_cancel_call(ty.as_u32(), *async_, host::future_cancel_write)
             }
             Trampoline::FutureCloseReadable { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32()],
                 None,
                 host::future_close_readable,
                 ir::types::I8,
             ),
             Trampoline::FutureCloseWritable { ty } => self.translate_future_or_stream_call(
-                ty.as_u32(),
+                &[ty.as_u32(), err_ctx_ty.as_u32()],
                 None,
                 host::future_close_writable,
                 ir::types::I8,
@@ -1001,7 +1009,7 @@ impl<'a> TrampolineCompiler<'a> {
 
     fn translate_future_or_stream_call(
         &mut self,
-        ty: u32,
+        tys: &[u32],
         options: Option<&CanonicalOptions>,
         get_libcall: fn(
             &dyn TargetIsa,
@@ -1042,7 +1050,9 @@ impl<'a> TrampolineCompiler<'a> {
             );
         }
 
-        callee_args.push(self.builder.ins().iconst(ir::types::I32, i64::from(ty)));
+        for ty in tys {
+            callee_args.push(self.builder.ins().iconst(ir::types::I32, i64::from(*ty)));
+        }
 
         callee_args.extend(args[2..].iter().copied());
 
