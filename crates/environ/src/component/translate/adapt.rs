@@ -140,6 +140,9 @@ pub struct Adapter {
     pub lower_options: AdapterOptions,
     /// The original core wasm function which was lifted.
     pub func: dfg::CoreDef,
+    /// Interned identifier to use when validating `task.return` call at
+    /// runtime.
+    pub task_return: TaskReturnIndex,
 }
 
 /// Configuration options which can be specified as part of the canonical ABI

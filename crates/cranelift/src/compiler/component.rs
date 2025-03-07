@@ -106,9 +106,7 @@ impl<'a> TrampolineCompiler<'a> {
             Trampoline::BackpressureSet { instance } => {
                 self.translate_backpressure_set_call(*instance)
             }
-            Trampoline::TaskReturn { results, options } => {
-                self.translate_task_return_call(*results, options)
-            }
+            Trampoline::TaskReturn { index } => self.translate_task_return_call(*index),
             Trampoline::WaitableSetNew { instance } => self.translate_waitable_set_new(*instance),
             Trampoline::WaitableSetWait {
                 instance,
@@ -396,9 +394,7 @@ impl<'a> TrampolineCompiler<'a> {
         }
     }
 
-    fn translate_task_return_call(&mut self, results: TypeTupleIndex, options: &CanonicalOptions) {
-        // FIXME(#10338) shouldn't ignore options here.
-        let _ = options;
+    fn translate_task_return_call(&mut self, index: TaskReturnIndex) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
 
@@ -407,7 +403,7 @@ impl<'a> TrampolineCompiler<'a> {
         let ty = self
             .builder
             .ins()
-            .iconst(ir::types::I32, i64::from(results.as_u32()));
+            .iconst(ir::types::I32, i64::from(index.as_u32()));
 
         self.translate_intrinsic_libcall(
             vmctx,

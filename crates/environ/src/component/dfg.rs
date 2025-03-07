@@ -63,6 +63,9 @@ pub struct ComponentDfg {
     /// Same as `reallocs`, but for post-return.
     pub post_returns: Intern<PostReturnId, CoreDef>,
 
+    /// TODO: docs
+    pub task_returns: Intern<TaskReturnIndex, TaskReturn>,
+
     /// Same as `reallocs`, but for post-return.
     pub memories: Intern<MemoryId, CoreExport<MemoryIndex>>,
 
@@ -199,6 +202,7 @@ pub enum Export {
         ty: TypeFuncIndex,
         func: CoreDef,
         options: CanonicalOptions,
+        task_return: TaskReturnIndex,
     },
     ModuleStatic {
         ty: ComponentCoreModuleTypeId,
@@ -263,6 +267,19 @@ impl<T> CoreExport<T> {
     }
 }
 
+/// Represents the return type and canonical options corresponding to an
+/// async-lifted export.  This is interned as a `TaskReturnIndex`, which is used
+/// at runtime to quickly verify that the correct `task.return` import is being
+/// called for the currently-running task.
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[allow(missing_docs, reason = "self-describing fields")]
+pub struct TaskReturn {
+    pub types: TypeTupleIndex,
+    pub memory: Option<MemoryId>,
+    pub realloc: Option<ReallocId>,
+    pub string_encoding: StringEncoding,
+}
+
 /// Same as `info::Trampoline`
 #[derive(Clone, PartialEq, Eq, Hash)]
 #[allow(missing_docs, reason = "self-describing fields")]
@@ -287,8 +304,7 @@ pub enum Trampoline {
         instance: RuntimeComponentInstanceIndex,
     },
     TaskReturn {
-        results: TypeTupleIndex,
-        options: CanonicalOptions,
+        index: TaskReturnIndex,
     },
     WaitableSetNew {
         instance: RuntimeComponentInstanceIndex,
@@ -651,13 +667,19 @@ impl LinearizeDfg<'_> {
         wasmparser_types: wasmparser::types::TypesRef<'_>,
     ) -> Result<ExportIndex> {
         let item = match export {
-            Export::LiftedFunction { ty, func, options } => {
+            Export::LiftedFunction {
+                ty,
+                func,
+                options,
+                task_return,
+            } => {
                 let func = self.core_def(func);
                 let options = self.options(options);
                 info::Export::LiftedFunction {
                     ty: *ty,
                     func,
                     options,
+                    task_return: *task_return,
                 }
             }
             Export::ModuleStatic { ty, index } => info::Export::ModuleStatic {
@@ -789,10 +811,7 @@ impl LinearizeDfg<'_> {
             Trampoline::BackpressureSet { instance } => info::Trampoline::BackpressureSet {
                 instance: *instance,
             },
-            Trampoline::TaskReturn { results, options } => info::Trampoline::TaskReturn {
-                results: *results,
-                options: self.options(options),
-            },
+            Trampoline::TaskReturn { index } => info::Trampoline::TaskReturn { index: *index },
             Trampoline::WaitableSetNew { instance } => info::Trampoline::WaitableSetNew {
                 instance: *instance,
             },

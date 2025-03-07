@@ -21,7 +21,7 @@
 use crate::component::dfg::CoreDef;
 use crate::component::{
     Adapter, AdapterOptions as AdapterOptionsDfg, ComponentTypesBuilder, FlatType, InterfaceType,
-    RuntimeComponentInstanceIndex, StringEncoding, Transcode, TypeFuncIndex,
+    RuntimeComponentInstanceIndex, StringEncoding, TaskReturnIndex, Transcode, TypeFuncIndex,
 };
 use crate::fact::transcode::Transcoder;
 use crate::prelude::*;
@@ -127,6 +127,9 @@ struct AdapterData {
     /// FIXME(#4185) should be plumbed and handled as part of the new reentrance
     /// rules not yet implemented here.
     called_as_export: bool,
+    /// Interned identifier to use when validating `task.return` call at
+    /// runtime.
+    task_return: TaskReturnIndex,
 }
 
 /// Configuration options which apply at the "global adapter" level.
@@ -276,6 +279,7 @@ impl<'a> Module<'a> {
             self,
             &AdapterData {
                 name: name.to_string(),
+                task_return: adapter.task_return,
                 lift,
                 lower,
                 callee,

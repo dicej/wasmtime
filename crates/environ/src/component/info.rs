@@ -433,6 +433,9 @@ pub enum Export {
         func: CoreDef,
         /// Any options, if present, associated with this lifting.
         options: CanonicalOptions,
+        /// Interned identifier to use when validating `task.return` call at
+        /// runtime.
+        task_return: TaskReturnIndex,
     },
     /// A module defined within this component is exported.
     ModuleStatic {
@@ -690,11 +693,9 @@ pub enum Trampoline {
     /// lifted export function.  This allows the callee to continue executing
     /// after returning a result.
     TaskReturn {
-        /// Tuple representing the result types this intrinsic accepts.
-        results: TypeTupleIndex,
-
-        /// The canonical ABI options specified for this intrinsic.
-        options: CanonicalOptions,
+        /// Index representing the result types this intrinsic accepts, along
+        /// with the canonical ABI options used.
+        index: TaskReturnIndex,
     },
 
     /// A `waitable-set.new` intrinsic.

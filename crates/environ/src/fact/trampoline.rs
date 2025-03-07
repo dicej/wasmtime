@@ -435,7 +435,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             i32::try_from(adapter.lower.instance.as_u32()).unwrap(),
         ));
         self.instruction(I32Const(
-            i32::try_from(self.types[adapter.lift.ty].results.as_u32()).unwrap(),
+            i32::try_from(adapter.task_return.as_u32()).unwrap(),
         ));
         // Async-lowered imports pass params and receive results via linear
         // memory, and those pointers are in the the first and second params to
@@ -513,7 +513,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             i32::try_from(adapter.lower.instance.as_u32()).unwrap(),
         ));
         self.instruction(I32Const(
-            i32::try_from(self.types[adapter.lift.ty].results.as_u32()).unwrap(),
+            i32::try_from(adapter.task_return.as_u32()).unwrap(),
         ));
         self.instruction(I32Const(
             i32::try_from(
@@ -597,7 +597,7 @@ impl<'a, 'b> Compiler<'a, 'b> {
             i32::try_from(adapter.lower.instance.as_u32()).unwrap(),
         ));
         self.instruction(I32Const(
-            i32::try_from(self.types[adapter.lift.ty].results.as_u32()).unwrap(),
+            i32::try_from(adapter.task_return.as_u32()).unwrap(),
         ));
         self.instruction(LocalGet(0));
         self.instruction(LocalGet(1));

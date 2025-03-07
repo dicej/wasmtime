@@ -170,8 +170,19 @@ impl Instance {
         let data = store[self.0].take().unwrap();
         let ret = name.lookup(&data.component).and_then(|index| {
             match &data.component.env_component().export_items[index] {
-                Export::LiftedFunction { ty, func, options } => Some(Func::from_lifted_func(
-                    store, self, &data, *ty, func, options,
+                Export::LiftedFunction {
+                    ty,
+                    func,
+                    options,
+                    task_return,
+                } => Some(Func::from_lifted_func(
+                    store,
+                    self,
+                    &data,
+                    *ty,
+                    func,
+                    options,
+                    *task_return,
                 )),
                 _ => None,
             }

@@ -585,12 +585,15 @@ impl<'a> Inliner<'a> {
                         func,
                         options: options_lift,
                     } => {
+                        let options = self.canonical_options(options_lift.clone());
+                        let task_return = self.task_return(types[*lift_ty].results, options);
                         let adapter_idx = self.result.adapters.push(Adapter {
                             lift_ty: *lift_ty,
                             lift_options: options_lift.clone(),
                             lower_ty,
                             lower_options: options_lower,
                             func: func.clone(),
+                            task_return,
                         });
                         dfg::CoreDef::Adapter(adapter_idx)
                     }
@@ -691,10 +694,11 @@ impl<'a> Inliner<'a> {
                 let results = types.new_tuple_type(results);
                 let options = self.adapter_options(frame, types, options);
                 let options = self.canonical_options(options);
+                let index = self.task_return(results, options);
                 let index = self
                     .result
                     .trampolines
-                    .push((*func, dfg::Trampoline::TaskReturn { results, options }));
+                    .push((*func, dfg::Trampoline::TaskReturn { index }));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
             WaitableSetNew { func } => {
@@ -1361,7 +1365,7 @@ impl<'a> Inliner<'a> {
         }
     }
 
-    /// Translatees an `AdapterOptions` into a `CanonicalOptions` where
+    /// Translates an `AdapterOptions` into a `CanonicalOptions` where
     /// memories/functions are inserted into the global initializer list for
     /// use at runtime. This is only used for lowered host functions and lifted
     /// functions exported to the host.
@@ -1383,6 +1387,19 @@ impl<'a> Inliner<'a> {
             post_return,
             async_: options.async_,
         }
+    }
+
+    fn task_return(
+        &mut self,
+        types: TypeTupleIndex,
+        options: dfg::CanonicalOptions,
+    ) -> TaskReturnIndex {
+        self.result.task_returns.push(dfg::TaskReturn {
+            types,
+            memory: options.memory,
+            realloc: options.realloc,
+            string_encoding: options.string_encoding,
+        })
     }
 
     fn record_export(
@@ -1411,7 +1428,13 @@ impl<'a> Inliner<'a> {
                 // here.
                 ComponentFuncDef::Lifted { ty, func, options } => {
                     let options = self.canonical_options(options);
-                    dfg::Export::LiftedFunction { ty, func, options }
+                    let task_return = self.task_return(types[ty].results, options.clone());
+                    dfg::Export::LiftedFunction {
+                        ty,
+                        func,
+                        options,
+                        task_return,
+                    }
                 }
 
                 // Currently reexported functions from an import are not

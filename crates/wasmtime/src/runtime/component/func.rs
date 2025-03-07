@@ -12,7 +12,7 @@ use core::mem::{self, MaybeUninit};
 use core::ptr::NonNull;
 use wasmtime_environ::component::{
     CanonicalOptions, ComponentTypes, CoreDef, InterfaceType, RuntimeComponentInstanceIndex,
-    TypeFuncIndex, TypeTuple, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
+    TaskReturnIndex, TypeFuncIndex, TypeTuple, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
 };
 
 #[cfg(feature = "component-model-async")]
@@ -57,6 +57,7 @@ pub struct FuncData {
     pub(crate) instance: Instance,
     pub(crate) component_instance: RuntimeComponentInstanceIndex,
     pub(crate) post_return: Option<ExportFunction>,
+    pub(crate) task_return: TaskReturnIndex,
     post_return_arg: Option<ValRaw>,
 }
 
@@ -68,6 +69,7 @@ impl Func {
         ty: TypeFuncIndex,
         func: &CoreDef,
         options: &CanonicalOptions,
+        task_return: TaskReturnIndex,
     ) -> Func {
         let export = match data.lookup_def(store, func) {
             Export::Function(f) => f,
@@ -103,6 +105,7 @@ impl Func {
             instance: *instance,
             component_instance,
             post_return,
+            task_return,
             post_return_arg: None,
         }))
     }

@@ -39,9 +39,9 @@ use {
     table::{Table, TableId},
     wasmtime_environ::{
         component::{
-            InterfaceType, RuntimeComponentInstanceIndex, StringEncoding,
+            InterfaceType, RuntimeComponentInstanceIndex, StringEncoding, TaskReturnIndex,
             TypeComponentLocalErrorContextTableIndex, TypeFutureTableIndex, TypeStreamTableIndex,
-            TypeTupleIndex, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
+            MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
         },
         fact,
     },
@@ -399,7 +399,7 @@ pub unsafe trait VMComponentAsyncStore {
     fn task_return(
         &mut self,
         instance: &mut ComponentInstance,
-        ty: TypeTupleIndex,
+        index: TaskReturnIndex,
         storage: *mut ValRaw,
         storage_len: usize,
     ) -> Result<()>;
@@ -468,7 +468,7 @@ pub unsafe trait VMComponentAsyncStore {
         start: *mut VMFuncRef,
         return_: *mut VMFuncRef,
         caller_instance: RuntimeComponentInstanceIndex,
-        task_return_type: TypeTupleIndex,
+        task_return_index: TaskReturnIndex,
         result_count: u32,
         storage: *mut ValRaw,
         storage_len: usize,
@@ -495,7 +495,7 @@ pub unsafe trait VMComponentAsyncStore {
         start: *mut VMFuncRef,
         return_: *mut VMFuncRef,
         caller_instance: RuntimeComponentInstanceIndex,
-        task_return_type: TypeTupleIndex,
+        task_return_index: TaskReturnIndex,
         params: u32,
         results: u32,
     ) -> Result<()>;
@@ -750,14 +750,14 @@ unsafe impl<T> VMComponentAsyncStore for StoreInner<T> {
     fn task_return(
         &mut self,
         instance: &mut ComponentInstance,
-        ty: TypeTupleIndex,
+        index: TaskReturnIndex,
         storage: *mut ValRaw,
         storage_len: usize,
     ) -> Result<()> {
         let storage = unsafe { std::slice::from_raw_parts(storage, storage_len) };
         let mut store = StoreContextMut(self);
         let guest_task = store.concurrent_state().guest_task.unwrap();
-        let (lift, lift_ty) = store
+        let (lift, lift_index) = store
             .concurrent_state()
             .table
             .get_mut(guest_task)?
@@ -765,8 +765,8 @@ unsafe impl<T> VMComponentAsyncStore for StoreInner<T> {
             .take()
             .ok_or_else(|| anyhow!("`task.return` called more than once"))?;
 
-        if ty != lift_ty {
-            bail!("invalid `task.return` signature for current task");
+        if index != lift_index {
+            bail!("invalid `task.return` signature and/or canonical options for current task");
         }
 
         assert!(store
@@ -907,7 +907,7 @@ unsafe impl<T> VMComponentAsyncStore for StoreInner<T> {
         start: *mut VMFuncRef,
         return_: *mut VMFuncRef,
         caller_instance: RuntimeComponentInstanceIndex,
-        task_return_type: TypeTupleIndex,
+        task_return_index: TaskReturnIndex,
         result_count: u32,
         storage: *mut ValRaw,
         storage_len: usize,
@@ -917,7 +917,7 @@ unsafe impl<T> VMComponentAsyncStore for StoreInner<T> {
             start,
             return_,
             caller_instance,
-            task_return_type,
+            task_return_index,
             CallerInfo::Sync {
                 params: unsafe { std::slice::from_raw_parts(storage, storage_len) }.to_vec(),
                 result_count,
@@ -957,7 +957,7 @@ unsafe impl<T> VMComponentAsyncStore for StoreInner<T> {
         start: *mut VMFuncRef,
         return_: *mut VMFuncRef,
         caller_instance: RuntimeComponentInstanceIndex,
-        task_return_type: TypeTupleIndex,
+        task_return_index: TaskReturnIndex,
         params: u32,
         results: u32,
     ) -> Result<()> {
@@ -966,7 +966,7 @@ unsafe impl<T> VMComponentAsyncStore for StoreInner<T> {
             start,
             return_,
             caller_instance,
-            task_return_type,
+            task_return_index,
             CallerInfo::Async { params, results },
         )
     }
@@ -1435,7 +1435,7 @@ enum Caller {
 
 struct GuestTask {
     lower_params: Option<RawLower>,
-    lift_result: Option<(RawLift, TypeTupleIndex)>,
+    lift_result: Option<(RawLift, TaskReturnIndex)>,
     result: Option<LiftedResult>,
     callback: Option<Callback>,
     events: VecDeque<(Event, AnyTask, u32)>,
@@ -3058,7 +3058,7 @@ pub(crate) fn start_call<'a, T: Send, LowerParams: Copy, R: 'static>(
     handle: Func,
 ) -> Result<Promise<R>> {
     let func_data = &store.0[handle.0];
-    let task_return_type = func_data.types[func_data.ty].results;
+    let task_return_index = func_data.task_return;
     let is_concurrent = func_data.options.async_();
     let component_instance = func_data.component_instance;
     let instance = func_data.instance;
@@ -3083,7 +3083,7 @@ pub(crate) fn start_call<'a, T: Send, LowerParams: Copy, R: 'static>(
             Box::new(for_any_lift(move |store, result| {
                 lift_result(lift_context, store, result)
             })) as RawLift,
-            task_return_type,
+            task_return_index,
         )),
         caller: Caller::Host(Some(tx)),
         ..GuestTask::default()
@@ -3252,7 +3252,7 @@ fn enter_call<T>(
     start: *mut VMFuncRef,
     return_: *mut VMFuncRef,
     caller_instance: RuntimeComponentInstanceIndex,
-    task_return_type: TypeTupleIndex,
+    task_return_index: TaskReturnIndex,
     caller_info: CallerInfo,
 ) -> Result<()> {
     enum ResultInfo {
@@ -3353,7 +3353,7 @@ fn enter_call<T>(
                 }
                 Ok(Box::new(DummyResult) as Box<dyn std::any::Any + Send + Sync>)
             }),
-            task_return_type,
+            task_return_index,
         )),
         result: None,
         callback: None,

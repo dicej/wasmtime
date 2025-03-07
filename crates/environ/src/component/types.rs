@@ -232,6 +232,12 @@ indices! {
 
     /// An index into `Component::export_items` at the end of compilation.
     pub struct ExportIndex(u32);
+
+    /// An index representing the return type and canonical options
+    /// corresponding to an async-lifted export.  This is used at runtime to
+    /// quickly verify that the correct `task.return` import is being called for
+    /// the currently-running task.
+    pub struct TaskReturnIndex(u32);
 }
 
 // Reexport for convenience some core-wasm indices which are also used in the

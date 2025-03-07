@@ -600,14 +600,14 @@ unsafe fn backpressure_set(
 #[cfg(feature = "component-model-async")]
 unsafe fn task_return(
     vmctx: NonNull<VMComponentContext>,
-    ty: u32,
+    index: u32,
     storage: *mut u8,
     storage_len: usize,
 ) -> Result<()> {
     ComponentInstance::from_vmctx(vmctx, |instance| {
         (*instance.store()).component_async_store().task_return(
             instance,
-            wasmtime_environ::component::TypeTupleIndex::from_u32(ty),
+            wasmtime_environ::component::TaskReturnIndex::from_u32(index),
             storage.cast::<crate::ValRaw>(),
             storage_len,
         )
@@ -747,7 +747,7 @@ unsafe fn sync_enter(
     start: *mut u8,
     return_: *mut u8,
     caller_instance: u32,
-    task_return_type: u32,
+    task_return_index: u32,
     result_count: u32,
     storage: *mut u8,
     storage_len: usize,
@@ -757,7 +757,7 @@ unsafe fn sync_enter(
             start.cast::<crate::vm::VMFuncRef>(),
             return_.cast::<crate::vm::VMFuncRef>(),
             wasmtime_environ::component::RuntimeComponentInstanceIndex::from_u32(caller_instance),
-            wasmtime_environ::component::TypeTupleIndex::from_u32(task_return_type),
+            wasmtime_environ::component::TaskReturnIndex::from_u32(task_return_index),
             result_count,
             storage.cast::<crate::ValRaw>(),
             storage_len,
@@ -796,7 +796,7 @@ unsafe fn async_enter(
     start: *mut u8,
     return_: *mut u8,
     caller_instance: u32,
-    task_return_type: u32,
+    task_return_index: u32,
     params: u32,
     results: u32,
 ) -> Result<()> {
@@ -805,7 +805,7 @@ unsafe fn async_enter(
             start.cast::<crate::vm::VMFuncRef>(),
             return_.cast::<crate::vm::VMFuncRef>(),
             wasmtime_environ::component::RuntimeComponentInstanceIndex::from_u32(caller_instance),
-            wasmtime_environ::component::TypeTupleIndex::from_u32(task_return_type),
+            wasmtime_environ::component::TaskReturnIndex::from_u32(task_return_index),
             params,
             results,
         )
