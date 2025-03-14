@@ -1329,19 +1329,19 @@ unsafe fn error_context_drop(
 }
 
 #[cfg(feature = "component-model-async")]
-unsafe fn context_get(vmctx: NonNull<VMComponentContext>, slot: u32) -> u32 {
+unsafe fn context_get(vmctx: NonNull<VMComponentContext>, slot: u32) -> Result<u32> {
     ComponentInstance::from_vmctx(vmctx, |instance| {
         (*instance.store())
             .component_async_store()
-            .context_get(instance, slot)
+            .context_get(slot)
     })
 }
 
 #[cfg(feature = "component-model-async")]
-unsafe fn context_set(vmctx: NonNull<VMComponentContext>, slot: u32, val: u32) {
+unsafe fn context_set(vmctx: NonNull<VMComponentContext>, slot: u32, val: u32) -> Result<()> {
     ComponentInstance::from_vmctx(vmctx, |instance| {
         (*instance.store())
             .component_async_store()
-            .context_set(instance, slot, val)
+            .context_set(slot, val)
     })
 }

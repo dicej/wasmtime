@@ -300,10 +300,9 @@ system-interface = { version = "0.27.1", features = ["cap_std_impls"] }
 io-lifetimes = { version = "2.0.3", default-features = false }
 io-extras = "0.18.1"
 rustix = "0.38.43"
-# TODO: switch back to released wit-bindgen
-wit-bindgen = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "1d8cbb92b7aed06b6e762a7b49d3a4691b0280b8", default-features = false }
-wit-bindgen-rt = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "1d8cbb92b7aed06b6e762a7b49d3a4691b0280b8", default-features = false }
-wit-bindgen-rust-macro = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "1d8cbb92b7aed06b6e762a7b49d3a4691b0280b8", default-features = false }
+wit-bindgen = { version = "0.41.0", default-features = false }
+wit-bindgen-rt = { version = "0.41.0", default-features = false }
+wit-bindgen-rust-macro = { version = "0.41.0", default-features = false }
 
 # wasm-tools family:
 # TODO: switch back to release
@@ -573,6 +572,21 @@ codegen-units = 1
 lto = true
 
 [patch.crates-io]
-wasmparser = { git = 'https://github.com/bytecodealliance/wasm-tools' }
-wasmprinter = { git = 'https://github.com/bytecodealliance/wasm-tools' }
-wasm-encoder = { git = 'https://github.com/bytecodealliance/wasm-tools' }
+wit-bindgen = { path = "../wit-bindgen/crates/guest-rust" }
+wit-bindgen-rt = { path = "../wit-bindgen/crates/guest-rust/rt" }
+wit-bindgen-rust-macro = { path = "../wit-bindgen/crates/guest-rust/macro" }
+
+[patch."https://github.com/bytecodealliance/wasm-tools"]
+wasmparser = { path = "../wasm-tools/crates/wasmparser" }
+wat = { path = "../wasm-tools/crates/wat" }
+wast = { path = "../wasm-tools/crates/wast" }
+wasmprinter = { path = "../wasm-tools/crates/wasmprinter" }
+wasm-encoder = { path = "../wasm-tools/crates/wasm-encoder" }
+wasm-smith = { path = "../wasm-tools/crates/wasm-smith" }
+wasm-mutate = { path = "../wasm-tools/crates/wasm-mutate" }
+wit-parser = { path = "../wasm-tools/crates/wit-parser" }
+wit-component = { path = "../wasm-tools/crates/wit-component" }
+wasm-wave = { path = "../wasm-tools/crates/wasm-wave" }
+wasm-compose = { path = "../wasm-tools/crates/wasm-compose" }
+wasm-metadata = { path = "../wasm-tools/crates/wasm-metadata" }
+

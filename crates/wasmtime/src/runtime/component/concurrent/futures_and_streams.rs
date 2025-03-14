@@ -1,6 +1,7 @@
 use {
     super::{
         table::TableId, Event, GuestTask, HostTaskFuture, HostTaskOutput, HostTaskResult, Promise,
+        WaitableSet,
     },
     crate::{
         component::{
@@ -1280,12 +1281,10 @@ pub fn future<T: func::Lower + func::Lift + Sync + Send + 'static, U, S: AsConte
     mut store: S,
 ) -> Result<(FutureWriter<T>, FutureReader<T>)> {
     let mut store = store.as_context_mut();
-    let transmit = store.concurrent_state().table.push(TransmitState {
-        read: ReadState::Open,
-        write: WriteState::Open,
-        reader_watcher: None,
-        writer_watcher: None,
-    })?;
+    let transmit = store
+        .concurrent_state()
+        .table
+        .push(TransmitState::default())?;
 
     Ok((
         FutureWriter {
@@ -1596,13 +1595,10 @@ pub fn stream<
     mut store: S,
 ) -> Result<(StreamWriter<B>, StreamReader<B>)> {
     let mut store = store.as_context_mut();
-    let transmit = store.concurrent_state().table.push(TransmitState {
-        read: ReadState::Open,
-        write: WriteState::Open,
-        reader_watcher: None,
-        writer_watcher: None,
-    })?;
-
+    let transmit = store
+        .concurrent_state()
+        .table
+        .push(TransmitState::default())?;
     Ok((
         StreamWriter {
             tx: Some(start_event_loop(&mut store, transmit.rep())),
@@ -1730,6 +1726,19 @@ pub(super) struct TransmitState {
     read: ReadState,
     writer_watcher: Option<oneshot::Sender<()>>,
     reader_watcher: Option<oneshot::Sender<()>>,
+    waitable_set: Option<TableId<WaitableSet>>,
+}
+
+impl Default for TransmitState {
+    fn default() -> Self {
+        Self {
+            read: ReadState::Open,
+            write: WriteState::Open,
+            reader_watcher: None,
+            writer_watcher: None,
+            waitable_set: None,
+        }
+    }
 }
 
 enum WriteState {
@@ -1815,12 +1824,7 @@ pub(super) fn guest_new<T>(
     instance: &mut ComponentInstance,
     ty: TableIndex,
 ) -> Result<u32> {
-    let transmit = cx.concurrent_state().table.push(TransmitState {
-        read: ReadState::Open,
-        write: WriteState::Open,
-        reader_watcher: None,
-        writer_watcher: None,
-    })?;
+    let transmit = cx.concurrent_state().table.push(TransmitState::default())?;
     state_table(instance, ty).insert(transmit.rep(), waitable_state(ty, StreamFutureState::Local))
 }
 
