@@ -1,7 +1,7 @@
 use {
     super::{
-        table::TableId, Event, GuestTask, HostTaskFuture, HostTaskOutput, HostTaskResult, Promise,
-        WaitableSet,
+        table::TableId, Event, HostTaskFuture, HostTaskOutput, HostTaskResult, Promise,
+        WaitableCommon,
     },
     crate::{
         component::{
@@ -88,13 +88,7 @@ fn state_table(instance: &mut ComponentInstance, ty: TableIndex) -> &mut StateTa
     &mut instance.component_waitable_tables()[runtime_instance]
 }
 
-fn push_event<T>(
-    mut store: StoreContextMut<T>,
-    rep: u32,
-    event: Event,
-    param: usize,
-    caller: TableId<GuestTask>,
-) {
+fn push_event<T>(mut store: StoreContextMut<T>, rep: u32, event: Event, param: usize) {
     store
         .concurrent_state()
         .futures
@@ -105,7 +99,6 @@ fn push_event<T>(
                 Ok(HostTaskResult {
                     event,
                     param: u32::try_from(param).unwrap(),
-                    caller,
                 })
             }),
         })) as HostTaskFuture);
@@ -288,7 +281,6 @@ fn host_write<
                 count,
                 instance,
                 handle,
-                caller,
                 ..
             } => unsafe {
                 let types = (*instance.as_ptr()).component_types();
@@ -313,12 +305,6 @@ fn host_write<
                 }
                 offset += count;
 
-                log::trace!("remove read child of {}: {transmit_rep}", caller.rep());
-                store
-                    .concurrent_state()
-                    .table
-                    .remove_child(transmit_id, caller)?;
-
                 *get_mut_by_index(&mut *instance.as_ptr(), ty, handle)?.1 = StreamFutureState::Read;
 
                 push_event(
@@ -329,7 +315,6 @@ fn host_write<
                         TableIndex::Stream(_) => Event::StreamRead,
                     },
                     count,
-                    caller,
                 );
 
                 if offset < values.len() {
@@ -456,7 +441,6 @@ pub fn host_read<
             count,
             instance,
             handle,
-            caller,
             post_write,
             ..
         } => unsafe {
@@ -474,16 +458,6 @@ pub fn host_read<
                 B::from(T::load_list(lift, list)?)
             }));
 
-            log::trace!(
-                "remove write child of {}: {}",
-                caller.rep(),
-                transmit_id.rep()
-            );
-            store
-                .concurrent_state()
-                .table
-                .remove_child(transmit_id, caller)?;
-
             if let PostWrite::Close(err_ctx) = post_write {
                 store.concurrent_state().table.get_mut(transmit_id)?.write =
                     WriteState::Closed(err_ctx);
@@ -500,7 +474,6 @@ pub fn host_read<
                     TableIndex::Stream(_) => Event::StreamWrite,
                 },
                 count,
-                caller,
             );
         },
 
@@ -535,16 +508,7 @@ fn host_cancel_write<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Re
     let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
 
     match &transmit.write {
-        WriteState::GuestReady { caller, .. } => {
-            let caller = *caller;
-            transmit.write = WriteState::Open;
-            store
-                .concurrent_state()
-                .table
-                .remove_child(transmit_id, caller)?;
-        }
-
-        WriteState::HostReady { .. } => {
+        WriteState::GuestReady { .. } | WriteState::HostReady { .. } => {
             transmit.write = WriteState::Open;
         }
 
@@ -564,16 +528,7 @@ fn host_cancel_read<U, S: AsContextMut<Data = U>>(mut store: S, rep: u32) -> Res
     let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
 
     match &transmit.read {
-        ReadState::GuestReady { caller, .. } => {
-            let caller = *caller;
-            transmit.read = ReadState::Open;
-            store
-                .concurrent_state()
-                .table
-                .remove_child(transmit_id, caller)?;
-        }
-
-        ReadState::HostReady { .. } => {
+        ReadState::GuestReady { .. } | ReadState::HostReady { .. } => {
             transmit.read = ReadState::Open;
         }
 
@@ -645,7 +600,6 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
             err_ctx_ty,
             instance,
             handle,
-            caller,
             ..
         } => unsafe {
             // Lift the global err_ctx that we're receiving into an error context
@@ -693,7 +647,6 @@ fn host_close_writer<U, S: AsContextMut<Data = U>>(
                     TableIndex::Stream(_) => Event::StreamRead,
                 },
                 push_param,
-                caller,
             );
 
             *get_mut_by_index(&mut *instance.as_ptr(), ty, handle)?.1 = StreamFutureState::Read;
@@ -754,7 +707,6 @@ fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, transmit_rep: u
             instance,
             handle,
             post_write,
-            caller,
             ..
         } => unsafe {
             push_event(
@@ -765,7 +717,6 @@ fn host_close_reader<U, S: AsContextMut<Data = U>>(mut store: S, transmit_rep: u
                     TableIndex::Stream(_) => Event::StreamRead,
                 },
                 CLOSED,
-                caller,
             );
 
             if let PostWrite::Close(_) = post_write {
@@ -1599,6 +1550,7 @@ pub fn stream<
         .concurrent_state()
         .table
         .push(TransmitState::default())?;
+
     Ok((
         StreamWriter {
             tx: Some(start_event_loop(&mut store, transmit.rep())),
@@ -1721,22 +1673,26 @@ unsafe impl func::Lift for ErrorContext {
     }
 }
 
+pub(super) struct TransmitHandle;
+
 pub(super) struct TransmitState {
+    pub(super) write_common: WaitableCommon,
+    pub(super) read_common: WaitableCommon,
     write: WriteState,
     read: ReadState,
     writer_watcher: Option<oneshot::Sender<()>>,
     reader_watcher: Option<oneshot::Sender<()>>,
-    waitable_set: Option<TableId<WaitableSet>>,
 }
 
 impl Default for TransmitState {
     fn default() -> Self {
         Self {
+            write_common: WaitableCommon::default(),
+            read_common: WaitableCommon::default(),
             read: ReadState::Open,
             write: WriteState::Open,
             reader_watcher: None,
             writer_watcher: None,
-            waitable_set: None,
         }
     }
 }
@@ -1751,7 +1707,6 @@ enum WriteState {
         count: usize,
         instance: SendSyncPtr<ComponentInstance>,
         handle: u32,
-        caller: TableId<GuestTask>,
         post_write: PostWrite,
     },
     HostReady {
@@ -1778,7 +1733,6 @@ enum ReadState {
         count: usize,
         instance: SendSyncPtr<ComponentInstance>,
         handle: u32,
-        caller: TableId<GuestTask>,
     },
     HostReady {
         accept: Box<dyn FnOnce(Writer) -> Result<usize> + Send + Sync>,
@@ -1989,7 +1943,11 @@ pub(super) fn guest_write<T>(
     let types = unsafe { (*instance).component_types() };
     let (rep, state) = unsafe { get_mut_by_index(&mut *instance, ty, handle)? };
     let StreamFutureState::Write = *state else {
-        bail!("invalid handle");
+        bail!(
+            "invalid handle {handle}; expected {:?}; got {:?}",
+            StreamFutureState::Write,
+            *state
+        );
     };
     *state = StreamFutureState::Busy;
     let transmit_id = TableId::<TransmitState>::new(rep);
@@ -2007,9 +1965,7 @@ pub(super) fn guest_write<T>(
             options: read_options,
             address: read_address,
             count: read_count,
-            instance: _,
             handle: read_handle,
-            caller: read_caller,
             ..
         } => {
             assert_eq!(flat_abi, read_flat_abi);
@@ -2031,15 +1987,6 @@ pub(super) fn guest_write<T>(
                 rep,
             )?;
 
-            log::trace!(
-                "remove read child of {}: {}",
-                read_caller.rep(),
-                transmit_id.rep()
-            );
-            cx.concurrent_state()
-                .table
-                .remove_child(transmit_id, read_caller)?;
-
             unsafe {
                 *get_mut_by_index(&mut *instance, read_ty, read_handle)?.1 =
                     StreamFutureState::Read;
@@ -2053,7 +2000,6 @@ pub(super) fn guest_write<T>(
                     TableIndex::Stream(_) => Event::StreamRead,
                 },
                 count,
-                read_caller,
             );
 
             count
@@ -2072,18 +2018,6 @@ pub(super) fn guest_write<T>(
         ReadState::Open => {
             assert!(matches!(&transmit.write, WriteState::Open));
 
-            let caller = cx.concurrent_state().guest_task.unwrap();
-            log::trace!(
-                "add write {} child of {}: {}",
-                match ty {
-                    TableIndex::Future(_) => "future",
-                    TableIndex::Stream(_) => "stream",
-                },
-                caller.rep(),
-                transmit_id.rep()
-            );
-            cx.concurrent_state().table.add_child(transmit_id, caller)?;
-
             let transmit = cx.concurrent_state().table.get_mut(transmit_id)?;
             transmit.write = WriteState::GuestReady {
                 ty,
@@ -2093,7 +2027,6 @@ pub(super) fn guest_write<T>(
                 count: usize::try_from(count).unwrap(),
                 instance: SendSyncPtr::new(NonNull::new(instance).unwrap()),
                 handle,
-                caller,
                 post_write: PostWrite::Continue,
             };
 
@@ -2140,7 +2073,11 @@ pub(super) fn guest_read<T>(
     let types = unsafe { (*instance).component_types() };
     let (rep, state) = unsafe { get_mut_by_index(&mut *instance, ty, handle)? };
     let StreamFutureState::Read = *state else {
-        bail!("invalid handle");
+        bail!(
+            "invalid handle {handle}; expected {:?}; got {:?}",
+            StreamFutureState::Read,
+            *state
+        );
     };
     *state = StreamFutureState::Busy;
     let transmit_id = TableId::<TransmitState>::new(rep);
@@ -2160,7 +2097,6 @@ pub(super) fn guest_read<T>(
             count: write_count,
             instance: _,
             handle: write_handle,
-            caller: write_caller,
             post_write,
         } => {
             assert_eq!(flat_abi, write_flat_abi);
@@ -2182,15 +2118,6 @@ pub(super) fn guest_read<T>(
                 rep,
             )?;
 
-            log::trace!(
-                "remove write child of {}: {}",
-                write_caller.rep(),
-                transmit_id.rep()
-            );
-            cx.concurrent_state()
-                .table
-                .remove_child(transmit_id, write_caller)?;
-
             if let PostWrite::Close(err_ctx) = post_write {
                 cx.concurrent_state().table.get_mut(transmit_id)?.write =
                     WriteState::Closed(err_ctx);
@@ -2201,6 +2128,8 @@ pub(super) fn guest_read<T>(
                 }
             }
 
+            eprintln!("push event for write handle {write_handle}");
+
             push_event(
                 cx,
                 transmit_id.rep(),
@@ -2209,7 +2138,6 @@ pub(super) fn guest_read<T>(
                     TableIndex::Stream(_) => Event::StreamWrite,
                 },
                 count,
-                write_caller,
             );
 
             count
@@ -2239,18 +2167,6 @@ pub(super) fn guest_read<T>(
         WriteState::Open => {
             assert!(matches!(&transmit.read, ReadState::Open));
 
-            let caller = cx.concurrent_state().guest_task.unwrap();
-            log::trace!(
-                "add read {} child of {}: {}",
-                match ty {
-                    TableIndex::Future(_) => "future",
-                    TableIndex::Stream(_) => "stream",
-                },
-                caller.rep(),
-                transmit_id.rep()
-            );
-            cx.concurrent_state().table.add_child(transmit_id, caller)?;
-
             let transmit = cx.concurrent_state().table.get_mut(transmit_id)?;
             transmit.read = ReadState::GuestReady {
                 ty,
@@ -2260,7 +2176,6 @@ pub(super) fn guest_read<T>(
                 count: usize::try_from(count).unwrap(),
                 instance: SendSyncPtr::new(NonNull::new(instance).unwrap()),
                 handle,
-                caller,
                 err_ctx_ty,
             };
 
@@ -2323,6 +2238,7 @@ pub(super) fn guest_read<T>(
         }
     };
 
+    eprintln!("maybe unbusy read handle {handle}; result is {result}");
     if result != BLOCKED {
         unsafe {
             *get_mut_by_index(&mut *instance, ty, handle)?.1 = StreamFutureState::Read;
@@ -2667,4 +2583,103 @@ pub(super) fn error_context_drop<T>(
     }
 
     Ok(())
+}
+
+pub(super) fn guest_transfer<T, U>(
+    mut store: StoreContextMut<T>,
+    instance: &mut ComponentInstance,
+    src_idx: u32,
+    src: U,
+    src_table: &mut StateTable<WaitableState>,
+    dst: U,
+    dst_table: &mut StateTable<WaitableState>,
+    match_state: Fn(&WaitableState) -> Result<(&U, &StreamFutureState)>,
+    make_state: Fn(U, StreamFutureState) -> WaitableState,
+) -> Result<u32> {
+    let src_instance = instance.component_types()[src].instance;
+    let dst_instance = instance.component_types()[dst].instance;
+    let [src_table, dst_table] = instance
+        .component_waitable_tables
+        .get_many_mut([src_instance, dst_instance])
+        .unwrap();
+    let (rep, src_state) = src_table.get_mut_by_index(src_idx)? else {
+        bail!("invalid future handle");
+    };
+    let (src_ty, src_state) = match_state(src_state)?;
+    if *src_ty != src {
+        bail!("invalid future handle");
+    }
+    match src_state {
+        StreamFutureState::Local => {
+            let state = TableId::<TransmitState>::new(rep);
+
+            let write = store
+                .concurrent_state()
+                .table
+                .push(TransmitHandle::new(state))?;
+
+            let read = store
+                .concurrent_state()
+                .table
+                .push(TransmitHandle::new(state))?;
+
+            let state = store.concurrent_state().table.get_mut(state)?;
+            state.write_handle = Some(write);
+            state.read_handle = Some(read);
+
+            src_table.replace_by_index(
+                src_idx,
+                write.rep(),
+                make_state(src, StreamFutureState::Write),
+            )?;
+
+            dst_table.insert(read.rep(), make_state(dst, StreamFutureState::Read))
+        }
+        StreamFutureState::Read => {
+            src_table.remove_by_index(src_idx)?;
+
+            let state = store
+                .concurrent_state()
+                .table
+                .get(TableId::<TransmitHandle>::new(rep))?
+                .state;
+            let state = store.concurrent_state().table.get(state)?;
+
+            if let Some((dst_idx, dst_state)) = state
+                .write_handle
+                .as_ref()
+                .and_then(|v| dst_table.get_mut_by_rep(v.rep()))
+            {
+                let (dst_ty, dst_state) = match_state(dst_state).unwrap();
+                assert_eq!(*dst_ty, dst);
+                assert_eq!(*dst_state, StreamFutureState::Write);
+
+                let state_id = store
+                    .concurrent_state()
+                    .table
+                    .delete(TableId::<TransmitHandle>::new(rep))?
+                    .state;
+                let state = store.concurrent_state().table.get_mut(state_id)?;
+
+                state.read_handle.take().unwrap();
+
+                store
+                    .concurrent_state()
+                    .table
+                    .delete(state.write_handle.take().unwrap())?;
+
+                dst_table.replace_by_index(
+                    dst_idx,
+                    state_id.rep(),
+                    make_state(src, StreamFutureState::Local),
+                )?;
+
+                Ok(dst_idx)
+            } else {
+                dst_table.insert(rep, make_state(dst, StreamFutureState::Read))
+            }
+        }
+        StreamFutureState::Write => bail!("cannot transfer write end of stream or future"),
+        StreamFutureState::Busy => bail!("cannot transfer busy stream or future"),
+    }
 }
