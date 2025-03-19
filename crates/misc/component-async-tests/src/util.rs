@@ -100,7 +100,7 @@ pub async fn test_run(component: &[u8]) -> Result<()> {
 
     // Start three concurrent calls and then join them all:
     let mut promises = PromisesUnordered::new();
-    for _ in 0..1 {
+    for _ in 0..3 {
         promises.push(yield_host.local_local_run().call_run(&mut store).await?);
     }
 

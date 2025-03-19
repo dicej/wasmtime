@@ -1678,6 +1678,19 @@ impl GuestTask {
 
     fn dispose<T>(self, mut store: StoreContextMut<T>, me: TableId<GuestTask>) -> Result<()> {
         store.concurrent_state().yielding.remove(&me);
+
+        for waitable in mem::take(
+            &mut store
+                .concurrent_state()
+                .table
+                .get_mut(self.sync_call_set)?
+                .ready,
+        ) {
+            if let Some((Event::CallReturned, _)) = waitable.common(&mut store)?.event {
+                waitable.delete_from(store.as_context_mut())?;
+            }
+        }
+
         store.concurrent_state().table.delete(self.sync_call_set)?;
 
         if let Caller::Guest { task, instance } = &self.caller {
@@ -3491,7 +3504,9 @@ fn do_start_call<'a, T>(
                 if let Caller::Host(tx) =
                     &mut store.concurrent_state().table.get_mut(guest_task)?.caller
                 {
-                    _ = tx.take().unwrap().send(result);
+                    if let Some(tx) = tx.take() {
+                        _ = tx.send(result);
+                    }
                 } else {
                     store.concurrent_state().table.get_mut(guest_task)?.result = Some(result);
                 }

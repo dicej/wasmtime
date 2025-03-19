@@ -89,6 +89,7 @@ fn state_table(instance: &mut ComponentInstance, ty: TableIndex) -> &mut StateTa
 }
 
 fn push_event<T>(mut store: StoreContextMut<T>, rep: u32, event: Event, param: usize) {
+    log::trace!("push event {event:?} for {rep}");
     store
         .concurrent_state()
         .futures
@@ -1086,10 +1087,22 @@ impl<T> HostFuture<T> {
     fn lower_to_index<U>(&self, cx: &mut LowerContext<'_, U>, ty: InterfaceType) -> Result<u32> {
         match ty {
             InterfaceType::Future(dst) => {
-                state_table(unsafe { &mut *cx.instance }, TableIndex::Future(dst)).insert(
-                    self.rep,
-                    WaitableState::Future(dst, StreamFutureState::Read),
-                )
+                let state = cx
+                    .store
+                    .concurrent_state()
+                    .table
+                    .get(TableId::<TransmitHandle>::new(self.rep))?
+                    .state;
+                let rep = cx
+                    .store
+                    .concurrent_state()
+                    .table
+                    .get(state)?
+                    .read_handle
+                    .rep();
+
+                state_table(unsafe { &mut *cx.instance }, TableIndex::Future(dst))
+                    .insert(rep, WaitableState::Future(dst, StreamFutureState::Read))
             }
             _ => func::bad_type_info(),
         }
@@ -1245,30 +1258,48 @@ impl<T> Drop for FutureReader<T> {
 fn transmit<T>(
     mut store: StoreContextMut<T>,
 ) -> Result<(TableId<TransmitHandle>, TableId<TransmitHandle>)> {
-    let state = store
+    let state_id = store
         .concurrent_state()
         .table
         .push(TransmitState::default())?;
     let write = store
         .concurrent_state()
         .table
-        .push(TransmitHandle::new(state))?;
+        .push(TransmitHandle::new(state_id))?;
     let read = store
         .concurrent_state()
         .table
-        .push(TransmitHandle::new(state))?;
-    let state = store.concurrent_state().table.get_mut(state)?;
+        .push(TransmitHandle::new(state_id))?;
+    let state = store.concurrent_state().table.get_mut(state_id)?;
     state.write_handle = write;
     state.read_handle = read;
+
+    log::trace!(
+        "new transmit: state {}; write {}; read {}",
+        state_id.rep(),
+        write.rep(),
+        read.rep(),
+    );
 
     Ok((write, read))
 }
 
-fn delete_transmit<T>(mut store: StoreContextMut<T>, state: TableId<TransmitState>) -> Result<()> {
+fn delete_transmit<T>(
+    mut store: StoreContextMut<T>,
+    state_id: TableId<TransmitState>,
+) -> Result<()> {
     let table = &mut store.concurrent_state().table;
-    let state = table.delete(state)?;
+    let state = table.delete(state_id)?;
     table.delete(state.write_handle)?;
     table.delete(state.read_handle)?;
+
+    log::trace!(
+        "delete transmit: state {}; write {}; read {}",
+        state_id.rep(),
+        state.write_handle.rep(),
+        state.read_handle.rep(),
+    );
+
     Ok(())
 }
 
@@ -1423,10 +1454,22 @@ impl<T> HostStream<T> {
     fn lower_to_index<U>(&self, cx: &mut LowerContext<'_, U>, ty: InterfaceType) -> Result<u32> {
         match ty {
             InterfaceType::Stream(dst) => {
-                state_table(unsafe { &mut *cx.instance }, TableIndex::Stream(dst)).insert(
-                    self.rep,
-                    WaitableState::Stream(dst, StreamFutureState::Read),
-                )
+                let state = cx
+                    .store
+                    .concurrent_state()
+                    .table
+                    .get(TableId::<TransmitHandle>::new(self.rep))?
+                    .state;
+                let rep = cx
+                    .store
+                    .concurrent_state()
+                    .table
+                    .get(state)?
+                    .read_handle
+                    .rep();
+
+                state_table(unsafe { &mut *cx.instance }, TableIndex::Stream(dst))
+                    .insert(rep, WaitableState::Stream(dst, StreamFutureState::Read))
             }
             _ => func::bad_type_info(),
         }
@@ -2009,6 +2052,10 @@ pub(super) fn guest_write<T>(
         .table
         .get(TableId::<TransmitHandle>::new(rep))?
         .state;
+    log::trace!(
+        "guest_write {rep} (handle {handle}; state {})",
+        transmit_id.rep()
+    );
     let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
     let new_state = if let ReadState::Closed = &transmit.read {
         ReadState::Closed
@@ -2145,6 +2192,10 @@ pub(super) fn guest_read<T>(
         .table
         .get(TableId::<TransmitHandle>::new(rep))?
         .state;
+    log::trace!(
+        "guest_read {rep} (handle {handle}; state {})",
+        transmit_id.rep()
+    );
     let transmit = store.concurrent_state().table.get_mut(transmit_id)?;
     let new_state = if let WriteState::Closed(err_ctx) = &transmit.write {
         WriteState::Closed(*err_ctx)
