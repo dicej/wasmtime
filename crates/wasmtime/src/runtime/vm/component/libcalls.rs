@@ -879,8 +879,8 @@ unsafe fn stream_transfer(
         (*instance.store()).component_async_store().stream_transfer(
             instance,
             src_idx,
-            wasmtime_environ::component::TypeFutureTableIndex::from_u32(src_table),
-            wasmtime_environ::component::TypeFutureTableIndex::from_u32(dst_table),
+            wasmtime_environ::component::TypeStreamTableIndex::from_u32(src_table),
+            wasmtime_environ::component::TypeStreamTableIndex::from_u32(dst_table),
         )
     })
 }

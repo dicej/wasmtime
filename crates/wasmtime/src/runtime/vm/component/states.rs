@@ -73,13 +73,6 @@ impl<T> StateTable<T> {
         Ok(ret)
     }
 
-    pub fn replace_by_index(&mut self, idx: u32, rep: u32, state: T) -> Result<()> {
-        remove_by_index(idx)?;
-        let new = insert(rep, state)?;
-        assert!(new == idx);
-        Ok(())
-    }
-
     fn handle_index_to_table_index(&self, idx: u32) -> Option<usize> {
         // NB: `idx` is decremented by one to account for the `+1` above during
         // allocation.
