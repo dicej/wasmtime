@@ -43,8 +43,8 @@ fn main() {
     // to rustc. That means that conditional dependencies enabled in
     // `Cargo.toml` (or other features) by `pulley` aren't activated, which is
     // why the `pulley` feature of this crate depends on nothing else.
-    custom_cfg("default_target_pulley", !has_host_compiler_backend);
-    if !has_host_compiler_backend {
+    custom_cfg("default_target_pulley", !has_host_compiler_backend || miri);
+    if !has_host_compiler_backend || miri {
         println!("cargo:rustc-cfg=feature=\"pulley\"");
     }
 }
