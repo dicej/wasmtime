@@ -32,19 +32,19 @@ pub async fn async_round_trip_stackful() -> Result<()> {
         test_round_trip_hack(
             |engine| unsafe { Component::deserialize_file(engine, "./my-hack.cwasm").unwrap() },
             &[
-            // (
-            //     "hello, world!",
-            //     "hello, world! - entered guest - entered host - exited host - exited guest",
-            // ),
-            // (
-            //     "¡hola, mundo!",
-            //     "¡hola, mundo! - entered guest - entered host - exited host - exited guest",
-            // ),
-            // (
-            //     "hi y'all!",
-            //     "hi y'all! - entered guest - entered host - exited host - exited guest",
-            // ),
-        ],
+                (
+                    "hello, world!",
+                    "hello, world! - entered guest - entered host - exited host - exited guest",
+                ),
+                (
+                    "¡hola, mundo!",
+                    "¡hola, mundo! - entered guest - entered host - exited host - exited guest",
+                ),
+                (
+                    "hi y'all!",
+                    "hi y'all! - entered guest - entered host - exited host - exited guest",
+                ),
+            ],
         )
         .await
     } else {

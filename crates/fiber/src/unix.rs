@@ -276,13 +276,17 @@ impl Fiber {
             addr.write(0);
         }
     }
+
+    pub(crate) fn drop<A, B, C>(&mut self) {
+        // ignore
+    }
 }
 
 impl Suspend {
     pub(crate) fn switch<A, B, C>(&mut self, result: RunResult<A, B, C>) -> A {
         unsafe {
             let is_finishing = match &result {
-                RunResult::Returned(_) | RunResult::Panicked(_) => true,
+                RunResult::Returned(_) | RunResult::Panicked(_) | RunResult::Exiting => true,
                 RunResult::Executing | RunResult::Resuming(_) | RunResult::Yield(_) => false,
             };
             // Calculate 0xAff8 and then write to it
@@ -291,6 +295,24 @@ impl Suspend {
             asan::fiber_switch(self.top_of_stack, is_finishing, &mut self.previous);
 
             self.take_resume::<A, B, C>()
+        }
+    }
+
+    pub(crate) fn exit<A, B, C>(&mut self, result: RunResult<A, B, C>) {
+        unsafe {
+            let is_finishing = match &result {
+                RunResult::Returned(_) | RunResult::Panicked(_) | RunResult::Exiting => true,
+                RunResult::Executing | RunResult::Resuming(_) | RunResult::Yield(_) => false,
+            };
+            // Calculate 0xAff8 and then write to it
+            (*self.result_location::<A, B, C>()).set(result);
+
+            asan::fiber_switch(self.top_of_stack, is_finishing, &mut self.previous);
+
+            match (*self.result_location::<A, B, C>()).replace(RunResult::Exiting) {
+                RunResult::Exiting => {}
+                _ => panic!("not in exiting state"),
+            }
         }
     }
 
