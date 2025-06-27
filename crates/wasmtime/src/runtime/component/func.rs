@@ -728,6 +728,11 @@ impl Func {
             // panic, even if the function call below traps.
             flags.set_needs_post_return(false);
 
+            // As of https://github.com/WebAssembly/component-model/pull/531,
+            // calling imports from a post-return function is not allowed.
+            assert!(flags.may_leave());
+            flags.set_may_leave(false);
+
             // If the function actually had a `post-return` configured in its
             // canonical options that's executed here.
             //
@@ -744,9 +749,10 @@ impl Func {
             }
 
             // And finally if everything completed successfully then the "may
-            // enter" flag is set to `true` again here which enables further use
-            // of the component.
+            // enter" and "may leave" flags is set to `true` again here which
+            // enables further use of the component.
             flags.set_may_enter(true);
+            flags.set_may_leave(true);
 
             let (calls, host_table, _, instance) = store
                 .0

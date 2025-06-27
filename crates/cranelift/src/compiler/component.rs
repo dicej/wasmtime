@@ -1,6 +1,8 @@
 //! Compilation support for the component model.
 
-use crate::{TRAP_ALWAYS, TRAP_CANNOT_ENTER, TRAP_INTERNAL_ASSERT, compiler::Compiler};
+use crate::{
+    TRAP_ALWAYS, TRAP_CANNOT_ENTER, TRAP_CANNOT_LEAVE, TRAP_INTERNAL_ASSERT, compiler::Compiler,
+};
 use anyhow::Result;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, InstBuilder, MemFlags, Value};
@@ -99,15 +101,19 @@ impl<'a> TrampolineCompiler<'a> {
             Trampoline::AlwaysTrap => {
                 self.translate_always_trap();
             }
-            Trampoline::ResourceNew(ty) => self.translate_resource_new(*ty),
-            Trampoline::ResourceRep(ty) => self.translate_resource_rep(*ty),
-            Trampoline::ResourceDrop(ty) => self.translate_resource_drop(*ty),
+            Trampoline::ResourceNew { instance, ty } => self.translate_resource_new(*instance, *ty),
+            Trampoline::ResourceRep { instance, ty } => self.translate_resource_rep(*instance, *ty),
+            Trampoline::ResourceDrop { instance, ty } => {
+                self.translate_resource_drop(*instance, *ty)
+            }
             Trampoline::BackpressureSet { instance } => {
                 self.translate_backpressure_set_call(*instance)
             }
-            Trampoline::TaskReturn { results, options } => {
-                self.translate_task_return_call(*results, options)
-            }
+            Trampoline::TaskReturn {
+                instance,
+                results,
+                options,
+            } => self.translate_task_return_call(*instance, *results, options),
             Trampoline::TaskCancel { instance } => self.translate_task_cancel_call(*instance),
             Trampoline::WaitableSetNew { instance } => self.translate_waitable_set_new(*instance),
             Trampoline::WaitableSetWait {
@@ -132,23 +138,35 @@ impl<'a> TrampolineCompiler<'a> {
             ),
             Trampoline::WaitableSetDrop { instance } => self.translate_waitable_set_drop(*instance),
             Trampoline::WaitableJoin { instance } => self.translate_waitable_join(*instance),
-            Trampoline::Yield { async_ } => self.translate_yield_call(*async_),
+            Trampoline::Yield { instance, async_ } => self.translate_yield_call(*instance, *async_),
             Trampoline::SubtaskDrop { instance } => self.translate_subtask_drop_call(*instance),
             Trampoline::SubtaskCancel { instance, async_ } => {
                 self.translate_subtask_cancel_call(*instance, *async_)
             }
-            Trampoline::StreamNew { ty } => self.translate_future_or_stream_call(
+            Trampoline::StreamNew { instance, ty } => self.translate_future_or_stream_call(
+                *instance,
                 &[ty.as_u32()],
                 None,
                 host::stream_new,
                 TrapSentinel::NegativeOne,
             ),
-            Trampoline::StreamRead { ty, options } => {
+            Trampoline::StreamRead {
+                instance,
+                ty,
+                options,
+            } => {
                 let tys = &[ty.as_u32()];
                 if let Some(info) = self.flat_stream_element_info(*ty).cloned() {
-                    self.translate_flat_stream_call(tys, options, host::flat_stream_read, &info)
+                    self.translate_flat_stream_call(
+                        *instance,
+                        tys,
+                        options,
+                        host::flat_stream_read,
+                        &info,
+                    )
                 } else {
                     self.translate_future_or_stream_call(
+                        *instance,
                         tys,
                         Some(options),
                         host::stream_read,
@@ -156,12 +174,23 @@ impl<'a> TrampolineCompiler<'a> {
                     )
                 }
             }
-            Trampoline::StreamWrite { ty, options } => {
+            Trampoline::StreamWrite {
+                instance,
+                ty,
+                options,
+            } => {
                 let tys = &[ty.as_u32()];
                 if let Some(info) = self.flat_stream_element_info(*ty).cloned() {
-                    self.translate_flat_stream_call(tys, options, host::flat_stream_write, &info)
+                    self.translate_flat_stream_call(
+                        *instance,
+                        tys,
+                        options,
+                        host::flat_stream_write,
+                        &info,
+                    )
                 } else {
                     self.translate_future_or_stream_call(
+                        *instance,
                         tys,
                         Some(options),
                         host::stream_write,
@@ -169,74 +198,132 @@ impl<'a> TrampolineCompiler<'a> {
                     )
                 }
             }
-            Trampoline::StreamCancelRead { ty, async_ } => {
-                self.translate_cancel_call(ty.as_u32(), *async_, host::stream_cancel_read)
-            }
-            Trampoline::StreamCancelWrite { ty, async_ } => {
-                self.translate_cancel_call(ty.as_u32(), *async_, host::stream_cancel_write)
-            }
-            Trampoline::StreamDropReadable { ty } => self.translate_future_or_stream_call(
-                &[ty.as_u32()],
-                None,
-                host::stream_drop_readable,
-                TrapSentinel::Falsy,
+            Trampoline::StreamCancelRead {
+                instance,
+                ty,
+                async_,
+            } => self.translate_cancel_call(
+                *instance,
+                ty.as_u32(),
+                *async_,
+                host::stream_cancel_read,
             ),
-            Trampoline::StreamDropWritable { ty } => self.translate_future_or_stream_call(
-                &[ty.as_u32()],
-                None,
-                host::stream_drop_writable,
-                TrapSentinel::Falsy,
+            Trampoline::StreamCancelWrite {
+                instance,
+                ty,
+                async_,
+            } => self.translate_cancel_call(
+                *instance,
+                ty.as_u32(),
+                *async_,
+                host::stream_cancel_write,
             ),
-            Trampoline::FutureNew { ty } => self.translate_future_or_stream_call(
+            Trampoline::StreamDropReadable { instance, ty } => self
+                .translate_future_or_stream_call(
+                    *instance,
+                    &[ty.as_u32()],
+                    None,
+                    host::stream_drop_readable,
+                    TrapSentinel::Falsy,
+                ),
+            Trampoline::StreamDropWritable { instance, ty } => self
+                .translate_future_or_stream_call(
+                    *instance,
+                    &[ty.as_u32()],
+                    None,
+                    host::stream_drop_writable,
+                    TrapSentinel::Falsy,
+                ),
+            Trampoline::FutureNew { instance, ty } => self.translate_future_or_stream_call(
+                *instance,
                 &[ty.as_u32()],
                 None,
                 host::future_new,
                 TrapSentinel::NegativeOne,
             ),
-            Trampoline::FutureRead { ty, options } => self.translate_future_or_stream_call(
+            Trampoline::FutureRead {
+                instance,
+                ty,
+                options,
+            } => self.translate_future_or_stream_call(
+                *instance,
                 &[ty.as_u32()],
                 Some(&options),
                 host::future_read,
                 TrapSentinel::NegativeOne,
             ),
-            Trampoline::FutureWrite { ty, options } => self.translate_future_or_stream_call(
+            Trampoline::FutureWrite {
+                instance,
+                ty,
+                options,
+            } => self.translate_future_or_stream_call(
+                *instance,
                 &[ty.as_u32()],
                 Some(options),
                 host::future_write,
                 TrapSentinel::NegativeOne,
             ),
-            Trampoline::FutureCancelRead { ty, async_ } => {
-                self.translate_cancel_call(ty.as_u32(), *async_, host::future_cancel_read)
-            }
-            Trampoline::FutureCancelWrite { ty, async_ } => {
-                self.translate_cancel_call(ty.as_u32(), *async_, host::future_cancel_write)
-            }
-            Trampoline::FutureDropReadable { ty } => self.translate_future_or_stream_call(
-                &[ty.as_u32()],
-                None,
-                host::future_drop_readable,
-                TrapSentinel::Falsy,
+            Trampoline::FutureCancelRead {
+                instance,
+                ty,
+                async_,
+            } => self.translate_cancel_call(
+                *instance,
+                ty.as_u32(),
+                *async_,
+                host::future_cancel_read,
             ),
-            Trampoline::FutureDropWritable { ty } => self.translate_future_or_stream_call(
-                &[ty.as_u32()],
-                None,
-                host::future_drop_writable,
-                TrapSentinel::Falsy,
+            Trampoline::FutureCancelWrite {
+                instance,
+                ty,
+                async_,
+            } => self.translate_cancel_call(
+                *instance,
+                ty.as_u32(),
+                *async_,
+                host::future_cancel_write,
             ),
-            Trampoline::ErrorContextNew { ty, options } => self.translate_error_context_call(
+            Trampoline::FutureDropReadable { instance, ty } => self
+                .translate_future_or_stream_call(
+                    *instance,
+                    &[ty.as_u32()],
+                    None,
+                    host::future_drop_readable,
+                    TrapSentinel::Falsy,
+                ),
+            Trampoline::FutureDropWritable { instance, ty } => self
+                .translate_future_or_stream_call(
+                    *instance,
+                    &[ty.as_u32()],
+                    None,
+                    host::future_drop_writable,
+                    TrapSentinel::Falsy,
+                ),
+            Trampoline::ErrorContextNew {
+                instance,
+                ty,
+                options,
+            } => self.translate_error_context_call(
+                *instance,
                 *ty,
                 options,
                 host::error_context_new,
                 TrapSentinel::NegativeOne,
             ),
-            Trampoline::ErrorContextDebugMessage { ty, options } => self
-                .translate_error_context_call(
-                    *ty,
-                    options,
-                    host::error_context_debug_message,
-                    TrapSentinel::Falsy,
-                ),
-            Trampoline::ErrorContextDrop { ty } => self.translate_error_context_drop_call(*ty),
+            Trampoline::ErrorContextDebugMessage {
+                instance,
+                ty,
+                options,
+            } => self.translate_error_context_call(
+                *instance,
+                *ty,
+                options,
+                host::error_context_debug_message,
+                TrapSentinel::Falsy,
+            ),
+            Trampoline::ErrorContextDrop { instance, ty } => {
+                self.translate_error_context_drop_call(*instance, *ty)
+            }
             Trampoline::ResourceTransferOwn => {
                 self.translate_host_libcall(host::resource_transfer_own, |me, rets| {
                     rets[0] = me.raise_if_negative_one_and_truncate(rets[0]);
@@ -276,8 +363,12 @@ impl<'a> TrampolineCompiler<'a> {
                     rets[0] = me.raise_if_negative_one_and_truncate(rets[0]);
                 })
             }
-            Trampoline::ContextGet(i) => self.translate_context_get(*i),
-            Trampoline::ContextSet(i) => self.translate_context_set(*i),
+            Trampoline::ContextGet { instance, slot } => {
+                self.translate_context_get(*instance, *slot)
+            }
+            Trampoline::ContextSet { instance, slot } => {
+                self.translate_context_set(*instance, *slot)
+            }
         }
     }
 
@@ -335,6 +426,21 @@ impl<'a> TrampolineCompiler<'a> {
         }
     }
 
+    fn trap_if_may_not_leave(&mut self, vmctx: ir::Value, instance: RuntimeComponentInstanceIndex) {
+        let trusted = ir::MemFlags::trusted().with_readonly();
+        let flags = self.builder.ins().load(
+            ir::types::I32,
+            trusted,
+            vmctx,
+            i32::try_from(self.offsets.instance_flags(instance)).unwrap(),
+        );
+        let masked = self
+            .builder
+            .ins()
+            .band_imm(flags, i64::from(FLAG_MAY_LEAVE));
+        self.builder.ins().trapz(masked, TRAP_CANNOT_LEAVE);
+    }
+
     fn translate_intrinsic_libcall(
         &mut self,
         vmctx: ir::Value,
@@ -387,7 +493,12 @@ impl<'a> TrampolineCompiler<'a> {
         }
     }
 
-    fn translate_task_return_call(&mut self, results: TypeTupleIndex, options: &CanonicalOptions) {
+    fn translate_task_return_call(
+        &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
+        results: TypeTupleIndex,
+        options: &CanonicalOptions,
+    ) {
         let mem_opts = match &options.data_model {
             CanonicalOptionsDataModel::Gc {} => todo!("CM+GC"),
             CanonicalOptionsDataModel::LinearMemory(opts) => opts,
@@ -395,6 +506,8 @@ impl<'a> TrampolineCompiler<'a> {
 
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
 
         let (values_vec_ptr, values_vec_len) = self.store_wasm_arguments(&args[2..]);
 
@@ -421,14 +534,16 @@ impl<'a> TrampolineCompiler<'a> {
         );
     }
 
-    fn translate_waitable_set_new(&mut self, instance: RuntimeComponentInstanceIndex) {
+    fn translate_waitable_set_new(&mut self, caller_instance: RuntimeComponentInstanceIndex) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
 
         let instance = self
             .builder
             .ins()
-            .iconst(ir::types::I32, i64::from(instance.as_u32()));
+            .iconst(ir::types::I32, i64::from(caller_instance.as_u32()));
 
         self.translate_intrinsic_libcall(
             vmctx,
@@ -438,15 +553,17 @@ impl<'a> TrampolineCompiler<'a> {
         );
     }
 
-    fn translate_waitable_set_drop(&mut self, instance: RuntimeComponentInstanceIndex) {
+    fn translate_waitable_set_drop(&mut self, caller_instance: RuntimeComponentInstanceIndex) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
         let set = args[2];
 
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let instance = self
             .builder
             .ins()
-            .iconst(ir::types::I32, i64::from(instance.as_u32()));
+            .iconst(ir::types::I32, i64::from(caller_instance.as_u32()));
 
         self.translate_intrinsic_libcall(
             vmctx,
@@ -456,16 +573,18 @@ impl<'a> TrampolineCompiler<'a> {
         );
     }
 
-    fn translate_waitable_join(&mut self, instance: RuntimeComponentInstanceIndex) {
+    fn translate_waitable_join(&mut self, caller_instance: RuntimeComponentInstanceIndex) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
         let set = args[2];
         let waitable = args[3];
 
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let instance = self
             .builder
             .ins()
-            .iconst(ir::types::I32, i64::from(instance.as_u32()));
+            .iconst(ir::types::I32, i64::from(caller_instance.as_u32()));
 
         self.translate_intrinsic_libcall(
             vmctx,
@@ -616,6 +735,8 @@ impl<'a> TrampolineCompiler<'a> {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
 
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let mut callee_args = vec![
             vmctx,
             self.builder
@@ -636,6 +757,8 @@ impl<'a> TrampolineCompiler<'a> {
     fn translate_task_cancel_call(&mut self, caller_instance: RuntimeComponentInstanceIndex) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
 
         let callee_args = vec![
             vmctx,
@@ -662,6 +785,8 @@ impl<'a> TrampolineCompiler<'a> {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
 
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let mut callee_args = vec![
             vmctx,
             self.builder
@@ -683,9 +808,15 @@ impl<'a> TrampolineCompiler<'a> {
         );
     }
 
-    fn translate_yield_call(&mut self, async_: bool) {
+    fn translate_yield_call(
+        &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
+        async_: bool,
+    ) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
 
         let callee_args = [
             vmctx,
@@ -705,6 +836,8 @@ impl<'a> TrampolineCompiler<'a> {
     fn translate_subtask_drop_call(&mut self, caller_instance: RuntimeComponentInstanceIndex) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
 
         let mut callee_args = vec![
             vmctx,
@@ -899,9 +1032,15 @@ impl<'a> TrampolineCompiler<'a> {
         self.builder.ins().trap(TRAP_INTERNAL_ASSERT);
     }
 
-    fn translate_resource_new(&mut self, resource: TypeResourceTableIndex) {
+    fn translate_resource_new(
+        &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
+        resource: TypeResourceTableIndex,
+    ) {
         let args = self.abi_load_params();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
 
         // The arguments this shim passes along to the libcall are:
         //
@@ -928,9 +1067,15 @@ impl<'a> TrampolineCompiler<'a> {
         self.abi_store_results(&[result]);
     }
 
-    fn translate_resource_rep(&mut self, resource: TypeResourceTableIndex) {
+    fn translate_resource_rep(
+        &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
+        resource: TypeResourceTableIndex,
+    ) {
         let args = self.abi_load_params();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
 
         // The arguments this shim passes along to the libcall are:
         //
@@ -957,11 +1102,17 @@ impl<'a> TrampolineCompiler<'a> {
         self.abi_store_results(&[result]);
     }
 
-    fn translate_resource_drop(&mut self, resource: TypeResourceTableIndex) {
+    fn translate_resource_drop(
+        &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
+        resource: TypeResourceTableIndex,
+    ) {
         let args = self.abi_load_params();
         let vmctx = args[0];
         let caller_vmctx = args[1];
         let pointer_type = self.isa.pointer_type();
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
 
         // The arguments this shim passes along to the libcall are:
         //
@@ -1171,9 +1322,18 @@ impl<'a> TrampolineCompiler<'a> {
         self.builder.ins().return_(&results);
     }
 
-    fn translate_cancel_call(&mut self, ty: u32, async_: bool, get_libcall: GetLibcallFn) {
+    fn translate_cancel_call(
+        &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
+        ty: u32,
+        async_: bool,
+        get_libcall: GetLibcallFn,
+    ) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let mut callee_args = vec![
             vmctx,
             self.builder.ins().iconst(ir::types::I32, i64::from(ty)),
@@ -1199,6 +1359,9 @@ impl<'a> TrampolineCompiler<'a> {
     ) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let mut callee_args = vec![
             vmctx,
             self.builder
@@ -1298,6 +1461,7 @@ impl<'a> TrampolineCompiler<'a> {
 
     fn translate_future_or_stream_call(
         &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
         tys: &[u32],
         options: Option<&CanonicalOptions>,
         get_libcall: GetLibcallFn,
@@ -1305,6 +1469,9 @@ impl<'a> TrampolineCompiler<'a> {
     ) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let mut callee_args = vec![vmctx];
 
         if let Some(options) = options {
@@ -1338,6 +1505,7 @@ impl<'a> TrampolineCompiler<'a> {
 
     fn translate_flat_stream_call(
         &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
         tys: &[u32],
         options: &CanonicalOptions,
         get_libcall: GetLibcallFn,
@@ -1350,6 +1518,9 @@ impl<'a> TrampolineCompiler<'a> {
 
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let mut callee_args = vec![
             vmctx,
             self.load_memory(vmctx, mem_opts.memory.unwrap()),
@@ -1383,6 +1554,7 @@ impl<'a> TrampolineCompiler<'a> {
 
     fn translate_error_context_call(
         &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
         ty: TypeComponentLocalErrorContextTableIndex,
         options: &CanonicalOptions,
         get_libcall: GetLibcallFn,
@@ -1395,6 +1567,9 @@ impl<'a> TrampolineCompiler<'a> {
 
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let mut callee_args = vec![
             vmctx,
             self.load_memory(vmctx, mem_opts.memory.unwrap()),
@@ -1410,9 +1585,16 @@ impl<'a> TrampolineCompiler<'a> {
         self.translate_intrinsic_libcall(vmctx, get_libcall, &callee_args, sentinel);
     }
 
-    fn translate_error_context_drop_call(&mut self, ty: TypeComponentLocalErrorContextTableIndex) {
+    fn translate_error_context_drop_call(
+        &mut self,
+        caller_instance: RuntimeComponentInstanceIndex,
+        ty: TypeComponentLocalErrorContextTableIndex,
+    ) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let mut callee_args = vec![
             vmctx,
             self.builder
@@ -1547,9 +1729,12 @@ impl<'a> TrampolineCompiler<'a> {
             .call_indirect_host(&mut self.builder, index, host_sig, host_fn, args)
     }
 
-    fn translate_context_get(&mut self, slot: u32) {
+    fn translate_context_get(&mut self, caller_instance: RuntimeComponentInstanceIndex, slot: u32) {
         let args = self.builder.func.dfg.block_params(self.block0).to_vec();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let slot = self.builder.ins().iconst(ir::types::I32, i64::from(slot));
 
         self.translate_intrinsic_libcall(
@@ -1560,9 +1745,12 @@ impl<'a> TrampolineCompiler<'a> {
         );
     }
 
-    fn translate_context_set(&mut self, slot: u32) {
+    fn translate_context_set(&mut self, caller_instance: RuntimeComponentInstanceIndex, slot: u32) {
         let args = self.abi_load_params();
         let vmctx = args[0];
+
+        self.trap_if_may_not_leave(vmctx, caller_instance);
+
         let slot = self.builder.ins().iconst(ir::types::I32, i64::from(slot));
 
         self.translate_intrinsic_libcall(

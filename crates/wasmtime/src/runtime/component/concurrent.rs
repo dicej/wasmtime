@@ -2113,7 +2113,11 @@ impl Instance {
                         )
                     })?;
 
-                    unsafe { flags.set_needs_post_return(false) }
+                    unsafe {
+                        flags.set_needs_post_return(false);
+                        assert!(flags.may_leave());
+                        flags.set_may_leave(false);
+                    }
 
                     if let Some(func) = post_return {
                         let arg = match result_count {
@@ -2141,7 +2145,10 @@ impl Instance {
                         }
                     }
 
-                    unsafe { flags.set_may_enter(true) }
+                    unsafe {
+                        flags.set_may_enter(true);
+                        flags.set_may_leave(true);
+                    }
 
                     instance.task_complete(store, guest_task, result, Status::Returned)?;
                 }
