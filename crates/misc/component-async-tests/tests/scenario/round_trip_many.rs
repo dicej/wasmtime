@@ -415,6 +415,7 @@ async fn test_round_trip_many(
                     unreachable!()
                 };
                 assert_eq!(&make(expected), actual);
+                foo_function.post_return_async(&mut store).await?;
             }
         }
     }
