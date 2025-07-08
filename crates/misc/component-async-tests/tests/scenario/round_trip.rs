@@ -237,6 +237,7 @@ pub async fn test_round_trip(
         let mut store = make_store();
 
         let instance = linker.instantiate_async(&mut store, &component).await?;
+        instance.enable_concurrent_state_debug(&mut store, true);
         let round_trip =
             component_async_tests::round_trip::bindings::RoundTrip::new(&mut store, &instance)?;
 
@@ -258,6 +259,8 @@ pub async fn test_round_trip(
             {
                 assert_eq!(expected, actual);
             }
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
 
         if call_style == 1 || !cfg!(miri) {
@@ -294,6 +297,8 @@ pub async fn test_round_trip(
                     }
                 })
                 .await??;
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
 
         if call_style == 2 || !cfg!(miri) {
@@ -352,6 +357,8 @@ pub async fn test_round_trip(
             );
 
             instance.run(&mut store, rx).await??;
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
 
         if call_style == 3 || !cfg!(miri) {
@@ -370,6 +377,8 @@ pub async fn test_round_trip(
                         .await?
                 );
             }
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
     }
 
@@ -425,6 +434,8 @@ pub async fn test_round_trip(
                 };
                 assert_eq!(expected, actual);
             }
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
 
         if call_style == 5 || !cfg!(miri) {
@@ -444,6 +455,8 @@ pub async fn test_round_trip(
                 assert_eq!(*expected, actual);
                 foo_function.post_return_async(&mut store).await?;
             }
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
     }
 

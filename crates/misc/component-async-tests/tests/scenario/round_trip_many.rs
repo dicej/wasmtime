@@ -245,6 +245,7 @@ async fn test_round_trip_many(
         let mut store = make_store();
 
         let instance = linker.instantiate_async(&mut store, &component).await?;
+        instance.enable_concurrent_state_debug(&mut store, true);
         let round_trip_many = component_async_tests::round_trip_many::bindings::RoundTripMany::new(
             &mut store, &instance,
         )?;
@@ -279,22 +280,24 @@ async fn test_round_trip_many(
                     actual
                 );
             }
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
 
         if call_style == 1 {
             // Now do it again using `TypedFunc::call_async`-based bindings:
             let e = component_async_tests::round_trip_many::non_concurrent_export_bindings::exports::local::local::many::Stuff {
-        a: vec![42i32; 42],
-        b: true,
-        c: 424242,
-    };
+                a: vec![42i32; 42],
+                b: true,
+                c: 424242,
+            };
             let f = Some(e.clone());
             let g = Err(());
 
             let round_trip_many = component_async_tests::round_trip_many::non_concurrent_export_bindings::RoundTripMany::instantiate_async(
-            &mut store, &component, &linker,
-        )
-        .await?;
+                &mut store, &component, &linker,
+            )
+                .await?;
 
             for (input, expected) in inputs_and_outputs {
                 assert_eq!(
@@ -322,6 +325,8 @@ async fn test_round_trip_many(
                         .await?
                 );
             }
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
     }
 
@@ -402,6 +407,8 @@ async fn test_round_trip_many(
                 };
                 assert_eq!(make(&expected), actual);
             }
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
 
         if call_style == 3 {
@@ -417,6 +424,8 @@ async fn test_round_trip_many(
                 assert_eq!(&make(expected), actual);
                 foo_function.post_return_async(&mut store).await?;
             }
+
+            instance.assert_concurrent_state_empty(&mut store);
         }
     }
 
