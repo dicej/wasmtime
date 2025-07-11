@@ -356,26 +356,22 @@ const _: () = {
             >(linker, host_getter)?;
             Ok(())
         }
-        pub fn call_some_world_func2<S: wasmtime::AsContextMut>(
+        pub async fn call_some_world_func2<_T: Send, _D: wasmtime::component::HasData>(
             &self,
-            mut store: S,
-        ) -> impl wasmtime::component::__internal::Future<
-            Output = wasmtime::Result<wasmtime::component::Resource<WorldResource>>,
-        > + Send + 'static + use<S>
-        where
-            <S as wasmtime::AsContext>::Data: Send + 'static,
-        {
+            accessor: &wasmtime::component::Accessor<_T, _D>,
+        ) -> wasmtime::Result<wasmtime::component::Resource<WorldResource>> {
             let callee = unsafe {
                 wasmtime::component::TypedFunc::<
                     (),
                     (wasmtime::component::Resource<WorldResource>,),
                 >::new_unchecked(self.some_world_func2)
             };
-            let future = callee.call_concurrent(store.as_context_mut(), ());
+            let future = callee.call_concurrent(accessor, ());
             async move {
                 let (ret0,) = future.await?;
                 Ok(ret0)
             }
+                .await
         }
         pub fn foo_foo_uses_resource_transitively(
             &self,
@@ -1196,23 +1192,18 @@ pub mod exports {
                     }
                 }
                 impl Guest {
-                    pub fn call_handle<S: wasmtime::AsContextMut>(
+                    pub async fn call_handle<_T: Send, _D: wasmtime::component::HasData>(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: wasmtime::component::Resource<Foo>,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<()>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<()> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (wasmtime::component::Resource<Foo>,),
                                 (),
                             >::new_unchecked(self.handle)
                         };
-                        callee.call_concurrent(store.as_context_mut(), (arg0,))
+                        callee.call_concurrent(accessor, (arg0,)).await
                     }
                 }
             }

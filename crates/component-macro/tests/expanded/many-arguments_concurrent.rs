@@ -565,9 +565,12 @@ pub mod exports {
                     }
                 }
                 impl Guest {
-                    pub fn call_many_args<S: wasmtime::AsContextMut>(
+                    pub async fn call_many_args<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: u64,
                         arg1: u64,
                         arg2: u64,
@@ -584,12 +587,7 @@ pub mod exports {
                         arg13: u64,
                         arg14: u64,
                         arg15: u64,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<()>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<()> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (
@@ -615,7 +613,7 @@ pub mod exports {
                         };
                         callee
                             .call_concurrent(
-                                store.as_context_mut(),
+                                accessor,
                                 (
                                     arg0,
                                     arg1,
@@ -635,24 +633,23 @@ pub mod exports {
                                     arg15,
                                 ),
                             )
+                            .await
                     }
-                    pub fn call_big_argument<S: wasmtime::AsContextMut>(
+                    pub async fn call_big_argument<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: BigStruct,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<()>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<()> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (BigStruct,),
                                 (),
                             >::new_unchecked(self.big_argument)
                         };
-                        callee.call_concurrent(store.as_context_mut(), (arg0,))
+                        callee.call_concurrent(accessor, (arg0,)).await
                     }
                 }
             }

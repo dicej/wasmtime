@@ -308,45 +308,42 @@ pub mod exports {
                 }
                 impl Guest {
                     /// A function that accepts a character
-                    pub fn call_take_char<S: wasmtime::AsContextMut>(
+                    pub async fn call_take_char<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: char,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<()>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<()> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (char,),
                                 (),
                             >::new_unchecked(self.take_char)
                         };
-                        callee.call_concurrent(store.as_context_mut(), (arg0,))
+                        callee.call_concurrent(accessor, (arg0,)).await
                     }
                     /// A function that returns a character
-                    pub fn call_return_char<S: wasmtime::AsContextMut>(
+                    pub async fn call_return_char<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<char>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
+                    ) -> wasmtime::Result<char> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (),
                                 (char,),
                             >::new_unchecked(self.return_char)
                         };
-                        let future = callee.call_concurrent(store.as_context_mut(), ());
+                        let future = callee.call_concurrent(accessor, ());
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
                 }
             }

@@ -909,223 +909,206 @@ pub mod exports {
                     }
                 }
                 impl Guest {
-                    pub fn call_tuple_arg<S: wasmtime::AsContextMut>(
+                    pub async fn call_tuple_arg<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: (char, u32),
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<()>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<()> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 ((char, u32),),
                                 (),
                             >::new_unchecked(self.tuple_arg)
                         };
-                        callee.call_concurrent(store.as_context_mut(), (arg0,))
+                        callee.call_concurrent(accessor, (arg0,)).await
                     }
-                    pub fn call_tuple_result<S: wasmtime::AsContextMut>(
+                    pub async fn call_tuple_result<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<(char, u32)>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
+                    ) -> wasmtime::Result<(char, u32)> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (),
                                 ((char, u32),),
                             >::new_unchecked(self.tuple_result)
                         };
-                        let future = callee.call_concurrent(store.as_context_mut(), ());
+                        let future = callee.call_concurrent(accessor, ());
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_empty_arg<S: wasmtime::AsContextMut>(
+                    pub async fn call_empty_arg<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Empty,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<()>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<()> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Empty,),
                                 (),
                             >::new_unchecked(self.empty_arg)
                         };
-                        callee.call_concurrent(store.as_context_mut(), (arg0,))
+                        callee.call_concurrent(accessor, (arg0,)).await
                     }
-                    pub fn call_empty_result<S: wasmtime::AsContextMut>(
+                    pub async fn call_empty_result<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Empty>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
+                    ) -> wasmtime::Result<Empty> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (),
                                 (Empty,),
                             >::new_unchecked(self.empty_result)
                         };
-                        let future = callee.call_concurrent(store.as_context_mut(), ());
+                        let future = callee.call_concurrent(accessor, ());
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_scalar_arg<S: wasmtime::AsContextMut>(
+                    pub async fn call_scalar_arg<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Scalars,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<()>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<()> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Scalars,),
                                 (),
                             >::new_unchecked(self.scalar_arg)
                         };
-                        callee.call_concurrent(store.as_context_mut(), (arg0,))
+                        callee.call_concurrent(accessor, (arg0,)).await
                     }
-                    pub fn call_scalar_result<S: wasmtime::AsContextMut>(
+                    pub async fn call_scalar_result<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Scalars>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
+                    ) -> wasmtime::Result<Scalars> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (),
                                 (Scalars,),
                             >::new_unchecked(self.scalar_result)
                         };
-                        let future = callee.call_concurrent(store.as_context_mut(), ());
+                        let future = callee.call_concurrent(accessor, ());
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_flags_arg<S: wasmtime::AsContextMut>(
+                    pub async fn call_flags_arg<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: ReallyFlags,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<()>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<()> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (ReallyFlags,),
                                 (),
                             >::new_unchecked(self.flags_arg)
                         };
-                        callee.call_concurrent(store.as_context_mut(), (arg0,))
+                        callee.call_concurrent(accessor, (arg0,)).await
                     }
-                    pub fn call_flags_result<S: wasmtime::AsContextMut>(
+                    pub async fn call_flags_result<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<ReallyFlags>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
+                    ) -> wasmtime::Result<ReallyFlags> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (),
                                 (ReallyFlags,),
                             >::new_unchecked(self.flags_result)
                         };
-                        let future = callee.call_concurrent(store.as_context_mut(), ());
+                        let future = callee.call_concurrent(accessor, ());
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_aggregate_arg<S: wasmtime::AsContextMut>(
+                    pub async fn call_aggregate_arg<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Aggregates,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<()>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<()> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Aggregates,),
                                 (),
                             >::new_unchecked(self.aggregate_arg)
                         };
-                        callee.call_concurrent(store.as_context_mut(), (arg0,))
+                        callee.call_concurrent(accessor, (arg0,)).await
                     }
-                    pub fn call_aggregate_result<S: wasmtime::AsContextMut>(
+                    pub async fn call_aggregate_result<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Aggregates>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
+                    ) -> wasmtime::Result<Aggregates> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (),
                                 (Aggregates,),
                             >::new_unchecked(self.aggregate_result)
                         };
-                        let future = callee.call_concurrent(store.as_context_mut(), ());
+                        let future = callee.call_concurrent(accessor, ());
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_typedef_inout<S: wasmtime::AsContextMut>(
+                    pub async fn call_typedef_inout<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: TupleTypedef2,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<i32>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<i32> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (TupleTypedef2,),
                                 (i32,),
                             >::new_unchecked(self.typedef_inout)
                         };
-                        let future = callee
-                            .call_concurrent(store.as_context_mut(), (arg0,));
+                        let future = callee.call_concurrent(accessor, (arg0,));
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
                 }
             }

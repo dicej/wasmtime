@@ -202,7 +202,7 @@ const START_FLAG_ASYNC_CALLEE: u32 = fact::START_FLAG_ASYNC_CALLEE as u32;
 ///
 /// See [`Accessor::with`] for details.
 pub struct Access<'a, T: 'static, D: HasData = HasSelf<T>> {
-    accessor: &'a mut Accessor<T, D>,
+    accessor: &'a Accessor<T, D>,
     store: StoreContextMut<'a, T>,
 }
 
@@ -390,7 +390,7 @@ where
     /// cannot borrow from the store or its associated data.  If you need shared
     /// access to something in the store data, it must be cloned (using
     /// e.g. `Arc::clone` if appropriate).
-    pub fn with<R: 'static>(&mut self, fun: impl FnOnce(Access<'_, T, D>) -> R) -> R {
+    pub fn with<R: 'static>(&self, fun: impl FnOnce(Access<'_, T, D>) -> R) -> R {
         tls::get(|vmstore| {
             fun(Access {
                 store: self.token.as_context_mut(vmstore),

@@ -269,15 +269,21 @@ pub async fn test_run_with_count(components: &[&str], count: usize) -> Result<()
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let yield_host = super::yield_host::bindings::YieldHost::new(&mut store, &instance)?;
 
-    // Start `count` concurrent calls and then join them all:
-    let mut futures = FuturesUnordered::new();
-    for _ in 0..count {
-        futures.push(yield_host.local_local_run().call_run(&mut store));
-    }
+    instance
+        .run_with(&mut store, move |accessor| {
+            Box::pin(async move {
+                // Start `count` concurrent calls and then join them all:
+                let mut futures = FuturesUnordered::new();
+                for _ in 0..count {
+                    futures.push(yield_host.local_local_run().call_run(accessor));
+                }
 
-    while let Some(()) = instance.run(&mut store, futures.try_next()).await?? {
-        // continue
-    }
+                while let Some(()) = futures.try_next().await? {
+                    // continue
+                }
 
-    Ok(())
+                anyhow::Ok(())
+            })
+        })
+        .await?
 }

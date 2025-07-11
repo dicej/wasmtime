@@ -2728,7 +2728,7 @@ impl<'a> InterfaceGenerator<'a> {
         let (async_, async__, await_, concurrent) = match &style {
             CallStyle::Async | CallStyle::Concurrent => {
                 if self.generator.opts.concurrent_exports {
-                    ("", "INVALID", "INVALID", true)
+                    ("async", "_async", ".await", true)
                 } else {
                     ("async", "_async", ".await", false)
                 }
@@ -2739,11 +2739,19 @@ impl<'a> InterfaceGenerator<'a> {
         self.rustdoc(&func.docs);
         let wt = self.generator.wasmtime_path();
 
-        uwrite!(
-            self.src,
-            "pub {async_} fn call_{}<S: {wt}::AsContextMut>(&self, mut store: S, ",
-            func.item_name().to_snake_case(),
-        );
+        if concurrent {
+            uwrite!(
+                self.src,
+                "pub {async_} fn call_{}<_T: Send, _D: {wt}::component::HasData>(&self, accessor: &{wt}::component::Accessor<_T, _D>, ",
+                func.item_name().to_snake_case(),
+            );
+        } else {
+            uwrite!(
+                self.src,
+                "pub {async_} fn call_{}<S: {wt}::AsContextMut>(&self, mut store: S, ",
+                func.item_name().to_snake_case(),
+            );
+        }
 
         let param_mode = if let CallStyle::Concurrent = &style {
             TypeMode::Owned
@@ -2757,30 +2765,15 @@ impl<'a> InterfaceGenerator<'a> {
             self.push_str(",");
         }
 
-        if concurrent {
-            uwrite!(
-                self.src,
-                ") -> impl {wt}::component::__internal::Future<Output = {wt}::Result<"
-            );
-        } else {
-            uwrite!(self.src, ") -> {wt}::Result<");
-        }
+        uwrite!(self.src, ") -> {wt}::Result<");
         self.print_result_ty(func.result, TypeMode::Owned);
-        if concurrent {
-            uwrite!(self.src, ">> + Send + 'static + use<S>");
-        } else {
-            uwrite!(self.src, ">");
-        }
+        uwrite!(self.src, ">");
 
         match style {
-            CallStyle::Concurrent => {
-                uwrite!(
-                    self.src,
-                    " where <S as {wt}::AsContext>::Data: Send + 'static",
-                );
-            }
-            CallStyle::Async => {
-                uwrite!(self.src, " where <S as {wt}::AsContext>::Data: Send");
+            CallStyle::Concurrent | CallStyle::Async => {
+                if !concurrent {
+                    uwrite!(self.src, " where <S as {wt}::AsContext>::Data: Send");
+                }
             }
             CallStyle::Sync => {}
         }
@@ -2839,7 +2832,7 @@ impl<'a> InterfaceGenerator<'a> {
             if func.result.is_some() {
                 uwrite!(self.src, "let future =");
             }
-            uwrite!(self.src, "callee.call_concurrent(store.as_context_mut(), (");
+            uwrite!(self.src, "callee.call_concurrent(accessor, (");
             for (i, _) in func.params.iter().enumerate() {
                 uwrite!(self.src, "arg{i}, ");
             }
@@ -2853,8 +2846,10 @@ impl<'a> InterfaceGenerator<'a> {
 async move {{
     let (ret0,) = future.await?;
     Ok(ret0)
-}}"
+}}.await"
                 );
+            } else {
+                self.src.push_str(".await");
             }
         } else {
             self.src.push_str("let (");

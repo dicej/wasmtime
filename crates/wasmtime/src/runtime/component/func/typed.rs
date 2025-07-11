@@ -17,7 +17,9 @@ use wasmtime_environ::component::{
 };
 
 #[cfg(feature = "component-model-async")]
-use crate::component::concurrent::{self, PreparedCall};
+use crate::component::HasData;
+#[cfg(feature = "component-model-async")]
+use crate::component::concurrent::{self, Accessor, PreparedCall};
 #[cfg(feature = "component-model-async")]
 use core::future::Future;
 #[cfg(feature = "component-model-async")]
@@ -270,7 +272,22 @@ where
     // implicitly does so. In a future version of Rust maybe this limitation
     // will be lifted? Maybe rust-lang/rust#130043. Unsure.
     #[cfg(feature = "component-model-async")]
-    pub fn call_concurrent(
+    pub async fn call_concurrent<T: Send, D: HasData>(
+        self,
+        accessor: &Accessor<T, D>,
+        params: Params,
+    ) -> Result<Return>
+    where
+        Params: 'static,
+        Return: 'static,
+    {
+        accessor
+            .with(move |access| self.call_concurrent_(access, params))
+            .await
+    }
+
+    #[cfg(feature = "component-model-async")]
+    fn call_concurrent_(
         self,
         mut store: impl AsContextMut<Data: Send>,
         params: Params,

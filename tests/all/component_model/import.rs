@@ -833,8 +833,11 @@ async fn test_stack_and_heap_args_and_rets(concurrent: bool) -> Result<()> {
     let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
 
     if concurrent {
-        let call = run.call_concurrent(&mut store, ());
-        instance.run(&mut store, call).await??;
+        instance
+            .run_with(&mut store, move |accessor| {
+                Box::pin(run.call_concurrent(accessor, ()))
+            })
+            .await??;
     } else {
         run.call_async(&mut store, ()).await?;
     }

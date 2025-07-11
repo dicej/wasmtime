@@ -65,15 +65,27 @@ async fn test_round_trip_direct(
             &mut store, &instance,
         )?;
 
-        // Start three concurrent calls and then join them all:
-        let mut futures = FuturesUnordered::new();
-        for _ in 0..3 {
-            futures.push(round_trip.call_foo(&mut store, input.to_owned()));
-        }
+        instance
+            .run_with(&mut store, {
+                let input = input.to_owned();
+                let expected_output = expected_output.to_owned();
+                move |accessor| {
+                    Box::pin(async move {
+                        // Start three concurrent calls and then join them all:
+                        let mut futures = FuturesUnordered::new();
+                        for _ in 0..3 {
+                            futures.push(round_trip.call_foo(accessor, input.clone()));
+                        }
 
-        while let Some(value) = instance.run(&mut store, futures.try_next()).await?? {
-            assert_eq!(expected_output, &value);
-        }
+                        while let Some(value) = futures.try_next().await? {
+                            assert_eq!(expected_output, value);
+                        }
+
+                        anyhow::Ok(())
+                    })
+                }
+            })
+            .await??;
     }
 
     // Now do it again using the dynamic API (except for WASI, where we stick with the static API):

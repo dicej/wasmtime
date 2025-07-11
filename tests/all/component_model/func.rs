@@ -919,10 +919,13 @@ async fn async_reentrance() -> Result<()> {
         .instantiate_async(&mut store, &component)
         .await?;
     let func = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "export")?;
-    let call = func.call_concurrent(&mut store, (42,));
-
     let message = "cannot enter component instance";
-    match instance.run(&mut store, call).await {
+    match instance
+        .run_with(&mut store, move |accessor| {
+            Box::pin(func.call_concurrent(accessor, (42,)))
+        })
+        .await
+    {
         Ok(_) => panic!(),
         Err(e) => assert!(
             format!("{e:?}").contains(message),
@@ -1047,9 +1050,12 @@ async fn task_return_trap(component: &str, substring: &str) -> Result<()> {
         .await?;
 
     let func = instance.get_typed_func::<(), ()>(&mut store, "foo")?;
-    let call = func.call_concurrent(&mut store, ());
-
-    match instance.run(&mut store, call).await {
+    match instance
+        .run_with(&mut store, move |accessor| {
+            Box::pin(func.call_concurrent(accessor, ()))
+        })
+        .await
+    {
         Ok(_) => panic!(),
         Err(e) => {
             assert!(
@@ -1285,8 +1291,12 @@ async fn test_many_parameters(dynamic: bool, concurrent: bool) -> Result<()> {
         ), ((Vec<u8>, u32),)>(&mut store, "many-param")?;
 
         if concurrent {
-            let call = func.call_concurrent(&mut store, input);
-            instance.run(&mut store, call).await??.0
+            instance
+                .run_with(&mut store, move |accessor| {
+                    Box::pin(func.call_concurrent(accessor, input))
+                })
+                .await??
+                .0
         } else {
             func.call_async(&mut store, input).await?.0
         }
@@ -1756,8 +1766,12 @@ async fn test_many_results(dynamic: bool, concurrent: bool) -> Result<()> {
         ),)>(&mut store, "many-results")?;
 
         if concurrent {
-            let call = func.call_concurrent(&mut store, ());
-            instance.run(&mut store, call).await??.0
+            instance
+                .run_with(&mut store, move |accessor| {
+                    Box::pin(func.call_concurrent(accessor, ()))
+                })
+                .await??
+                .0
         } else {
             func.call_async(&mut store, ()).await?.0
         }

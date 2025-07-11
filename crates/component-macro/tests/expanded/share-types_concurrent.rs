@@ -352,27 +352,23 @@ pub mod exports {
             }
         }
         impl Guest {
-            pub fn call_handle_request<S: wasmtime::AsContextMut>(
+            pub async fn call_handle_request<_T: Send, _D: wasmtime::component::HasData>(
                 &self,
-                mut store: S,
+                accessor: &wasmtime::component::Accessor<_T, _D>,
                 arg0: Request,
-            ) -> impl wasmtime::component::__internal::Future<
-                Output = wasmtime::Result<Response>,
-            > + Send + 'static + use<S>
-            where
-                <S as wasmtime::AsContext>::Data: Send + 'static,
-            {
+            ) -> wasmtime::Result<Response> {
                 let callee = unsafe {
                     wasmtime::component::TypedFunc::<
                         (Request,),
                         (Response,),
                     >::new_unchecked(self.handle_request)
                 };
-                let future = callee.call_concurrent(store.as_context_mut(), (arg0,));
+                let future = callee.call_concurrent(accessor, (arg0,));
                 async move {
                     let (ret0,) = future.await?;
                     Ok(ret0)
                 }
+                    .await
             }
         }
     }

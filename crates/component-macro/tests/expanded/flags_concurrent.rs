@@ -755,166 +755,152 @@ pub mod exports {
                     }
                 }
                 impl Guest {
-                    pub fn call_roundtrip_flag1<S: wasmtime::AsContextMut>(
+                    pub async fn call_roundtrip_flag1<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Flag1,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Flag1>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<Flag1> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Flag1,),
                                 (Flag1,),
                             >::new_unchecked(self.roundtrip_flag1)
                         };
-                        let future = callee
-                            .call_concurrent(store.as_context_mut(), (arg0,));
+                        let future = callee.call_concurrent(accessor, (arg0,));
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_roundtrip_flag2<S: wasmtime::AsContextMut>(
+                    pub async fn call_roundtrip_flag2<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Flag2,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Flag2>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<Flag2> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Flag2,),
                                 (Flag2,),
                             >::new_unchecked(self.roundtrip_flag2)
                         };
-                        let future = callee
-                            .call_concurrent(store.as_context_mut(), (arg0,));
+                        let future = callee.call_concurrent(accessor, (arg0,));
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_roundtrip_flag4<S: wasmtime::AsContextMut>(
+                    pub async fn call_roundtrip_flag4<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Flag4,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Flag4>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<Flag4> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Flag4,),
                                 (Flag4,),
                             >::new_unchecked(self.roundtrip_flag4)
                         };
-                        let future = callee
-                            .call_concurrent(store.as_context_mut(), (arg0,));
+                        let future = callee.call_concurrent(accessor, (arg0,));
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_roundtrip_flag8<S: wasmtime::AsContextMut>(
+                    pub async fn call_roundtrip_flag8<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Flag8,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Flag8>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<Flag8> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Flag8,),
                                 (Flag8,),
                             >::new_unchecked(self.roundtrip_flag8)
                         };
-                        let future = callee
-                            .call_concurrent(store.as_context_mut(), (arg0,));
+                        let future = callee.call_concurrent(accessor, (arg0,));
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_roundtrip_flag16<S: wasmtime::AsContextMut>(
+                    pub async fn call_roundtrip_flag16<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Flag16,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Flag16>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<Flag16> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Flag16,),
                                 (Flag16,),
                             >::new_unchecked(self.roundtrip_flag16)
                         };
-                        let future = callee
-                            .call_concurrent(store.as_context_mut(), (arg0,));
+                        let future = callee.call_concurrent(accessor, (arg0,));
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_roundtrip_flag32<S: wasmtime::AsContextMut>(
+                    pub async fn call_roundtrip_flag32<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Flag32,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Flag32>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<Flag32> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Flag32,),
                                 (Flag32,),
                             >::new_unchecked(self.roundtrip_flag32)
                         };
-                        let future = callee
-                            .call_concurrent(store.as_context_mut(), (arg0,));
+                        let future = callee.call_concurrent(accessor, (arg0,));
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
-                    pub fn call_roundtrip_flag64<S: wasmtime::AsContextMut>(
+                    pub async fn call_roundtrip_flag64<
+                        _T: Send,
+                        _D: wasmtime::component::HasData,
+                    >(
                         &self,
-                        mut store: S,
+                        accessor: &wasmtime::component::Accessor<_T, _D>,
                         arg0: Flag64,
-                    ) -> impl wasmtime::component::__internal::Future<
-                        Output = wasmtime::Result<Flag64>,
-                    > + Send + 'static + use<S>
-                    where
-                        <S as wasmtime::AsContext>::Data: Send + 'static,
-                    {
+                    ) -> wasmtime::Result<Flag64> {
                         let callee = unsafe {
                             wasmtime::component::TypedFunc::<
                                 (Flag64,),
                                 (Flag64,),
                             >::new_unchecked(self.roundtrip_flag64)
                         };
-                        let future = callee
-                            .call_concurrent(store.as_context_mut(), (arg0,));
+                        let future = callee.call_concurrent(accessor, (arg0,));
                         async move {
                             let (ret0,) = future.await?;
                             Ok(ret0)
                         }
+                            .await
                     }
                 }
             }
