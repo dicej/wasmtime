@@ -18,7 +18,6 @@ use wasmtime::{Engine, Store, StoreLimits, UpdateDeadline};
 use wasmtime_wasi::p2::{IoView, StreamError, StreamResult, WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::bindings as p2;
 use wasmtime_wasi_http::io::TokioIo;
-use wasmtime_wasi_http::p3::bindings as p3;
 use wasmtime_wasi_http::{
     DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS, DEFAULT_OUTGOING_BODY_CHUNK_SIZE, WasiHttpCtx,
     WasiHttpView,
@@ -30,6 +29,295 @@ use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
 use wasmtime_wasi_keyvalue::{WasiKeyValue, WasiKeyValueCtx, WasiKeyValueCtxBuilder};
 #[cfg(feature = "wasi-nn")]
 use wasmtime_wasi_nn::wit::WasiNnCtx;
+
+mod draft {
+    use {
+        super::*,
+        bytes::BytesMut,
+        exports::wasi::http::handler::Guest,
+        futures::{
+            FutureExt, SinkExt, TryStreamExt,
+            channel::{mpsc, oneshot},
+            stream::FuturesUnordered,
+        },
+        http_body_util::StreamBody,
+        hyper::body::Frame,
+        std::{io::Cursor, pin::Pin},
+        wasi::http::types,
+        wasmtime::component::{
+            Accessor, FutureReader, FutureWriter, Resource, StreamReader, StreamWriter,
+        },
+    };
+
+    wasmtime::component::bindgen!({
+        path: "crates/wasi-http/src/p3/wit",
+        interfaces: "
+          export wasi:http/handler@0.3.0-draft;
+        ",
+        concurrent_imports: true,
+        concurrent_exports: true,
+        async: {
+            only_imports: []
+        },
+        with: {
+            "wasi:http/types": wasi_http_draft::wasi::http::types,
+        }
+    });
+
+    enum Event {
+        RequestBodyWrite(
+            BoxBody<Bytes, anyhow::Error>,
+            Option<StreamWriter<Cursor<Bytes>>>,
+            FutureWriter<Result<Option<Resource<types::Fields>>, types::ErrorCode>>,
+        ),
+        RequestTrailersWrite,
+        Response(Result<Resource<types::Response>, types::ErrorCode>),
+        ResponseBodyRead(
+            Option<StreamReader<BytesMut>>,
+            BytesMut,
+            mpsc::Sender<Result<Frame<Bytes>, anyhow::Error>>,
+            FutureReader<Result<Option<Resource<types::Fields>>, types::ErrorCode>>,
+        ),
+        ResponseTrailersRead(
+            Option<Result<Option<Resource<types::Fields>>, types::ErrorCode>>,
+            mpsc::Sender<Result<Frame<Bytes>, anyhow::Error>>,
+        ),
+    }
+
+    pub async fn handle(
+        mut store: Store<Host>,
+        proxy: Guest,
+        instance: Instance,
+        request: Request,
+    ) -> Result<hyper::Response<BoxBody<Bytes, anyhow::Error>>> {
+        let (request_body_tx, request_body_rx) = instance.stream(&mut store)?;
+        let (request_trailers_tx, request_trailers_rx) =
+            instance.future(|| Ok(None), &mut store)?;
+
+        let my_request = store.data_mut().table().push(types::Request {
+            method: match request.method() {
+                &hyper::Method::GET => types::Method::Get,
+                &hyper::Method::POST => types::Method::Post,
+                &hyper::Method::PUT => types::Method::Put,
+                &hyper::Method::DELETE => types::Method::Delete,
+                &hyper::Method::PATCH => types::Method::Patch,
+                &hyper::Method::HEAD => types::Method::Head,
+                &hyper::Method::OPTIONS => types::Method::Options,
+                method => types::Method::Other(method.as_str().into()),
+            },
+            scheme: request.uri().scheme().map(|scheme| match scheme.as_str() {
+                "http" => types::Scheme::Http,
+                "https" => types::Scheme::Https,
+                _ => types::Scheme::Other(scheme.as_str().into()),
+            }),
+            path_with_query: request.uri().path_and_query().map(|p| p.as_str().into()),
+            authority: request.uri().authority().map(|a| a.as_str().into()),
+            headers: types::Fields(
+                request
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().into(), v.as_bytes().into()))
+                    .collect(),
+            ),
+            contents: Some(request_body_rx),
+            trailers: request_trailers_rx,
+            options: None,
+        })?;
+
+        let (response_tx, response_rx) = oneshot::channel();
+
+        tokio::task::spawn(async move {
+            instance
+                .run_with(&mut store, async move |accessor| {
+                    let mut response_tx = Some(response_tx);
+
+                    let result = async {
+                        let mut futures = FuturesUnordered::new();
+
+                        read(
+                            accessor,
+                            &mut futures,
+                            request.into_body().map_err(|e| e.into()).boxed(),
+                            request_body_tx,
+                            request_trailers_tx,
+                        )
+                        .await?;
+
+                        futures.push(
+                            proxy
+                                .call_handle(accessor, my_request)
+                                .map(|v| v.map(Event::Response))
+                                .boxed(),
+                        );
+
+                        poll(accessor, &mut futures, &mut response_tx).await
+                    }
+                    .await;
+
+                    if let (Some(response_tx), Err(e)) = (response_tx.take(), result) {
+                        _ = response_tx.send(Err(e));
+                    }
+                })
+                .await
+        });
+
+        response_rx
+            .await
+            .map_err(|_| anyhow!("no response received from handler"))?
+    }
+
+    async fn read<'a>(
+        accessor: &'a Accessor<Host>,
+        futures: &mut FuturesUnordered<Pin<Box<dyn Future<Output = Result<Event>> + Send + 'a>>>,
+        mut body: BoxBody<Bytes, anyhow::Error>,
+        body_tx: StreamWriter<Cursor<Bytes>>,
+        trailers_tx: FutureWriter<Result<Option<Resource<types::Fields>>, types::ErrorCode>>,
+    ) -> Result<()> {
+        if let Some(frame) = body.frame().await {
+            match frame?.into_data() {
+                Ok(chunk) => futures.push(
+                    body_tx
+                        .write_all(accessor, Cursor::new(chunk))
+                        .map(move |(tx, _)| Ok(Event::RequestBodyWrite(body, tx, trailers_tx)))
+                        .boxed(),
+                ),
+
+                Err(frame) => match frame.into_trailers() {
+                    Ok(trailers) => {
+                        drop(body_tx);
+
+                        let trailers = accessor.with(|mut access| {
+                            access.get().table().push(types::Fields(
+                                trailers
+                                    .iter()
+                                    .map(|(k, v)| (k.as_str().into(), v.as_bytes().into()))
+                                    .collect(),
+                            ))
+                        })?;
+
+                        futures.push(
+                            trailers_tx
+                                .write(accessor, Ok(Some(trailers)))
+                                .map(|_| Ok(Event::RequestTrailersWrite))
+                                .boxed(),
+                        )
+                    }
+                    Err(_) => unreachable!(),
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn poll<'a>(
+        accessor: &'a Accessor<Host>,
+        futures: &mut FuturesUnordered<Pin<Box<dyn Future<Output = Result<Event>> + Send + 'a>>>,
+        response_tx: &mut Option<
+            oneshot::Sender<Result<hyper::Response<BoxBody<Bytes, anyhow::Error>>>>,
+        >,
+    ) -> Result<()> {
+        while let Some(event) = futures.try_next().await? {
+            match event {
+                Event::RequestBodyWrite(body, body_tx, trailers_tx) => {
+                    read(
+                        accessor,
+                        futures,
+                        body,
+                        body_tx
+                            .ok_or_else(|| anyhow!("request body reader closed unexpectedly"))?,
+                        trailers_tx,
+                    )
+                    .await?;
+                }
+                Event::RequestTrailersWrite => {}
+                Event::Response(response) => {
+                    let response = response?;
+                    let response =
+                        accessor.with(|mut access| access.get().table().delete(response))?;
+
+                    let (response_body_tx, response_body_rx) = mpsc::channel(1);
+
+                    let trailers = response.trailers;
+
+                    if let Some(body) = response.contents {
+                        futures.push(
+                            body.read(accessor, BytesMut::with_capacity(4096))
+                                .map(move |(rx, buffer)| {
+                                    Ok(Event::ResponseBodyRead(
+                                        rx,
+                                        buffer,
+                                        response_body_tx,
+                                        trailers,
+                                    ))
+                                })
+                                .boxed(),
+                        );
+                    } else {
+                        futures.push(
+                            trailers
+                                .read(accessor)
+                                .map(|value| {
+                                    Ok(Event::ResponseTrailersRead(value, response_body_tx))
+                                })
+                                .boxed(),
+                        );
+                    }
+
+                    let mut builder = hyper::Response::builder().status(response.status_code);
+                    for (k, v) in response.headers.0 {
+                        builder = builder.header(k, v);
+                    }
+                    _ = response_tx.take().unwrap().send(Ok(
+                        builder.body(BoxBody::new(StreamBody::new(response_body_rx)))?
+                    ));
+                }
+                Event::ResponseBodyRead(rx, mut buffer, mut body_tx, trailers) => {
+                    let chunk = buffer.split();
+                    if !chunk.is_empty() {
+                        body_tx.send(Ok(Frame::data(chunk.freeze()))).await?;
+                    }
+
+                    if let Some(rx) = rx {
+                        buffer.reserve(4096);
+                        futures.push(
+                            rx.read(accessor, buffer)
+                                .map(move |(rx, buffer)| {
+                                    Ok(Event::ResponseBodyRead(rx, buffer, body_tx, trailers))
+                                })
+                                .boxed(),
+                        );
+                    } else {
+                        futures.push(
+                            trailers
+                                .read(accessor)
+                                .map(|value| Ok(Event::ResponseTrailersRead(value, body_tx)))
+                                .boxed(),
+                        );
+                    }
+                }
+                Event::ResponseTrailersRead(trailers, mut body_tx) => {
+                    if let Ok(Some(trailers)) = trailers.unwrap() {
+                        body_tx
+                            .send(Ok(Frame::trailers(accessor.with(|mut access| {
+                                access
+                                    .get()
+                                    .table()
+                                    .delete(trailers)?
+                                    .0
+                                    .into_iter()
+                                    .map(|(k, v)| Ok((k.try_into()?, v.try_into()?)))
+                                    .collect::<Result<_>>()
+                            })?)))
+                            .await?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
 
 struct Host {
     table: wasmtime::component::ResourceTable,
@@ -84,6 +372,28 @@ impl WasiHttpView for Host {
     fn outgoing_body_chunk_size(&mut self) -> usize {
         self.http_outgoing_body_chunk_size
             .unwrap_or_else(|| DEFAULT_OUTGOING_BODY_CHUNK_SIZE)
+    }
+}
+
+impl wasi_http_draft::WasiHttpView for Host {
+    fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
+        &mut self.table
+    }
+}
+
+impl wasi_http_draft::WasiHttpViewConcurrent for Host {
+    type View<'a> = &'a mut Self;
+
+    async fn send_request<T>(
+        _accessor: &wasmtime::component::Accessor<T, wasi_http_draft::WasiHttp<Self>>,
+        _request: wasmtime::component::Resource<wasi_http_draft::wasi::http::types::Request>,
+    ) -> wasmtime::Result<
+        Result<
+            wasmtime::component::Resource<wasi_http_draft::wasi::http::types::Response>,
+            wasi_http_draft::wasi::http::types::ErrorCode,
+        >,
+    > {
+        Err(anyhow!("no outbound request handler available"))
     }
 }
 
@@ -429,7 +739,8 @@ impl ServeCommand {
             wasmtime_wasi_http::p3::add_only_http_to_linker(linker)?;
         } else {
             wasmtime_wasi_http::add_to_linker_async(linker)?;
-            wasmtime_wasi_http::p3::add_to_linker(linker)?;
+            // wasmtime_wasi_http::p3::add_to_linker(linker)?;
+            wasi_http_draft::add_to_linker(linker)?;
         }
 
         if self.run.common.wasi.nn == Some(true) {
@@ -519,7 +830,7 @@ impl ServeCommand {
         };
 
         let instance = linker.instantiate_pre(&component)?;
-        let instance = match p3::ProxyIndices::new(&instance) {
+        let instance = match draft::exports::wasi::http::handler::GuestIndices::new(&instance) {
             Ok(indices) => ProxyPre::P3(indices, instance),
             Err(_) => ProxyPre::P2(p2::ProxyPre::new(instance)?),
         };
@@ -579,6 +890,7 @@ impl ServeCommand {
                 v = listener.accept() => v?,
             };
             let comp = component.clone();
+            stream.set_nodelay(true).unwrap();
             let stream = TokioIo::new(stream);
             let h = handler.clone();
             let shutdown_guard = shutdown.clone().increment();
@@ -861,7 +1173,10 @@ struct ProxyHandlerInner {
 
 enum ProxyPre {
     P2(p2::ProxyPre<Host>),
-    P3(p3::ProxyIndices, InstancePre<Host>),
+    P3(
+        draft::exports::wasi::http::handler::GuestIndices,
+        InstancePre<Host>,
+    ),
 }
 
 impl ProxyPre {
@@ -879,7 +1194,7 @@ impl ProxyPre {
 
 enum Proxy {
     P2(p2::Proxy),
-    P3(p3::Proxy, Instance),
+    P3(draft::exports::wasi::http::handler::Guest, Instance),
 }
 
 impl ProxyHandlerInner {
@@ -970,37 +1285,7 @@ async fn handle_request(
 
             Ok(result.map(|body| body.map_err(|e| e.into()).boxed()))
         }
-        Proxy::P3(proxy, instance) => {
-            let (req, body) = req.into_parts();
-            let body = body.map_err(p3::http::types::ErrorCode::from_hyper_request_error);
-            let res = instance
-                .run_with(&mut store, async |store| {
-                    proxy
-                        .handle(store, http::Request::from_parts(req, body))
-                        .await
-                })
-                .await???;
-            let (res, io) = wasmtime_wasi_http::p3::Response::resource_into_http(&mut store, res)?;
-            tokio::task::spawn(async move {
-                instance
-                    .run_with(&mut store, async |store| {
-                        // TODO: Report transmit errors
-                        let guest_io_result = async { Ok(()) };
-                        io.run(store, guest_io_result).await
-                    })
-                    .await??;
-
-                write_profile(&mut store);
-                drop(epoch_thread);
-
-                anyhow::Ok(())
-            });
-            Ok(res.map(|body| {
-                body.map_err(|err| err.unwrap_or(p3::http::types::ErrorCode::InternalError(None)))
-                    .map_err(|err| err.into())
-                    .boxed()
-            }))
-        }
+        Proxy::P3(proxy, instance) => draft::handle(store, proxy, instance, req).await,
     }
 }
 

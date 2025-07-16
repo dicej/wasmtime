@@ -4132,6 +4132,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasi-http-draft"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "wasmtime",
+]
+
+[[package]]
 name = "wasi-nn"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4532,6 +4542,7 @@ dependencies = [
  "trait-variant",
  "walkdir",
  "wasi-common",
+ "wasi-http-draft",
  "wasm-encoder",
  "wasmparser 0.235.0",
  "wasmtime",
