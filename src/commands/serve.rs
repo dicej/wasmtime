@@ -3,7 +3,7 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 use clap::Parser;
 use futures::{
-    future::{self, Either},
+    future::{self, Either, FutureExt},
     stream::{FuturesUnordered, StreamExt},
 };
 use http::{Response, StatusCode};
@@ -869,75 +869,85 @@ impl ProxyHandler {
             }
         }
 
+        // TODO: make these configurable via CLI options
         const MAX_REUSE_COUNT: usize = 128;
-        const MAX_CONCURRENT_REUSE_COUNT: usize = 16;
+        const MAX_CONCURRENT_REUSE_COUNT: usize = 1;
 
         let mut state = State {
             handler: self.clone(),
             available: true,
         };
 
-        tokio::spawn(async move {
-            let handler = &state.handler.0;
-            let mut store = handler.cmd.new_store(&handler.engine, 0)?;
-            let ProxyPre::P3(indices, pre) = &handler.instance_pre else {
-                panic!("ProxyHandler::maybe_start_worker is only supported for WASIp3 handlers");
-            };
-            let instance = pre.instantiate_async(&mut store).await?;
-            let proxy = indices.load(&mut store, &instance)?;
+        tokio::spawn(
+            async move {
+                let handler = &state.handler.0;
+                let mut store = handler.cmd.new_store(&handler.engine, 0)?;
+                let ProxyPre::P3(indices, pre) = &handler.instance_pre else {
+                    panic!(
+                        "ProxyHandler::maybe_start_worker is only supported for WASIp3 handlers"
+                    );
+                };
+                let instance = pre.instantiate_async(&mut store).await?;
+                let proxy = &indices.load(&mut store, &instance)?;
+                let accessor = &instance
+                    .run_concurrent(&mut store, async |accessor| accessor.with_getter(|v| v))
+                    .await?;
 
-            instance
-                .run_concurrent(store, async move |accessor| {
-                    let mut reuse_count = 0;
-                    let proxy = &proxy;
-                    let mut futures = FuturesUnordered::new();
-                    while !futures.is_empty()
-                        || (reuse_count < MAX_REUSE_COUNT && !state.handler.0.task_queue.is_empty())
-                    {
-                        let task = {
-                            let future_count = futures.len();
-                            let next_future = pin!(async {
-                                if futures.is_empty() {
-                                    future::pending().await
-                                } else {
-                                    futures.next().await
-                                }
-                            });
-                            let next_task = pin!(async {
-                                if reuse_count < MAX_REUSE_COUNT
-                                    && future_count < MAX_CONCURRENT_REUSE_COUNT
-                                {
-                                    state.handler.0.task_queue.pop().await
-                                } else {
-                                    future::pending().await
-                                }
-                            });
-                            match future::select(next_future, next_task).await {
-                                Either::Left((Some(()), _)) => None,
-                                Either::Left((None, _)) => unreachable!(),
-                                Either::Right((task, _)) => Some(task),
+                let mut reuse_count = 0;
+                let mut futures = FuturesUnordered::new();
+                while !futures.is_empty()
+                    || (reuse_count < MAX_REUSE_COUNT && !state.handler.0.task_queue.is_empty())
+                {
+                    let task = {
+                        let future_count = futures.len();
+                        let next_future = pin!(async {
+                            if futures.is_empty() {
+                                future::pending().await
+                            } else {
+                                instance
+                                    .run_concurrent(&mut store, async |_| futures.next().await)
+                                    .await
                             }
-                        };
-
-                        if let Some(task) = task {
-                            reuse_count += 1;
-
-                            futures.push(async move {
-                                if let Err(error) = (task.run)(accessor, &proxy).await {
-                                    log::error!("[{}] :: {error:?}", task.request_id);
-                                }
-                            });
-
-                            if futures.len() == MAX_CONCURRENT_REUSE_COUNT {
-                                state.set_available(false);
+                        });
+                        let next_task = pin!(async {
+                            if reuse_count < MAX_REUSE_COUNT
+                                && future_count < MAX_CONCURRENT_REUSE_COUNT
+                            {
+                                state.handler.0.task_queue.pop().await
+                            } else {
+                                future::pending().await
                             }
-                        } else if futures.len() == MAX_CONCURRENT_REUSE_COUNT - 1 {
-                            state.set_available(true);
+                        });
+                        match future::select(next_future, next_task).await {
+                            Either::Left((Ok(Some(())), _)) => None,
+                            Either::Left((Ok(None), _)) => unreachable!(),
+                            Either::Left((Err(error), _)) => return Err(error),
+                            Either::Right((task, _)) => Some(task),
                         }
+                    };
+
+                    if let Some(task) = task {
+                        reuse_count += 1;
+
+                        futures.push(async move {
+                            if let Err(error) = (task.run)(accessor, proxy).await {
+                                eprintln!("[{}] :: {error:?}", task.request_id);
+                            }
+                        });
                     }
-                })
-                .await
-        });
+
+                    state.set_available(futures.len() < MAX_CONCURRENT_REUSE_COUNT);
+                }
+
+                //eprintln!("worker exiting; reuse count: {reuse_count}");
+                anyhow::Ok(())
+            }
+            .map(|result| {
+                if let Err(error) = result {
+                    eprintln!("worker error: {error:?}");
+                }
+            }),
+        );
     }
 }
 
