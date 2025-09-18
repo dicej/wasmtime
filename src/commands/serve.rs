@@ -2,25 +2,31 @@ use crate::common::{Profile, RunCommon, RunTarget};
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use clap::Parser;
+use futures::{
+    future::{self, Either},
+    stream::{FuturesUnordered, StreamExt},
+};
 use http::{Response, StatusCode};
 use http_body_util::BodyExt as _;
 use http_body_util::combinators::BoxBody;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
+use std::sync::atomic::Ordering::SeqCst;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use tokio::io::{self, AsyncWrite};
 use tokio::sync::Notify;
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Accessor, Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store, StoreLimits, UpdateDeadline};
 use wasmtime_wasi::p2::{StreamError, StreamResult};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -734,6 +740,62 @@ struct ProxyHandlerInner {
     engine: Engine,
     instance_pre: ProxyPre,
     next_id: AtomicU64,
+    task_queue: Queue<Task>,
+    worker_count: AtomicUsize,
+}
+
+struct Task {
+    run: Box<
+        dyn for<'a> FnOnce(
+                &'a Accessor<Host>,
+                &'a wasmtime_wasi_http::p3::bindings::Proxy,
+            )
+                -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>
+            + Send,
+    >,
+    request_id: u64,
+}
+
+struct Queue<T> {
+    queue: Mutex<VecDeque<T>>,
+    notify: Notify,
+}
+
+impl<T> Default for Queue<T> {
+    fn default() -> Self {
+        Self {
+            queue: Default::default(),
+            notify: Default::default(),
+        }
+    }
+}
+
+impl<T> Queue<T> {
+    fn is_empty(&self) -> bool {
+        self.queue.lock().unwrap().is_empty()
+    }
+
+    fn push(&self, item: T) {
+        self.queue.lock().unwrap().push_back(item);
+        self.notify.notify_one();
+    }
+
+    fn try_pop(&self) -> Option<T> {
+        self.queue.lock().unwrap().pop_front()
+    }
+
+    async fn pop(&self) -> T {
+        let mut notified = pin!(self.notify.notified());
+
+        loop {
+            notified.as_mut().enable();
+            if let Some(item) = self.try_pop() {
+                return item;
+            }
+            notified.as_mut().await;
+            notified.set(self.notify.notified());
+        }
+    }
 }
 
 enum ProxyPre {
@@ -742,29 +804,6 @@ enum ProxyPre {
     P3(
         wasmtime_wasi_http::p3::bindings::ProxyIndices,
         wasmtime::component::InstancePre<Host>,
-    ),
-}
-
-impl ProxyPre {
-    async fn instantiate(&self, store: &mut Store<Host>) -> Result<Proxy> {
-        Ok(match self {
-            ProxyPre::P2(pre) => Proxy::P2(pre.instantiate_async(store).await?),
-            #[cfg(feature = "component-model-async")]
-            ProxyPre::P3(indices, pre) => {
-                let instance = pre.instantiate_async(&mut *store).await?;
-                let proxy = indices.load(&mut *store, &instance)?;
-                Proxy::P3(proxy, instance)
-            }
-        })
-    }
-}
-
-enum Proxy {
-    P2(p2::Proxy),
-    #[cfg(feature = "component-model-async")]
-    P3(
-        wasmtime_wasi_http::p3::bindings::Proxy,
-        wasmtime::component::Instance,
     ),
 }
 
@@ -784,19 +823,132 @@ impl ProxyHandler {
             engine,
             instance_pre,
             next_id: AtomicU64::from(0),
+            task_queue: Default::default(),
+            worker_count: AtomicUsize::from(0),
         }))
+    }
+
+    fn push(&self, task: Task) {
+        self.0.task_queue.push(task);
+        self.maybe_start_worker()
+    }
+
+    fn maybe_start_worker(&self) {
+        if self.0.worker_count.fetch_add(1, SeqCst) == 0 {
+            self.start_worker();
+        } else {
+            self.0.worker_count.fetch_sub(1, SeqCst);
+        }
+    }
+
+    fn start_worker(&self) {
+        struct State {
+            handler: ProxyHandler,
+            available: bool,
+        }
+
+        impl State {
+            fn set_available(&mut self, available: bool) {
+                if available != self.available {
+                    self.available = available;
+                    if available {
+                        self.handler.0.worker_count.fetch_add(1, SeqCst);
+                    } else {
+                        self.handler.0.worker_count.fetch_sub(1, SeqCst);
+                        if !self.handler.0.task_queue.is_empty() {
+                            self.handler.maybe_start_worker();
+                        }
+                    }
+                }
+            }
+        }
+
+        impl Drop for State {
+            fn drop(&mut self) {
+                self.set_available(false);
+            }
+        }
+
+        const MAX_REUSE_COUNT: usize = 128;
+        const MAX_CONCURRENT_REUSE_COUNT: usize = 16;
+
+        let mut state = State {
+            handler: self.clone(),
+            available: true,
+        };
+
+        tokio::spawn(async move {
+            let handler = &state.handler.0;
+            let mut store = handler.cmd.new_store(&handler.engine, 0)?;
+            let ProxyPre::P3(indices, pre) = &handler.instance_pre else {
+                panic!("ProxyHandler::maybe_start_worker is only supported for WASIp3 handlers");
+            };
+            let instance = pre.instantiate_async(&mut store).await?;
+            let proxy = indices.load(&mut store, &instance)?;
+
+            instance
+                .run_concurrent(store, async move |accessor| {
+                    let mut reuse_count = 0;
+                    let proxy = &proxy;
+                    let mut futures = FuturesUnordered::new();
+                    while !futures.is_empty()
+                        || (reuse_count < MAX_REUSE_COUNT && !state.handler.0.task_queue.is_empty())
+                    {
+                        let task = {
+                            let future_count = futures.len();
+                            let next_future = pin!(async {
+                                if futures.is_empty() {
+                                    future::pending().await
+                                } else {
+                                    futures.next().await
+                                }
+                            });
+                            let next_task = pin!(async {
+                                if reuse_count < MAX_REUSE_COUNT
+                                    && future_count < MAX_CONCURRENT_REUSE_COUNT
+                                {
+                                    state.handler.0.task_queue.pop().await
+                                } else {
+                                    future::pending().await
+                                }
+                            });
+                            match future::select(next_future, next_task).await {
+                                Either::Left((Some(()), _)) => None,
+                                Either::Left((None, _)) => unreachable!(),
+                                Either::Right((task, _)) => Some(task),
+                            }
+                        };
+
+                        if let Some(task) = task {
+                            reuse_count += 1;
+
+                            futures.push(async move {
+                                if let Err(error) = (task.run)(accessor, &proxy).await {
+                                    log::error!("[{}] :: {error:?}", task.request_id);
+                                }
+                            });
+
+                            if futures.len() == MAX_CONCURRENT_REUSE_COUNT {
+                                state.set_available(false);
+                            }
+                        } else if futures.len() == MAX_CONCURRENT_REUSE_COUNT - 1 {
+                            state.set_available(true);
+                        }
+                    }
+                })
+                .await
+        });
     }
 }
 
 type Request = hyper::Request<hyper::body::Incoming>;
 
 async fn handle_request(
-    ProxyHandler(inner): ProxyHandler,
+    handler: ProxyHandler,
     req: Request,
     component: Component,
 ) -> Result<hyper::Response<BoxBody<Bytes, anyhow::Error>>> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-
+    let ProxyHandler(inner) = &handler;
     let req_id = inner.next_req_id();
 
     log::info!(
@@ -805,16 +957,18 @@ async fn handle_request(
         req.uri()
     );
 
-    let mut store = inner.cmd.new_store(&inner.engine, req_id)?;
+    match &inner.instance_pre {
+        ProxyPre::P2(pre) => {
+            let mut store = inner.cmd.new_store(&inner.engine, req_id)?;
 
-    let (write_profile, epoch_thread) =
-        setup_epoch_handler(&inner.cmd, &mut store, component.clone())?;
+            let (write_profile, epoch_thread) =
+                setup_epoch_handler(&inner.cmd, &mut store, component.clone())?;
 
-    match inner.instance_pre.instantiate(&mut store).await? {
-        Proxy::P2(proxy) => {
+            let proxy = pre.instantiate_async(&mut store).await?;
             let req = store
                 .data_mut()
                 .new_incoming_request(p2::http::types::Scheme::Http, req)?;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
             let out = store.data_mut().new_response_outparam(sender)?;
             let task = tokio::task::spawn(async move {
                 if let Err(e) = proxy
@@ -857,14 +1011,14 @@ async fn handle_request(
             Ok(result.map(|body| body.map_err(|e| e.into()).boxed()))
         }
         #[cfg(feature = "component-model-async")]
-        Proxy::P3(proxy, instance) => {
+        ProxyPre::P3(..) => {
             use wasmtime_wasi_http::p3::bindings::http::types::{ErrorCode, Request};
 
             let (tx, rx) = tokio::sync::oneshot::channel();
 
-            tokio::task::spawn(async move {
-                let guest_result = instance
-                    .run_concurrent(&mut store, async move |store| {
+            handler.push(Task {
+                run: Box::new(move |store, proxy| {
+                    Box::pin(async move {
                         let (req, body) = req.into_parts();
                         let body = body.map_err(ErrorCode::from_hyper_request_error);
                         let req = http::Request::from_parts(req, body);
@@ -872,22 +1026,14 @@ async fn handle_request(
                         let (res, task) = proxy.handle(store, request).await??;
                         let res =
                             store.with(|mut store| res.into_http(&mut store, request_io_result))?;
-
                         _ = tx.send(res);
 
+                        // Wait for the task to finish.
                         task.block(store).await;
                         anyhow::Ok(())
                     })
-                    .await?;
-                if let Err(e) = guest_result {
-                    log::error!("[{req_id}] :: {e:?}");
-                    return Err(e);
-                }
-
-                write_profile(&mut store);
-                drop(epoch_thread);
-
-                anyhow::Ok(())
+                }),
+                request_id: req_id,
             });
             Ok(rx.await?.map(|body| body.map_err(|err| err.into()).boxed()))
         }
