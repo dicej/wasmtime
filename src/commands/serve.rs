@@ -462,6 +462,7 @@ impl ServeCommand {
                 v = listener.accept() => v?,
             };
             let comp = component.clone();
+            stream.set_nodelay(true)?;
             let stream = TokioIo::new(stream);
             let h = handler.clone();
             let shutdown_guard = shutdown.clone().increment();
@@ -889,58 +890,56 @@ impl ProxyHandler {
                 };
                 let instance = pre.instantiate_async(&mut store).await?;
                 let proxy = &indices.load(&mut store, &instance)?;
-                let accessor = &instance
-                    .run_concurrent(&mut store, async |accessor| accessor.with_getter(|v| v))
-                    .await?;
+                instance
+                    .run_concurrent(&mut store, async |accessor| {
+                        let mut reuse_count = 0;
+                        let mut futures = FuturesUnordered::new();
+                        while !futures.is_empty()
+                            || (reuse_count < MAX_REUSE_COUNT
+                                && !state.handler.0.task_queue.is_empty())
+                        {
+                            let task = {
+                                let future_count = futures.len();
+                                let next_future = pin!(async {
+                                    if futures.is_empty() {
+                                        future::pending().await
+                                    } else {
+                                        futures.next().await
+                                    }
+                                });
+                                let next_task = pin!(async {
+                                    if reuse_count < MAX_REUSE_COUNT
+                                        && future_count < MAX_CONCURRENT_REUSE_COUNT
+                                    {
+                                        state.handler.0.task_queue.pop().await
+                                    } else {
+                                        future::pending().await
+                                    }
+                                });
+                                match future::select(next_future, next_task).await {
+                                    Either::Left((Some(()), _)) => None,
+                                    Either::Left((None, _)) => unreachable!(),
+                                    Either::Right((task, _)) => Some(task),
+                                }
+                            };
 
-                let mut reuse_count = 0;
-                let mut futures = FuturesUnordered::new();
-                while !futures.is_empty()
-                    || (reuse_count < MAX_REUSE_COUNT && !state.handler.0.task_queue.is_empty())
-                {
-                    let task = {
-                        let future_count = futures.len();
-                        let next_future = pin!(async {
-                            if futures.is_empty() {
-                                future::pending().await
-                            } else {
-                                instance
-                                    .run_concurrent(&mut store, async |_| futures.next().await)
-                                    .await
+                            if let Some(task) = task {
+                                reuse_count += 1;
+
+                                futures.push(async move {
+                                    if let Err(error) = (task.run)(accessor, proxy).await {
+                                        eprintln!("[{}] :: {error:?}", task.request_id);
+                                    }
+                                });
                             }
-                        });
-                        let next_task = pin!(async {
-                            if reuse_count < MAX_REUSE_COUNT
-                                && future_count < MAX_CONCURRENT_REUSE_COUNT
-                            {
-                                state.handler.0.task_queue.pop().await
-                            } else {
-                                future::pending().await
-                            }
-                        });
-                        match future::select(next_future, next_task).await {
-                            Either::Left((Ok(Some(())), _)) => None,
-                            Either::Left((Ok(None), _)) => unreachable!(),
-                            Either::Left((Err(error), _)) => return Err(error),
-                            Either::Right((task, _)) => Some(task),
+
+                            state.set_available(futures.len() < MAX_CONCURRENT_REUSE_COUNT);
                         }
-                    };
 
-                    if let Some(task) = task {
-                        reuse_count += 1;
-
-                        futures.push(async move {
-                            if let Err(error) = (task.run)(accessor, proxy).await {
-                                eprintln!("[{}] :: {error:?}", task.request_id);
-                            }
-                        });
-                    }
-
-                    state.set_available(futures.len() < MAX_CONCURRENT_REUSE_COUNT);
-                }
-
-                //eprintln!("worker exiting; reuse count: {reuse_count}");
-                anyhow::Ok(())
+                        //eprintln!("worker exiting; reuse count: {reuse_count}");
+                        anyhow::Ok(())
+                    })
+                    .await?
             }
             .map(|result| {
                 if let Err(error) = result {
