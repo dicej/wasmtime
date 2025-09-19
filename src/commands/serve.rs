@@ -894,10 +894,7 @@ impl ProxyHandler {
                     .run_concurrent(&mut store, async |accessor| {
                         let mut reuse_count = 0;
                         let mut futures = FuturesUnordered::new();
-                        while !futures.is_empty()
-                            || (reuse_count < MAX_REUSE_COUNT
-                                && !state.handler.0.task_queue.is_empty())
-                        {
+                        while !(futures.is_empty() && reuse_count >= MAX_REUSE_COUNT) {
                             let task = {
                                 let future_count = futures.len();
                                 let next_future = pin!(async {
