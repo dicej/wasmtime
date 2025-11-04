@@ -1595,18 +1595,6 @@ impl Instance {
         log::trace!("received callback code from {guest_thread:?}: {code} (set: {set})");
 
         let state = store.concurrent_state_mut();
-        if !state.get_mut(guest_thread.task)?.returned_or_cancelled() {
-            if initial_call {
-                // Notify any current or future waiters that this subtask has
-                // started.
-                Waitable::Guest(guest_thread.task).set_event(
-                    state,
-                    Some(Event::Subtask {
-                        status: Status::Started,
-                    }),
-                )?;
-            }
-        }
 
         let get_set = |store, handle| {
             if handle == 0 {
