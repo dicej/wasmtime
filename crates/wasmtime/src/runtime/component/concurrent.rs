@@ -54,9 +54,7 @@ use crate::component::func::{self, Func, Options};
 use crate::component::{HasData, HasSelf, Instance, Resource, ResourceTable, ResourceTableError};
 use crate::fiber::{self, StoreFiber, StoreFiberYield};
 use crate::store::{Store, StoreId, StoreInner, StoreOpaque, StoreToken};
-use crate::vm::component::{
-    CallContext, ComponentInstance, InstanceFlags, ResourceTables, TransmitLocalState,
-};
+use crate::vm::component::{CallContext, ComponentInstance, InstanceFlags, ResourceTables};
 use crate::vm::{AlwaysMut, SendSyncPtr, VMFuncRef, VMMemoryDefinition, VMStore};
 use crate::{AsContext, AsContextMut, FuncType, StoreContext, StoreContextMut, ValRaw, ValType};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -845,7 +843,7 @@ fn handle_guest_call(store: &mut dyn VMStore, call: GuestCall) -> Result<()> {
 
             store.maybe_pop_call_context(call.thread.task)?;
 
-            instance.handle_callback_code(store, call.thread, runtime_instance, code, false)?;
+            instance.handle_callback_code(store, call.thread, runtime_instance, code)?;
 
             store.concurrent_state_mut().guest_thread = old_thread;
             log::trace!("GuestCallKind::DeliverEvent: restored {old_thread:?} as current thread");
@@ -1588,7 +1586,6 @@ impl Instance {
         guest_thread: QualifiedThreadId,
         runtime_instance: RuntimeComponentInstanceIndex,
         code: u32,
-        initial_call: bool,
     ) -> Result<()> {
         let (code, set) = unpack_callback_code(code);
 
@@ -1864,7 +1861,7 @@ impl Instance {
                 // function returns a `i32` result.
                 let code = unsafe { storage[0].assume_init() }.get_i32() as u32;
 
-                self.handle_callback_code(store, guest_thread, callee_instance, code, true)?;
+                self.handle_callback_code(store, guest_thread, callee_instance, code)?;
 
                 Ok(())
             }) as Box<dyn FnOnce(&mut dyn VMStore) -> Result<()> + Send + Sync>
