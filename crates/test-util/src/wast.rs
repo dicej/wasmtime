@@ -687,6 +687,14 @@ impl WastTest {
             return true;
         }
 
+        // This will require a wasm-tools update:
+        if self
+            .path
+            .ends_with("component-model/test/validation/max-value-size.wast")
+        {
+            return true;
+        }
+
         false
     }
 }
