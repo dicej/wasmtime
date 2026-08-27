@@ -908,7 +908,7 @@ pub(crate) fn poll_and_block<R: Send + Sync + 'static>(
         // complete, suspending the current fiber until it does so.
         Poll::Pending => {
             let caller_instance = store.concurrent_state_mut()?.get_mut(caller.task)?.instance;
-            store.switch_or_trap_if_may_not_suspend(caller_instance, caller)?;
+            store.switch_or_trap_if_may_not_suspend(caller_instance)?;
 
             let state = store.concurrent_state_mut()?;
             state.push_future(future);
@@ -1339,7 +1339,20 @@ impl<T> StoreContextMut<'_, T> {
                     Poll::Pending => Poll::Pending,
                 };
 
-                // Next, identify the next work item to process, if any.
+                // Next, identify the next work item to process, if any, using
+                // the following priority order:
+                //
+                // - `switch_item`: Represents the guest thread we _must_ switch
+                // to before any other thread runs per the determinism
+                // requirements in the Component Model spec.
+                //
+                // - `high_priority`: "Urgent" work items, e.g. async calls have
+                // become freshly unblocked due to backpressure clearing or
+                // similar, stream or future state updates, etc.
+                //
+                // - `low_priority`: Work items such as resuming a fiber after
+                // it yields, in which case the point is to let other items run
+                // first.
                 let state = reset.store.0.concurrent_state_mut()?;
                 let mut ready = state.switch_item.take();
                 let mut low_priority = false;
@@ -2001,15 +2014,9 @@ impl StoreOpaque {
         Ok(old_thread)
     }
 
-    /// Check if the specified instance has a sync-typed call in progress; if so
-    /// attempt to switch to another ready thread for that instance, and if no
-    /// such thread exists, trap.
-    fn switch_or_trap_if_may_not_suspend(
-        &mut self,
-        instance: RuntimeInstance,
-        thread: QualifiedThreadId,
-    ) -> Result<()> {
-        if self.switch_if_may_not_suspend(instance, thread)? {
+    /// Call `switch_if_may_not_suspend` and trap if it returns `false`.
+    fn switch_or_trap_if_may_not_suspend(&mut self, instance: RuntimeInstance) -> Result<()> {
+        if self.switch_if_may_not_suspend(instance)? {
             Ok(())
         } else {
             Err(Trap::CannotBlockSyncTask.into())
@@ -2019,39 +2026,12 @@ impl StoreOpaque {
     /// Check if the specified instance has a sync-typed call in progress; if so
     /// attempt to switch to another ready thread for that instance, and if no
     /// such thread exists, return false.
-    fn switch_if_may_not_suspend(
-        &mut self,
-        instance: RuntimeInstance,
-        thread: QualifiedThreadId,
-    ) -> Result<bool> {
-        if !self.concurrency_support() {
-            return Ok(true);
-        }
-
-        if let Some(item) = self
-            .concurrent_state_mut()?
-            .get_mut(thread.task)?
-            .switch_item
-            .take()
-        {
-            if self
+    fn switch_if_may_not_suspend(&mut self, instance: RuntimeInstance) -> Result<bool> {
+        Ok(!self.concurrency_support()
+            || !self
                 .instance_state(instance)
                 .concurrent_state()
                 .do_not_suspend
-            {
-                bail_bug!(
-                    "`do_not_suspend` is `true` when `GuestThread::switch_item` is `Some(_)`"
-                );
-            }
-
-            self.concurrent_state_mut()?.set_switch_item(item)?;
-            return Ok(true);
-        }
-
-        Ok(!self
-            .instance_state(instance)
-            .concurrent_state()
-            .do_not_suspend
             || self
                 .concurrent_state_mut()?
                 .promote_instance_local_thread_work_item(instance)?)
@@ -2218,7 +2198,14 @@ impl StoreOpaque {
             SuspendReason::NeedWork => None,
         };
 
-        let old_guest_thread = if task.is_some() {
+        let old_guest_thread = if let Some(task) = task {
+            let state = self.concurrent_state_mut()?;
+            if state.switch_item.is_none() {
+                if let Some(item) = state.get_mut(task)?.switch_item.take() {
+                    state.set_switch_item(item)?;
+                }
+            }
+
             self.current_thread()?
         } else {
             CurrentThread::None
@@ -2257,7 +2244,7 @@ impl StoreOpaque {
         let set = state.get_mut(caller.thread)?.sync_call_set;
         waitable.join(state, Some(set))?;
 
-        self.switch_or_trap_if_may_not_suspend(caller_instance, caller)?;
+        self.switch_or_trap_if_may_not_suspend(caller_instance)?;
 
         self.suspend(match reason {
             WaitReason::GuestSubtask(callee) => {
@@ -2300,16 +2287,14 @@ impl StoreOpaque {
         cleanup_task: CleanupTask,
         may_suspend: bool,
     ) -> Result<()> {
-        if may_suspend {
-            let state = self.concurrent_state_mut()?;
-            if let Some(item) = state.get_mut(guest_thread.task)?.switch_item.take() {
-                state.set_switch_item(item)?;
-            }
-        } else {
-            self.switch_or_trap_if_may_not_suspend(runtime_instance, guest_thread)?;
+        if !may_suspend {
+            self.switch_or_trap_if_may_not_suspend(runtime_instance)?;
         }
 
         let state = self.concurrent_state_mut()?;
+        if let Some(item) = state.get_mut(guest_thread.task)?.switch_item.take() {
+            state.set_switch_item(item)?;
+        }
         let thread_data = state.get_mut(guest_thread.thread)?;
         let sync_call_set = thread_data.sync_call_set;
         if let Some(guest_id) = thread_data.instance_rep {
@@ -2512,6 +2497,10 @@ impl Instance {
         let (code, set) = unpack_callback_code(code);
 
         log::trace!("received callback code from {guest_thread:?}: {code} (set: {set})");
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 200 {
+            bail_bug!("debug");
+        }
 
         let state = store.concurrent_state_mut()?;
 
@@ -3263,9 +3252,7 @@ impl Instance {
                 // The callee hasn't returned yet, and the caller is calling via
                 // a sync-lowered import, so we loop and keep waiting until the
                 // callee returns.
-                store
-                    .0
-                    .switch_or_trap_if_may_not_suspend(caller_instance, caller)?;
+                store.0.switch_or_trap_if_may_not_suspend(caller_instance)?;
             }
         };
 
@@ -3932,8 +3919,6 @@ impl Instance {
         yielding: bool,
         to_thread: SuspensionTarget,
     ) -> Result<WaitResult> {
-        let guest_thread = store.current_guest_thread()?;
-
         // There could be a pending cancellation from a previous uncancellable wait
         if cancellable && store.take_pending_cancellation()? {
             return Ok(WaitResult::Cancelled);
@@ -3952,9 +3937,7 @@ impl Instance {
             SuspensionTarget::None => true,
         };
 
-        if check_suspend
-            && !store.switch_if_may_not_suspend(self.runtime_instance(caller), guest_thread)?
-        {
+        if check_suspend && !store.switch_if_may_not_suspend(self.runtime_instance(caller))? {
             return if yielding {
                 Ok(WaitResult::Completed)
             } else {
@@ -4010,7 +3993,7 @@ impl Instance {
                     || (matches!(task.event, Some(Event::Cancelled)) && !cancellable))
                     && state.get_mut(set)?.ready.is_empty()
                 {
-                    store.switch_or_trap_if_may_not_suspend(caller, guest_thread)?;
+                    store.switch_or_trap_if_may_not_suspend(caller)?;
 
                     if cancellable {
                         let old = store
