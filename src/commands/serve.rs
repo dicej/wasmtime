@@ -27,7 +27,7 @@ use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, Semaphore};
-use wasmtime::component::{Component, GuestTaskId, Linker};
+use wasmtime::component::{Component, Linker};
 use wasmtime::error::Context as _;
 use wasmtime::{
     AsContextMut as _, Engine, Result, Store, StoreContextMut, StoreLimits, UpdateDeadline, bail,
@@ -999,7 +999,6 @@ impl WorkerState for HostWorkerState {
         &self,
         _store: StoreContextMut<Host>,
         request_id: u64,
-        _task_id: GuestTaskId,
     ) -> Pin<Box<dyn Future<Output = ()> + 'static + Send + Sync>> {
         log::info!(
             "Instance {} handling request {request_id}",
