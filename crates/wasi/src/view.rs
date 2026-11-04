@@ -1,4 +1,6 @@
 use crate::WasiCtx;
+use std::pin::Pin;
+use std::sync::Arc;
 use wasmtime::component::ResourceTable;
 
 /// A trait which provides access to the [`WasiCtx`] inside the embedder's `T`
@@ -46,11 +48,16 @@ pub struct WasiCtxView<'a> {
     pub ctx: &'a mut WasiCtx,
     /// Resources, such as files/streams, that the guest is using.
     pub table: &'a mut ResourceTable,
+    /// Mutable reference to the WASI hooks.
+    ///
+    /// Note that [`default_hooks`] or [`Default::default()`] can be used if
+    /// you don't want or need to customize this.
+    pub hooks: &'a mut dyn WasiHooks,
 }
 
 impl<T: WasiView> crate::cli::WasiCliView for T {
     fn cli(&mut self) -> crate::cli::WasiCliCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx();
+        let WasiCtxView { ctx, table, .. } = self.ctx();
         crate::cli::WasiCliCtxView {
             ctx: &mut ctx.cli,
             table,
@@ -60,7 +67,7 @@ impl<T: WasiView> crate::cli::WasiCliView for T {
 
 impl<T: WasiView> crate::clocks::WasiClocksView for T {
     fn clocks(&mut self) -> crate::clocks::WasiClocksCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx();
+        let WasiCtxView { ctx, table, .. } = self.ctx();
         crate::clocks::WasiClocksCtxView {
             ctx: &mut ctx.clocks,
             table,
@@ -70,10 +77,11 @@ impl<T: WasiView> crate::clocks::WasiClocksView for T {
 
 impl<T: WasiView> crate::filesystem::WasiFilesystemView for T {
     fn filesystem(&mut self) -> crate::filesystem::WasiFilesystemCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx();
+        let WasiCtxView { ctx, table, hooks } = self.ctx();
         crate::filesystem::WasiFilesystemCtxView {
             ctx: &mut ctx.filesystem,
             table,
+            hooks,
         }
     }
 }
@@ -86,7 +94,7 @@ impl<T: WasiView> crate::random::WasiRandomView for T {
 
 impl<T: WasiView> crate::sockets::WasiSocketsView for T {
     fn sockets(&mut self) -> crate::sockets::WasiSocketsCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx();
+        let WasiCtxView { ctx, table, .. } = self.ctx();
         crate::sockets::WasiSocketsCtxView {
             ctx: &mut ctx.sockets,
             table,
@@ -146,7 +154,7 @@ pub trait WasiNamedView: Send + 'static {
 
 impl<T: WasiNamedView> crate::cli::WasiCliNamedView for T {
     fn cli(&mut self, id: NamedId) -> crate::cli::WasiCliCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx(id);
+        let WasiCtxView { ctx, table, .. } = self.ctx(id);
         crate::cli::WasiCliCtxView {
             ctx: &mut ctx.cli,
             table,
@@ -156,7 +164,7 @@ impl<T: WasiNamedView> crate::cli::WasiCliNamedView for T {
 
 impl<T: WasiNamedView> crate::clocks::WasiClocksNamedView for T {
     fn clocks(&mut self, id: NamedId) -> crate::clocks::WasiClocksCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx(id);
+        let WasiCtxView { ctx, table, .. } = self.ctx(id);
         crate::clocks::WasiClocksCtxView {
             ctx: &mut ctx.clocks,
             table,
@@ -166,10 +174,11 @@ impl<T: WasiNamedView> crate::clocks::WasiClocksNamedView for T {
 
 impl<T: WasiNamedView> crate::filesystem::WasiFilesystemNamedView for T {
     fn filesystem(&mut self, id: NamedId) -> crate::filesystem::WasiFilesystemCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx(id);
+        let WasiCtxView { ctx, table, hooks } = self.ctx(id);
         crate::filesystem::WasiFilesystemCtxView {
             ctx: &mut ctx.filesystem,
             table,
+            hooks,
         }
     }
 }
@@ -182,10 +191,60 @@ impl<T: WasiNamedView> crate::random::WasiRandomNamedView for T {
 
 impl<T: WasiNamedView> crate::sockets::WasiSocketsNamedView for T {
     fn sockets(&mut self, id: NamedId) -> crate::sockets::WasiSocketsCtxView<'_> {
-        let WasiCtxView { ctx, table } = self.ctx(id);
+        let WasiCtxView { ctx, table, .. } = self.ctx(id);
         crate::sockets::WasiSocketsCtxView {
             ctx: &mut ctx.sockets,
             table,
         }
     }
 }
+
+/// Trait representing a permit returned by `WasiHooks::acquire`.
+pub trait WasiPermit: Send + Sync {}
+
+/// Type of permit to request via `WasiHooks::acquire`.
+#[derive(Clone, Copy)]
+pub enum WasiPermitType {
+    /// Request a permit to open a `wasi:filesystem` file or directory.
+    FileOrDirectory,
+    /// Request a permit to create a `wasi:sockets` TCP or UDP socket.
+    Socket,
+}
+
+/// A trait which provides hooks into internal WASI operations.
+pub trait WasiHooks: Send {
+    /// Acquire a permit to create a host file descriptor to be wrapped in a
+    /// resource and returned to the guest.
+    ///
+    /// The `ty` parameter indicates which type of file descriptor is to be
+    /// created.  The result, if successful, represents a semaphore-style permit
+    /// which should be dropped immediately _after_ closing the file descriptor,
+    /// which will release the permit and potentially unblock other requests.
+    fn acquire(
+        &self,
+        ty: WasiPermitType,
+    ) -> Pin<Box<dyn Future<Output = wasmtime::Result<Arc<dyn WasiPermit>>> + Send>> {
+        _ = ty;
+        Box::pin(async { Ok(Arc::new(DummyPermit) as Arc<dyn WasiPermit>) })
+    }
+}
+
+/// Returns a value suitable for the `WasiCtxView::hooks` field which has
+/// the default behavior.
+pub fn default_hooks() -> &'static mut dyn WasiHooks {
+    Default::default()
+}
+
+impl<'a> Default for &'a mut dyn WasiHooks {
+    fn default() -> Self {
+        let x: &mut [(); 0] = &mut [];
+        x
+    }
+}
+
+#[doc(hidden)]
+impl WasiHooks for [(); 0] {}
+
+pub(crate) struct DummyPermit;
+
+impl WasiPermit for DummyPermit {}

@@ -3,7 +3,7 @@ use crate::clocks::{HostMonotonicClock, HostWallClock, WasiClocksCtx};
 use crate::filesystem::{Dir, WasiFilesystemCtx};
 use crate::random::WasiRandomCtx;
 use crate::sockets::{SocketAddrCheck, SocketAddrUse, WasiSocketsCtx};
-use crate::{FsPerms, OpenMode};
+use crate::{DummyPermit, FsPerms, OpenMode};
 use rand::Rng;
 use std::future::Future;
 use std::mem;
@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::io::{stderr, stdin, stdout};
 use wasmtime::Result;
 
@@ -330,6 +331,7 @@ impl WasiCtxBuilder {
                 perms,
                 open_mode,
                 self.filesystem.allow_blocking_current_thread,
+                Arc::new(DummyPermit),
             ),
             guest_path.as_ref().to_owned(),
         ));

@@ -1,7 +1,7 @@
 use crate::clocks::Datetime;
 use crate::filesystem::primitives::{FollowSymlinks, Metadata, OpenOptions};
 use crate::runtime::{AbortOnDropJoinHandle, spawn_blocking};
-use crate::{NamedId, WasiCtxNamedView};
+use crate::{NamedId, WasiCtxNamedView, WasiHooks, WasiPermit};
 use std::collections::hash_map;
 use std::marker;
 use std::num::NonZeroUsize;
@@ -86,6 +86,7 @@ impl Default for WasiFilesystemCtx {
 pub struct WasiFilesystemCtxView<'a> {
     pub ctx: &'a mut WasiFilesystemCtx,
     pub table: &'a mut ResourceTable,
+    pub hooks: &'a mut dyn WasiHooks,
 }
 
 pub trait WasiFilesystemView: Send {
@@ -682,6 +683,13 @@ impl Descriptor {
 
 #[derive(Clone)]
 pub struct File {
+    /// `WasiHooks::acquire` permit representing permission to create the
+    /// descriptor.
+    ///
+    /// This field is declared first to ensure it is dropped last, i.e. _after_
+    /// the `file` field is dropped.
+    _permit: Arc<dyn WasiPermit>,
+
     /// The operating system File this struct is mediating access to.
     ///
     /// Wrapped in an Arc because the same underlying file is used for
@@ -708,12 +716,14 @@ impl File {
         perms: FsPerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
+        permit: Arc<dyn WasiPermit>,
     ) -> Self {
         Self {
             file: Arc::new(file),
             perms,
             open_mode,
             allow_blocking_current_thread,
+            _permit: permit,
         }
     }
 
@@ -790,6 +800,13 @@ impl File {
 
 #[derive(Clone)]
 pub struct Dir {
+    /// `WasiHooks::acquire` permit representing permission to create the
+    /// descriptor.
+    ///
+    /// This field is declared first to ensure it is dropped last, i.e. _after_
+    /// the `dir` field is dropped.
+    _permit: Arc<dyn WasiPermit>,
+
     /// The operating system file descriptor this struct is mediating access
     /// to.
     ///
@@ -820,12 +837,14 @@ impl Dir {
         perms: FsPerms,
         open_mode: OpenMode,
         allow_blocking_current_thread: bool,
+        permit: Arc<dyn WasiPermit>,
     ) -> Self {
         Dir {
             dir: Arc::new(dir),
             perms,
             open_mode,
             allow_blocking_current_thread,
+            _permit: permit,
         }
     }
 
@@ -950,6 +969,7 @@ impl Dir {
         oflags: OpenFlags,
         flags: DescriptorFlags,
         allow_blocking_current_thread: bool,
+        permit: Arc<dyn WasiPermit>,
     ) -> Result<Descriptor, ErrorCode> {
         // Track whether we are creating file, for permission check:
         let mut create = false;
@@ -1055,6 +1075,7 @@ impl Dir {
                 self.perms,
                 open_mode,
                 allow_blocking_current_thread,
+                permit,
             ))),
 
             OpenResult::File(file) => Ok(Descriptor::File(File::new(
@@ -1062,6 +1083,7 @@ impl Dir {
                 self.perms,
                 open_mode,
                 allow_blocking_current_thread,
+                permit,
             ))),
 
             OpenResult::NotDir => Err(ErrorCode::NotDirectory),

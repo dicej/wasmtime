@@ -1,3 +1,4 @@
+use crate::WasiPermitType;
 use crate::filesystem::sys;
 use crate::filesystem::{Descriptor, Dir, File, WasiFilesystem, WasiFilesystemCtxView};
 use crate::p3::FallibleIteratorProducer;
@@ -758,7 +759,14 @@ impl WasiFilesystemCtxView<'_> {
     ) -> impl Future<Output = FilesystemResult<Descriptor>> + use<> {
         let dir = get_dir(self.table, fd).cloned();
         let allow_blocking_current_thread = self.ctx.allow_blocking_current_thread;
+        let permit = self.hooks.acquire(WasiPermitType::FileOrDirectory);
         async move {
+            let permit = permit.await.map_err(|_| {
+                // Ideally, we'd return something like POSIX's `ENFILE`, but
+                // `wasi:filesystem/types#error-code` doesn't have any
+                // equivalent.
+                ErrorCode::Io
+            })?;
             let fd = dir?
                 .open_at(
                     path_flags.into(),
@@ -766,6 +774,7 @@ impl WasiFilesystemCtxView<'_> {
                     open_flags.into(),
                     flags.into(),
                     allow_blocking_current_thread,
+                    permit,
                 )
                 .await?;
             Ok(fd)
